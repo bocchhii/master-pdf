@@ -41,9 +41,9 @@ jobs:
           $env:MASTERPDF_SELFTEST_OUT = "$PWD\selftest.txt"
           $env:MASTERPDF_SELFTEST_SHOT = "$PWD\screenshot-windows.png"
           Start-Process dist\MasterPDF.exe -Wait
-          $result = Get-Content selftest.txt
+          $result = @(Get-Content selftest.txt)  # (@(): a list even for one line)
           $result
-          if ($result[0] -ne "ok") { exit 1 }
+          if ($result[0].Trim() -ne "ok") { exit 1 }
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
       - name: Build the installer
