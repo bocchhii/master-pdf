@@ -23,6 +23,8 @@ It looks and feels like Windows 98, because why not.
 Just open a PDF (or drag one in), make your changes and hit Save. You can also switch between a
 few themes from the Theme menu.
 
+<img width="1917" height="1079" alt="masterpdf" src="https://github.com/user-attachments/assets/105dca45-f7bb-4684-afea-f87d375dc057" />
+
 ## Install
 
 1. Download **MasterPDF-Setup.exe** from the [Releases](../../releases/latest) page.
