@@ -1,0 +1,7 @@
+build/
+dist/
+installer_output/
+*.spec
+__pycache__/
+.venv/
+.claude/

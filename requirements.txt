@@ -1,0 +1,5 @@
+# what Master PDF needs to run:  pip install -r requirements.txt
+pymupdf           # reads, draws and writes the PDFs
+pillow            # pictures
+tkinterdnd2       # drag & drop from Explorer
+numpy             # the done / error sounds
