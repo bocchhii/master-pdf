@@ -27,30 +27,52 @@ few themes from the Theme menu.
 
 ## Install
 
-1. Download **MasterPDF-Setup.exe** from the [Releases](../../releases/latest) page.
+Everything is on the [Releases](../../releases/latest) page.
+
+**Windows**
+
+1. Download **MasterPDF-Setup.exe**.
 2. Run it. If Windows says **"Windows protected your PC"**, click **More info → Run anyway**.
    That warning shows up for any app that isn't signed with a paid certificate. It doesn't mean
    the app is unsafe.
 3. Click through the installer and open Master PDF from the Start menu.
 
-The app tells you when there's a new version and can update itself. Checking for updates is the
-only time it goes online.
+**macOS**
 
-Turning Word documents into PDFs needs Microsoft Word (or LibreOffice) on your PC. Everything
-else works on its own.
+1. Download **MasterPDF-macOS-AppleSilicon.dmg** (Macs with an M1 or newer chip) or
+   **MasterPDF-macOS-Intel.dmg** (older Macs).
+2. Open it and drag **Master PDF** into **Applications**.
+3. The first time, macOS says it can't check the app. Open **System Settings → Privacy &
+   Security**, scroll down and click **Open Anyway**. Like the Windows warning, it shows up for
+   any app that isn't signed with a paid Apple certificate.
+
+**Linux**
+
+1. Download **MasterPDF-x86_64.AppImage**.
+2. Make it runnable (right-click → Properties → Allow executing as program, or
+   `chmod +x MasterPDF-x86_64.AppImage`) and double-click it.
+
+The app tells you when there's a new version. On Windows it updates itself; on macOS and Linux it
+downloads the new version for you to install the same way. Checking for updates is the only time
+it goes online.
+
+Turning Word documents into PDFs needs Microsoft Word or LibreOffice on Windows, and
+[LibreOffice](https://www.libreoffice.org/) on macOS and Linux. Everything else works on its own.
 
 ## Run it from the code
 
-You'll need [Python](https://www.python.org/downloads/) 3.10 or newer.
+You'll need [Python](https://www.python.org/downloads/) 3.10 or newer (on Linux, with Tk: the
+`python3-tk` package).
 
 ```
 pip install -r requirements.txt
 python master_pdf.py
 ```
 
-To build the installer yourself, install [Inno Setup](https://jrsoftware.org/isdl.php) and run
-`build.bat`. New releases are built automatically on GitHub when a version tag (like `v1.2.0`) is
-pushed.
+To build it yourself: on Windows install [Inno Setup](https://jrsoftware.org/isdl.php) and run
+`build.bat`; on a Mac run `bash packaging/build_mac.sh`; on Linux run
+`bash packaging/build_linux.sh`. New releases for all three are built automatically on GitHub when
+a version tag (like `v1.2.0`) is pushed.
 
 ## Thanks to
 

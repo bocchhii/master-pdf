@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Master PDF
+Comment=Edit, mark up and change your PDFs on your own computer
+Exec=MasterPDF %f
+Icon=master-pdf
+Categories=Office;Viewer;
+MimeType=application/pdf;
+Terminal=false

@@ -1,0 +1,3 @@
+# the build scripts run on macOS and Linux: always with Unix line endings
+*.sh text eol=lf
+*.desktop text eol=lf

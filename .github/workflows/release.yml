@@ -8,8 +8,11 @@ on:
 permissions:
   contents: write
 
+# Each system is built on its own machine, checked with the app's self-test (it opens a PDF,
+# edits it, searches, saves - and takes a screenshot, kept with the run), and its file added
+# to the release: Windows' installer, the macOS disk images, the Linux AppImage.
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +33,16 @@ jobs:
           Select-String -Path master_pdf.py -Pattern '^APP_VERSION = '
       - name: Build the exe
         run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name MasterPDF --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --collect-all tkinterdnd2 --collect-all pymupdf master_pdf.py
+      - name: Self-test
+        timeout-minutes: 5
+        run: |
+          $env:MASTERPDF_SELFTEST = "1"
+          $env:MASTERPDF_SELFTEST_OUT = "$PWD\selftest.txt"
+          $env:MASTERPDF_SELFTEST_SHOT = "$PWD\screenshot-windows.png"
+          Start-Process dist\MasterPDF.exe -Wait
+          $result = Get-Content selftest.txt
+          $result
+          if ($result[0] -ne "ok") { exit 1 }
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
       - name: Build the installer
@@ -44,13 +57,103 @@ jobs:
             & $iscc installer.iss
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Keep the installer as a build artifact
+      - name: Keep the installer and screenshot with the run
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MasterPDF-Setup
-          path: installer_output/MasterPDF-Setup.exe
-      - name: Publish a GitHub Release
+          name: MasterPDF-Windows
+          path: |
+            installer_output/MasterPDF-Setup.exe
+            screenshot-windows.png
+          if-no-files-found: ignore
+      - name: Add it to the GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: installer_output/MasterPDF-Setup.exe
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14          # Apple chips (M1 and newer)
+            file: MasterPDF-macOS-AppleSilicon
+          - runner: macos-15-intel    # Intel Macs
+            file: MasterPDF-macOS-Intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Put the version into the app
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sed -i '' "s/^APP_VERSION = \"dev\"/APP_VERSION = \"$version\"/" master_pdf.py
+          grep '^APP_VERSION = ' master_pdf.py
+      - name: Build the app and its disk image
+        run: bash packaging/build_mac.sh "${{ matrix.file }}"
+      - name: Self-test
+        timeout-minutes: 5
+        run: |
+          MASTERPDF_SELFTEST=1 MASTERPDF_SELFTEST_OUT="$PWD/selftest.txt" \
+          MASTERPDF_SELFTEST_SHOT="$PWD/screenshot-${{ matrix.file }}.png" \
+          "dist/Master PDF.app/Contents/MacOS/Master PDF" || true
+          cat selftest.txt
+          test "$(head -n 1 selftest.txt)" = "ok"
+      - name: Keep the disk image and screenshot with the run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.file }}
+          path: |
+            installer_output/${{ matrix.file }}.dmg
+            screenshot-${{ matrix.file }}.png
+          if-no-files-found: ignore
+      - name: Add it to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer_output/${{ matrix.file }}.dmg
+
+  linux:
+    runs-on: ubuntu-22.04   # (an older Linux: the AppImage then runs on older and newer systems)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Tk and a screen to test on
+        run: sudo apt-get update && sudo apt-get install -y tk8.6 libtk8.6 xvfb
+      - name: Put the version into the app
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sed -i "s/^APP_VERSION = \"dev\"/APP_VERSION = \"$version\"/" master_pdf.py
+          grep '^APP_VERSION = ' master_pdf.py
+      - name: Build the AppImage
+        run: bash packaging/build_linux.sh
+      - name: Self-test
+        timeout-minutes: 5
+        run: |
+          MASTERPDF_SELFTEST=1 MASTERPDF_SELFTEST_OUT="$PWD/selftest.txt" \
+          MASTERPDF_SELFTEST_SHOT="$PWD/screenshot-linux.png" APPIMAGE_EXTRACT_AND_RUN=1 \
+          xvfb-run -a -s "-screen 0 1600x1000x24" installer_output/MasterPDF-x86_64.AppImage || true
+          cat selftest.txt
+          test "$(head -n 1 selftest.txt)" = "ok"
+      - name: Keep the AppImage and screenshot with the run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MasterPDF-Linux
+          path: |
+            installer_output/MasterPDF-x86_64.AppImage
+            screenshot-linux.png
+          if-no-files-found: ignore
+      - name: Add it to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer_output/MasterPDF-x86_64.AppImage

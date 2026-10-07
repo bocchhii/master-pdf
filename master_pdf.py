@@ -511,6 +511,19 @@ def parse_version(text):
     return tuple(int(n) for n in nums[:3]) if nums else None
 
 
+def release_file_is_mine(name):
+    """Whether a release's file is the one for this system: the Windows installer, the macOS
+    disk image (Apple chips or Intel), or the Linux AppImage."""
+    import platform
+    name = name.lower()
+    if sys.platform == "win32":
+        return name.endswith("setup.exe")
+    if sys.platform == "darwin":
+        intel = platform.machine() == "x86_64"
+        return name.endswith(".dmg") and ("intel" in name) == intel
+    return name.endswith(".appimage")
+
+
 def fetch_latest_release():
     """(version, release notes, installer download link) of the newest release, or None
     (no internet, GitHub unreachable...). Only reads the public release list."""
@@ -524,7 +537,7 @@ def fetch_latest_release():
     except Exception:
         return None
     url = next((a.get("browser_download_url") for a in data.get("assets", [])
-                if a.get("name", "").lower().endswith("setup.exe")), None)
+                if release_file_is_mine(a.get("name", ""))), None)
     version = (data.get("tag_name") or "").lstrip("vV")
     return (version, data.get("body") or "", url) if url and parse_version(version) else None
 
@@ -638,8 +651,17 @@ def notes_dialog(parent, heading, notes):
     win.wait_window()
 
 
-SETTINGS_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
-                             "Master PDF", "settings.json")
+def settings_folder():
+    """Where the app keeps its settings: Windows' AppData, macOS's Application Support,
+    Linux's ~/.config."""
+    if sys.platform == "win32":
+        return os.environ.get("APPDATA") or os.path.expanduser("~")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support")
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+
+
+SETTINGS_PATH = os.path.join(settings_folder(), "Master PDF", "settings.json")
 CUSTOM_ICON = os.path.join(os.path.dirname(SETTINGS_PATH), "custom_icon.png")  # Settings > App icon
 
 
@@ -887,6 +909,9 @@ class ClassicWindow:
             pass
 
     def minimize(self):
+        if not hasattr(self, "bar"):  # (macOS / Linux: the system's own title bar)
+            self.win.iconify()
+            return
         try:
             import ctypes
             ctypes.windll.user32.ShowWindow(self.hwnd(), 6)  # SW_MINIMIZE
@@ -962,6 +987,16 @@ class ClassicWindow:
     def toggle_maximize(self):
         if not self.resizable:
             return
+        if not hasattr(self, "bar"):  # (macOS / Linux: the system maximizes it)
+            self.maximized = not self.maximized
+            try:
+                if sys.platform == "darwin":
+                    self.win.state("zoomed" if self.maximized else "normal")
+                else:
+                    self.win.attributes("-zoomed", self.maximized)
+            except tk.TclError:
+                pass
+            return
         if self.maximized:  # back to a snapped half if it was one, else the size from before
             self.win.geometry(self._half_geo if getattr(self, "half", False) else self.normal_geo)
         else:
@@ -991,10 +1026,18 @@ class ClassicWindow:
             self.draw()
 
     def set_icon(self, path, size=16):
-        """Show the picture at path, size x size, at the left of the title bar."""
+        """Show the picture at path, size x size, at the left of the title bar (macOS / Linux:
+        the window's own icon)."""
         self.icon = ImageTk.PhotoImage(Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS))
         if hasattr(self, "bar"):
             self.draw()
+        else:
+            try:
+                self._native_icon = ImageTk.PhotoImage(Image.open(path).convert("RGBA").resize(
+                    (64, 64), Image.LANCZOS), master=self.win)
+                self.win.iconphoto(False, self._native_icon)
+            except Exception:
+                pass
 
     def set_update_button(self, on_click):
         """Show a green download-arrow button left of _ that calls on_click (None hides it)."""
@@ -1027,6 +1070,8 @@ class ClassicWindow:
         return out
 
     def draw(self):
+        if not hasattr(self, "bar"):  # (macOS / Linux: the system draws the title bar)
+            return
         c, W, H = self.bar, self.bar.winfo_width(), self.TITLE_H
         c.delete("all")
         a, b = CAPTION_ACTIVE if self.active else caption_inactive()
@@ -1707,10 +1752,45 @@ _SOUNDS = {}
 SOUNDS_ON = True  # Settings > Sound effects (read from the settings file at start)
 
 
+def bind_wheel(widget, seq, func):
+    """widget.bind(seq, func) for a <...MouseWheel> - and on Linux (X11), where Tk 8.6 sends
+    the wheel as buttons 4 / 5, those too: func gets an event with delta set (+120 up)."""
+    widget.bind(seq, func)
+    if widget.tk.call("tk", "windowingsystem") == "x11":
+        mods = seq[1:-1].rsplit("MouseWheel", 1)[0]
+
+        def as_wheel(e, delta):
+            e.delta = delta
+            return func(e)
+        widget.bind(f"<{mods}Button-4>", lambda e: as_wheel(e, 120))
+        widget.bind(f"<{mods}Button-5>", lambda e: as_wheel(e, -120))
+
+
+def play_sound_elsewhere(kind):
+    """A sound on macOS / Linux: the WAV written once to a file, played by the system's
+    player in the background."""
+    import shutil
+    player = (["afplay"] if sys.platform == "darwin" else
+              next(([p] for p in ("paplay", "aplay", "pw-play") if shutil.which(p)), None))
+    if not player or kind not in _SOUNDS:
+        return
+    try:
+        path = os.path.join(tempfile.gettempdir(), f"masterpdf-{kind}.wav")
+        if not os.path.isfile(path):
+            with open(path, "wb") as f:
+                f.write(_SOUNDS[kind])
+        subprocess.Popen(player + [path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def play_sound(kind):
     """Play "done" or "error" without waiting for it (Windows only; silently skipped if the
     sound can't play, e.g. no speakers)."""
-    if sys.platform != "win32" or kind is None or not SOUNDS_ON:
+    if kind is None or not SOUNDS_ON:
+        return
+    if sys.platform != "win32":  # (macOS: afplay; Linux: whichever player there is)
+        play_sound_elsewhere(kind)
         return
 
     def go():
@@ -2094,7 +2174,7 @@ class WhatsThis:
         self.saved = {}
 
     def pick(self, e):
-        if e.widget is self.chrome.bar:  # the title bar (? again, X...): out of help mode
+        if e.widget is getattr(self.chrome, "bar", None):  # the title bar (? again, X...): out of help mode
             self.stop()
             return None  # ... and the click still reaches its button
         widget = e.widget  # (a click inside a button is the button's)
@@ -2892,18 +2972,15 @@ def page_find(page, query):
                     flat.append(x)
                     where.append(n)
             s = "".join(flat)
-            shown = unicodedata.normalize("NFKC", "".join(ch["c"] for ch in chars))
             start = s.find(key)
             while start >= 0:
                 a, b = where[start], where[start + len(key) - 1]
                 rect = pymupdf.Rect(chars[a]["bbox"])
                 for ch in chars[a:b + 1]:
                     rect |= ch["bbox"]
-                before = s[:start]  # (normalized: as shown, letters as they read)
-                before, words, after = (shown[:len(before)] if len(shown) == len(s) else before,
-                                        s[start:start + len(key)], s[start + len(key):])
-                if len(shown) == len(s):
-                    words, after = shown[start:start + len(key)], shown[start + len(key):]
+                text_of = lambda cs: unicodedata.normalize("NFKC", "".join(ch["c"] for ch in cs))  # noqa: E731
+                before, words, after = (text_of(chars[:a]), text_of(chars[a:b + 1]),
+                                        text_of(chars[b + 1:]))  # (the line as written)
                 if len(before) > 40:
                     before = "..." + before[-37:].lstrip()
                 if len(after) > 70:
@@ -2942,16 +3019,26 @@ def is_word(path):
 
 
 def find_libreoffice():
-    for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
-                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
-        exe = os.path.join(base, "LibreOffice", "program", "soffice.exe")
+    """LibreOffice's converter (soffice), wherever this system keeps it - or None."""
+    import shutil
+    if sys.platform == "win32":
+        for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+            exe = os.path.join(base, "LibreOffice", "program", "soffice.exe")
+            if os.path.isfile(exe):
+                return exe
+        return None
+    if sys.platform == "darwin":
+        exe = "/Applications/LibreOffice.app/Contents/MacOS/soffice"
         if os.path.isfile(exe):
             return exe
-    return None
+    return shutil.which("soffice") or shutil.which("libreoffice")
 
 
 def has_word():
-    """Whether Microsoft Word is installed (it does the converting)."""
+    """Whether Microsoft Word is installed (it does the converting) - on Windows."""
+    if sys.platform != "win32":
+        return False
     try:
         import winreg
         winreg.CloseKey(winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"Word.Application\CLSID"))
@@ -3021,8 +3108,10 @@ def word_to_pdf(src, dst, job=None):
                 os.replace(made, dst)
             return
         why = why or "LibreOffice couldn't convert it"
-    raise RuntimeError(why or "making a PDF from a Word document needs Microsoft Word "
-                              "(or LibreOffice) on this computer")
+    raise RuntimeError(why or ("making a PDF from a Word document needs Microsoft Word "
+                               "(or LibreOffice) on this computer" if sys.platform == "win32" else
+                               "making a PDF from a Word document needs LibreOffice on this "
+                               "computer (free from libreoffice.org)"))
 
 
 def open_pdf(path):
@@ -3164,7 +3253,7 @@ class FlatScrollbar(tk.Canvas):
         self.bind("<ButtonPress-1>", self.press)
         self.bind("<B1-Motion>", self.drag)
         self.bind("<ButtonRelease-1>", self.release)
-        self.bind("<MouseWheel>", lambda e: e.delta and self.command(
+        bind_wheel(self, "<MouseWheel>", lambda e: e.delta and self.command(
             "scroll", -int(e.delta / 120) or (-1 if e.delta > 0 else 1), "units"))
 
     # positions along the bar: y if it's upright, x if it lies down
@@ -4329,8 +4418,23 @@ def sharpened(sharp, size):
 # copy inside a PDF usually holds only the letters it used), else the closest one.
 # Pictures keep their place in the page's drawing instructions: moving or resizing one just
 # changes the position it's drawn at, so nothing else on the page is touched.
-FONT_FOLDERS = [os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
-                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts")]
+if sys.platform == "win32":
+    FONT_FOLDERS = [os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
+                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts")]
+elif sys.platform == "darwin":
+    FONT_FOLDERS = ["/System/Library/Fonts", "/System/Library/Fonts/Supplemental", "/Library/Fonts",
+                    os.path.expanduser("~/Library/Fonts")]
+else:
+    FONT_FOLDERS = ["/usr/share/fonts", "/usr/local/share/fonts", os.path.expanduser("~/.fonts"),
+                    os.path.expanduser("~/.local/share/fonts")]
+
+
+def font_files(folder):
+    """The font files in a folder and the folders in it."""
+    out = []
+    for root, _dirs, files in os.walk(folder):
+        out += [os.path.join(root, f) for f in sorted(files)]
+    return out
 BASE_FONTS = {"he": ("helv", "heit", "hebo", "hebi"), "ti": ("tiro", "tiit", "tibo", "tibi"),
               "co": ("cour", "coit", "cobo", "cobi")}  # PDF's own fonts: plain, italic, bold, both
 RTL_LETTERS = re.compile("[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufeff]")  # Hebrew, Arabic...
@@ -4399,14 +4503,9 @@ def scan_fonts():
     it only reads the files' name tables, so it doesn't need MuPDF)."""
     index, families, styles, cut = {}, {}, {}, {}
     for folder in FONT_FOLDERS:
-        try:
-            files = sorted(os.listdir(folder))
-        except OSError:
-            continue
-        for file in files:
-            if not file.lower().endswith((".ttf", ".otf", ".ttc")):
+        for path in font_files(folder):
+            if not path.lower().endswith((".ttf", ".otf", ".ttc")):
                 continue
-            path = os.path.join(folder, file)
             try:
                 names, family, subfamily = sfnt_names(path)
             except Exception:
@@ -5240,6 +5339,10 @@ def keep_case(doc, xref, path, text):
             g = font.has_glyph(ord(c.lower()))
             if g and g == font.has_glyph(ord(c.upper())):
                 want[g] = c.upper() if want.get(g, c) != c else c
+    if " " in text:  # (a space read back as a space: fonts that draw the no-break space with
+        g = font.has_glyph(32)  # the same shape get it read back as that - copied out wrong)
+        if g:
+            want[g] = " "
     if not want:
         return
     kind, value = doc.xref_get_key(xref, "ToUnicode")
@@ -6349,9 +6452,9 @@ class DocView(tk.Frame):
         c.bind("<Triple-Button-1>", self.on_triple)
         c.bind("<Button-3>", self.on_right_click)
         c.bind("<Motion>", self.on_motion)
-        c.bind("<MouseWheel>", self.on_wheel)
-        c.bind("<Shift-MouseWheel>", lambda e: self.wheel_scroll(e, "x"))
-        c.bind("<Control-MouseWheel>", self.on_ctrl_wheel)
+        bind_wheel(c, "<MouseWheel>", self.on_wheel)
+        bind_wheel(c, "<Shift-MouseWheel>", lambda e: self.wheel_scroll(e, "x"))
+        bind_wheel(c, "<Control-MouseWheel>", self.on_ctrl_wheel)
 
     # ---- layout ----
     def fit_scale(self, mode):
@@ -8171,9 +8274,9 @@ class ThumbBar(tk.Frame):
         c.bind("<B1-Motion>", self.on_drag)
         c.bind("<ButtonRelease-1>", self.on_release)
         c.bind("<Button-3>", self.on_right_click)
-        c.bind("<MouseWheel>", lambda e: e.delta and c.yview_scroll(
+        bind_wheel(c, "<MouseWheel>", lambda e: e.delta and c.yview_scroll(
             -int(e.delta / 120) * 2 or (-1 if e.delta > 0 else 1), "units"))
-        c.bind("<Control-MouseWheel>", self.ctrl_wheel)
+        bind_wheel(c, "<Control-MouseWheel>", self.ctrl_wheel)
         self.lists = {"bookmarks": self.make_list("bookmarks"),
                       "annotations": self.make_list("annotations")}
         self.views["results"] = self.make_results()
@@ -8339,7 +8442,7 @@ class ThumbBar(tk.Frame):
         tree.bind("<<TreeviewSelect>>", lambda e: self.list_go(key, double=False))
         tree.bind("<Double-Button-1>", lambda e: self.list_go(key, double=True))
         tree.bind("<Button-3>", lambda e: self.list_menu(key, e))
-        tree.bind("<Control-MouseWheel>", self.ctrl_wheel)
+        bind_wheel(tree, "<Control-MouseWheel>", self.ctrl_wheel)
         return {"tree": tree, "sb": sb, "note": note, "targets": {}, "stale": True}
 
     def refresh_lists(self):
@@ -9649,6 +9752,8 @@ class App(BaseTk):
         # opened with a file (double-clicked, "Open with", or dropped on the program)
         if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
             self.after(300, lambda: self.open_path(sys.argv[1], asked=True))
+        if os.environ.get("MASTERPDF_SELFTEST"):  # (the build's check: see self_test)
+            self.after(1500, self.self_test)
 
     # ---- the toolbar and the status bar ----
     def build_toolbar(self, parent):
@@ -10017,6 +10122,9 @@ class App(BaseTk):
 
         def key(seq, action, in_text=False):
             self.bind(seq, lambda e: None if (typing() and not in_text) else (action(), "break")[1])
+            if sys.platform == "darwin" and seq.startswith("<Control-"):  # (macOS: Command too)
+                self.bind(seq.replace("<Control-", "<Command-", 1),
+                          lambda e: None if (typing() and not in_text) else (action(), "break")[1])
             m = re.fullmatch(r"<Control-([A-Za-z])>", seq)
             if m:
                 shortcuts[(ord(m[1].upper()), m[1].isupper())] = (action, in_text)
@@ -10028,6 +10136,8 @@ class App(BaseTk):
                  0x5A: "<<Undo>>", 0x59: "<<Redo>>"}
 
         def by_key(e):
+            if sys.platform != "win32":  # (the key codes below are Windows' own)
+                return None
             if len(e.keysym) == 1 and e.keysym.isascii():
                 return None  # (a Latin letter: the usual bindings did it)
             if typing() and e.keycode in edits:
@@ -11919,6 +12029,9 @@ class App(BaseTk):
             meta = meta or self.wrap_state()  # (as things were: for Undo)
             rec = self.wrap_record(i, obj) or self.new_record(i, obj)  # (the frame's text and
             rec["runs"], rec["edited"] = list(runs), True  # place kept: laid out round any
+            rec["wrap"] = (len(obj["lines"]) > 1 or x0 is not None or "cell" in obj
+                           or self._boxes.get((i, obj.get("oid"))) is not None
+                           or "frame_x" in memo or rec.get("wrap", False))
             if align:  # picture, what's under it pushed down as it grows - and back up)
                 rec["how"] = align
             box = self._boxes.get((i, obj.get("oid")))
@@ -12381,7 +12494,9 @@ class App(BaseTk):
                         remove_text(page, r)
                     placed = layout_frame(page, e["obj"], runs_to_paras(runs), a0, a1,
                                           how or "left", start_y=info["home_y"] + push,
-                                          avoid=avoid, geometry=geom)
+                                          avoid=avoid, geometry=geom,
+                                          wrap=info.get("wrap", len(e["obj"]["lines"]) > 1)
+                                          or avoid is not None)
                 if e["obj"].get("oid") is not None and boxes:
                     self._claims.setdefault(i, []).append((e["obj"]["oid"], list(boxes)))
                 put_marks(page, placed, see)
@@ -12923,8 +13038,13 @@ class App(BaseTk):
 
 
     # ---- updates ----
+    def self_test(self):
+        self_test_main(self)
+
     def startup_update_tasks(self):
         """Just updated? Show what's new. Then look for a newer version in the background."""
+        if os.environ.get("MASTERPDF_SELFTEST"):  # (the build's check: offline, no questions)
+            return
         self.show_update_notes()
         self.check_for_updates()
 
@@ -13011,6 +13131,14 @@ class App(BaseTk):
         """Download the new installer (with a progress bar), run it silently - no questions:
         it installs over this version where it is - and close; the installer starts the new
         version, which then shows the release notes."""
+        if sys.platform != "win32":  # (macOS / Linux: the new version's download, opened in
+            import webbrowser  # the browser - installed the way the first one was)
+            webbrowser.open(url)
+            dialog("Master PDF", f"Master PDF {version} is downloading in your browser.\n"
+                   "Install it the way you installed this one"
+                   + (" (drag it into Applications)." if sys.platform == "darwin" else
+                      " (replace the old AppImage file).") + "\nThen close this version.")
+            return
         if not self.maybe_save():
             return
         win, chrome, body = new_dialog(self, "Updating")
@@ -13659,6 +13787,86 @@ class App(BaseTk):
         win.bind("<Return>", lambda e: win.destroy())
         win.bind("<Escape>", lambda e: win.destroy())
         show_dialog(win, self, focus=ok)
+
+
+def self_test_steps(app):
+    """The build's own check (MASTERPDF_SELFTEST=1): a PDF made, opened, its text moved and
+    retyped, a picture added, searched, the dark theme, saved and read back. Returns the
+    problems (empty: all good)."""
+    problems = []
+    folder = tempfile.mkdtemp(prefix="masterpdf-selftest-")
+    src = os.path.join(folder, "test.pdf")
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 100), "Hello from the self-test", fontsize=18)
+    page.insert_text((72, 140), "A second line of text to find", fontsize=12)
+    doc.save(src)
+    doc.close()
+    app.open_path(src, asked=True)
+    app.update()
+    if not app.doc or app.doc.page_count != 1:
+        return ["the PDF didn't open"]
+    app.wait_fonts()
+    app.set_tool("edit")
+    texts = [o for o in app.objects_on(0) if o["kind"] == "text"]
+    if not texts:
+        problems.append("no text found on the page")
+    else:
+        o = next((x for x in texts if x["text"].startswith("Hello")), texts[0])
+        app.move_object(0, o, pymupdf.Point(0, 30))
+        o = next((x for x in app.objects_on(0) if x["kind"] == "text" and x["text"].startswith("Hello")), None)
+        if o is None:
+            problems.append("the moved text was lost")
+        else:
+            app.replace_frame(0, o, [("Hello, edited", app.frame_runs(0, o)[0][1])])
+            if "Hello, edited" not in app.doc[0].get_text():
+                problems.append("retyping text didn't work")
+    img = Image.new("RGB", (60, 40), (200, 30, 30))
+    app.put_picture(0, img, rect=pymupdf.Rect(300, 300, 360, 340))
+    if not any(o["kind"] == "image" for o in app.objects_on(0)):
+        problems.append("adding a picture didn't work")
+    app.search("second")
+    if len(app.find_hits) != 1:
+        problems.append(f"find found {len(app.find_hits)} results, not 1")
+    app.set_theme("dark")
+    app.update()
+    app.set_theme(DEFAULT_THEME)
+    app.update()
+    out = os.path.join(folder, "saved.pdf")
+    with PDF_LOCK:
+        app.doc.save(out)
+    check = pymupdf.open(out)
+    if "Hello, edited" not in check[0].get_text():
+        problems.append("the saved PDF lost the change")
+    check.close()
+    return problems
+
+
+def self_test_main(app):
+    """MASTERPDF_SELFTEST=1: the steps above, a screenshot (MASTERPDF_SELFTEST_SHOT), and the
+    result (MASTERPDF_SELFTEST_OUT): "ok", or what went wrong. Then the app closes."""
+    try:
+        problems = self_test_steps(app)
+    except Exception as e:
+        import traceback
+        problems = ["crashed: " + "".join(traceback.format_exception(e))[-1500:]]
+    shot = os.environ.get("MASTERPDF_SELFTEST_SHOT")
+    if shot:
+        try:
+            from PIL import ImageGrab
+            app.update()
+            x, y = app.winfo_rootx(), app.winfo_rooty()
+            ImageGrab.grab(bbox=(x, y, x + app.winfo_width(), y + app.winfo_height())).save(shot)
+        except Exception as e:
+            problems.append(f"(no screenshot: {e})")
+    result = "ok" if not [p for p in problems if not p.startswith("(")] else "\n".join(problems)
+    out = os.environ.get("MASTERPDF_SELFTEST_OUT")
+    if out:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(result + ("\n" + "\n".join(problems) if problems and result == "ok" else ""))
+    print("SELF-TEST:", result, flush=True)
+    app.dirty = False
+    app.destroy()
 
 
 if __name__ == "__main__":
