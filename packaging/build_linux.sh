@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds MasterPDF-x86_64.AppImage: the app as one file that runs on most Linux systems.
+# Builds MasterPDF-Linux.AppImage: the app as one file that runs on most Linux systems.
 # Needs Python 3.10+ with Tk. Run from the project folder:  bash packaging/build_linux.sh
 set -e
 cd "$(dirname "$0")/.."
@@ -29,5 +29,5 @@ if [ ! -x "$TOOL" ]; then
     chmod +x "$TOOL"
 fi
 mkdir -p installer_output
-ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" build/AppDir installer_output/MasterPDF-x86_64.AppImage
-echo "Built: installer_output/MasterPDF-x86_64.AppImage"
+ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" build/AppDir installer_output/MasterPDF-Linux.AppImage
+echo "Built: installer_output/MasterPDF-Linux.AppImage"

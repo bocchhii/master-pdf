@@ -31,7 +31,7 @@ Everything is on the [Releases](../../releases/latest) page.
 
 **Windows**
 
-1. Download **MasterPDF-Setup.exe**.
+1. Download **MasterPDF-Windows-Setup.exe**.
 2. Run it. If Windows says **"Windows protected your PC"**, click **More info → Run anyway**.
    That warning shows up for any app that isn't signed with a paid certificate. It doesn't mean
    the app is unsafe.
@@ -39,8 +39,9 @@ Everything is on the [Releases](../../releases/latest) page.
 
 **macOS**
 
-1. Download **MasterPDF-macOS-AppleSilicon.dmg** (Macs with an M1 or newer chip) or
-   **MasterPDF-macOS-Intel.dmg** (older Macs).
+1. Download **MasterPDF-Mac-AppleChip-M1-and-newer.dmg** if your Mac has an Apple chip (M1, M2,
+   M3, M4...), or **MasterPDF-Mac-Intel-chip.dmg** if it's an older Mac with an Intel chip. (Not
+   sure? Apple menu → About This Mac: it says "Chip: Apple M..." or "Processor: Intel".)
 2. Open it and drag **Master PDF** into **Applications**.
 3. The first time, macOS says it can't check the app. Open **System Settings → Privacy &
    Security**, scroll down and click **Open Anyway**. Like the Windows warning, it shows up for
@@ -48,9 +49,9 @@ Everything is on the [Releases](../../releases/latest) page.
 
 **Linux**
 
-1. Download **MasterPDF-x86_64.AppImage**.
+1. Download **MasterPDF-Linux.AppImage**.
 2. Make it runnable (right-click → Properties → Allow executing as program, or
-   `chmod +x MasterPDF-x86_64.AppImage`) and double-click it.
+   `chmod +x MasterPDF-Linux.AppImage`) and double-click it.
 
 The app tells you when there's a new version. On Windows it updates itself; on macOS and Linux it
 downloads the new version for you to install the same way. Checking for updates is the only time

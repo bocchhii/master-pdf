@@ -1,4 +1,4 @@
-; Inno Setup script - builds MasterPDF-Setup.exe
+; Inno Setup script - builds MasterPDF-Windows-Setup.exe
 #define MyAppName "Master PDF"
 #ifndef MyAppVersion
   #define MyAppVersion "1.0.0"
@@ -18,7 +18,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=installer_output
-OutputBaseFilename=MasterPDF-Setup
+OutputBaseFilename=MasterPDF-Windows-Setup
 SetupIconFile=icon.ico
 UninstallDisplayIcon={app}\{#MyAppExe}
 Compression=lzma2

@@ -22,7 +22,7 @@ if not exist "%ISCC%" goto :noinno
 "%ISCC%" installer.iss
 if errorlevel 1 goto :fail
 echo.
-echo DONE! Send this file to people: installer_output\MasterPDF-Setup.exe
+echo DONE! Send this file to people: installer_output\MasterPDF-Windows-Setup.exe
 goto :end
 
 :noinno

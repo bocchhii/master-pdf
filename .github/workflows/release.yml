@@ -64,7 +64,7 @@ jobs:
         with:
           name: MasterPDF-Windows
           path: |
-            installer_output/MasterPDF-Setup.exe
+            installer_output/MasterPDF-Windows-Setup.exe
             screenshot-windows.png
           if-no-files-found: ignore
 
@@ -74,9 +74,9 @@ jobs:
       matrix:
         include:
           - runner: macos-14          # Apple chips (M1 and newer)
-            file: MasterPDF-macOS-AppleSilicon
+            file: MasterPDF-Mac-AppleChip-M1-and-newer
           - runner: macos-15-intel    # Intel Macs
-            file: MasterPDF-macOS-Intel
+            file: MasterPDF-Mac-Intel-chip
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -131,7 +131,7 @@ jobs:
         run: |
           MASTERPDF_SELFTEST=1 MASTERPDF_SELFTEST_OUT="$PWD/selftest.txt" \
           MASTERPDF_SELFTEST_SHOT="$PWD/screenshot-linux.png" APPIMAGE_EXTRACT_AND_RUN=1 \
-          xvfb-run -a -s "-screen 0 1600x1000x24" installer_output/MasterPDF-x86_64.AppImage || true
+          xvfb-run -a -s "-screen 0 1600x1000x24" installer_output/MasterPDF-Linux.AppImage || true
           cat selftest.txt
           test "$(head -n 1 selftest.txt)" = "ok"
       - name: Keep the AppImage and screenshot with the run
@@ -140,7 +140,7 @@ jobs:
         with:
           name: MasterPDF-Linux
           path: |
-            installer_output/MasterPDF-x86_64.AppImage
+            installer_output/MasterPDF-Linux.AppImage
             screenshot-linux.png
           if-no-files-found: ignore
 
@@ -160,6 +160,6 @@ jobs:
         with:
           fail_on_unmatched_files: false
           files: |
-            files/**/MasterPDF-Setup.exe
+            files/**/MasterPDF-Windows-Setup.exe
             files/**/*.dmg
             files/**/*.AppImage
