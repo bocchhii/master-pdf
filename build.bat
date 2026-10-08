@@ -10,7 +10,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt pyinstaller
 if errorlevel 1 goto :fail
 
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name MasterPDF --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --collect-all tkinterdnd2 --collect-all pymupdf master_pdf.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name MasterPDF --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --add-data "fonts;fonts" --collect-all tkinterdnd2 --collect-all pymupdf master_pdf.py
 if errorlevel 1 goto :fail
 echo.
 echo Built the app: dist\MasterPDF.exe

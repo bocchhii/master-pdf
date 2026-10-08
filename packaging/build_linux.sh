@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 
 python -m pip install -r requirements.txt pyinstaller
 python -m PyInstaller --noconfirm --clean --onefile --windowed --name MasterPDF \
-    --add-data "icon.ico:." --add-data "icon.png:." \
+    --add-data "icon.ico:." --add-data "icon.png:." --add-data "fonts:fonts" \
     --collect-all tkinterdnd2 --collect-all pymupdf --hidden-import PIL._tkinter_finder master_pdf.py
 
 # the AppImage's folder: the app, its menu entry and its icon

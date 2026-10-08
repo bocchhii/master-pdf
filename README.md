@@ -83,7 +83,17 @@ a version tag (like `v1.2.0`) is pushed.
 - [tkinterdnd2](https://github.com/Eliav2/tkinterdnd2) for drag and drop
 - [PyInstaller](https://pyinstaller.org/) and [Inno Setup](https://jrsoftware.org/isinfo.php) for the app and installer
 
+- The free fonts the app comes with (in `fonts/`), so text keeps its look on any computer:
+  [Carlito](https://fonts.google.com/specimen/Carlito), [Caladea](https://fonts.google.com/specimen/Caladea),
+  [Liberation](https://github.com/liberationfonts/liberation-fonts), [DejaVu](https://dejavu-fonts.github.io/),
+  [Selawik](https://github.com/microsoft/Selawik), [Amiri](https://fonts.google.com/specimen/Amiri),
+  [Tajawal](https://fonts.google.com/specimen/Tajawal), [Comic Neue](https://fonts.google.com/specimen/Comic+Neue),
+  [Courier Prime](https://fonts.google.com/specimen/Courier+Prime), [Lato](https://fonts.google.com/specimen/Lato),
+  [Poppins](https://fonts.google.com/specimen/Poppins), [PT Sans](https://fonts.google.com/specimen/PT+Sans),
+  [PT Serif](https://fonts.google.com/specimen/PT+Serif) and [Ubuntu](https://design.ubuntu.com/font)
+
 Each of these has its own license. PyMuPDF and MuPDF are under the AGPL, which applies if you
-share the built app.
+share the built app. The fonts are under the SIL Open Font License, the Ubuntu Font Licence, or
+their own free licenses; each font's license file is next to it in `fonts/`.
 
 Made by **bocchi the old**. For more tools, check out [my GitHub profile](https://github.com/bocchhii).

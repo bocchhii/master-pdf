@@ -9,7 +9,7 @@ NAME="${1:-MasterPDF-macOS}"
 python3 -m pip install -r requirements.txt pyinstaller
 python3 -m PyInstaller --noconfirm --clean --windowed --name "Master PDF" --icon icon.png \
     --osx-bundle-identifier com.bocchhii.masterpdf \
-    --add-data "icon.ico:." --add-data "icon.png:." \
+    --add-data "icon.ico:." --add-data "icon.png:." --add-data "fonts:fonts" \
     --collect-all tkinterdnd2 --collect-all pymupdf --hidden-import PIL._tkinter_finder master_pdf.py
 
 # the disk image: the app, and a shortcut to Applications to drag it onto

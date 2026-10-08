@@ -33,7 +33,7 @@ jobs:
           Set-Content master_pdf.py $code -NoNewline -Encoding utf8
           Select-String -Path master_pdf.py -Pattern '^APP_VERSION = '
       - name: Build the exe
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name MasterPDF --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --collect-all tkinterdnd2 --collect-all pymupdf master_pdf.py
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name MasterPDF --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --add-data "fonts;fonts" --collect-all tkinterdnd2 --collect-all pymupdf master_pdf.py
       - name: Self-test
         timeout-minutes: 5
         run: |

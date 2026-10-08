@@ -23,7 +23,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 from tkinter import font as tkfont
 
-from PIL import Image, ImageChops, ImageDraw, ImageOps, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageStat, ImageTk
 
 import pymupdf  # PyMuPDF: reads, draws and writes the PDFs
 
@@ -2059,6 +2059,226 @@ class PopupMenu:
             icon.bind("<ButtonRelease-1>", up)
 
 
+ARABIC_SAMPLE = "\u0623\u0628\u062c\u062f \u0647\u0648\u0632"  # (Word's: abjad hawwaz)
+
+
+ROTATE_ICON = 24  # (the rotate handle's picture: how big, in pixels)
+
+
+def rotate_icon(size=ROTATE_ICON, color=(95, 95, 95)):
+    """The rotate handle's picture, as Word's: a grey arrow going round clockwise, open at the
+    top right. Drawn 8 times as big and made small: smooth."""
+    k = 8
+    S = size * k
+    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    c, r, w = S / 2, S * 0.30, round(S * 0.12)
+    start, end = 10, 268  # (clockwise from just under the right, round to the top)
+    d.arc((c - r, c - r, c + r, c + r), start=start, end=end, fill=color + (255,), width=w)
+    a = math.radians(end)  # (its head, at the top, pointing on clockwise)
+    px, py = c + r * math.cos(a), c + r * math.sin(a)
+    tx, ty, nx, ny = -math.sin(a), math.cos(a), math.cos(a), math.sin(a)
+    L, H = S * 0.24, S * 0.17
+    head = [(px + tx * L * 0.8, py + ty * L * 0.8),
+            (px - tx * L * 0.2 + nx * H, py - ty * L * 0.2 + ny * H),
+            (px - tx * L * 0.2 - nx * H, py - ty * L * 0.2 - ny * H)]
+    d.polygon(head, fill=color + (255,))
+    return im.resize((size, size), Image.LANCZOS)
+
+
+class FontList:
+    """The font box's drop-down list, like Word's: each font's name written in that font
+    (a font of symbols - no letters - in the plain one), and an Arabic sample at the right
+    of the fonts that have Arabic letters. Only the rows in sight are drawn, so a computer's
+    hundreds of fonts open at once; what a font can show is read from its file the first
+    time its row comes into sight."""
+    ROW, SHOWN, WIDTH = 28, 18, 330  # (a row's height, rows in sight, the list's width)
+    kinds = {}  # family -> (has letters, has Arabic) - kept between opens
+
+    ADD = "Add a font..."  # (the last row: a font file added to the app - My fonts)
+
+    def __init__(self, box, families, current, chosen, add=None):
+        self.box, self.families, self.chosen, self.add = box, families, chosen, add
+        self.count = len(families) + (1 if add else 0)  # (rows)
+        top = self.top = tk.Toplevel(box, bg="#000000")
+        top.keeps_owner_active = True
+        top.withdraw()
+        top.overrideredirect(True)
+        top.transient(box.winfo_toplevel())
+        w = self.w = max(box.winfo_width(), self.WIDTH)
+        h = self.ROW * min(self.count, self.SHOWN)
+        self.back, self.text = theme_color("#FFFFFF", "box"), theme_color("#000000", "text")
+        self.canvas = tk.Canvas(top, width=w, height=h, bg=self.back, highlightthickness=0, bd=0,
+                                yscrollincrement=1)
+        bar = ttk.Scrollbar(top, orient="vertical", command=self.scroll_bar)
+        self.canvas.config(yscrollcommand=bar.set,
+                           scrollregion=(0, 0, w, self.ROW * self.count))
+        bar.pack(side="right", fill="y", pady=1, padx=(0, 1))
+        self.canvas.pack(side="left", padx=(1, 0), pady=1)
+        self.hot = families.index(current) if current in families else 0
+        top.update_idletasks()
+        tw, th = top.winfo_reqwidth(), top.winfo_reqheight()
+        x, y = box.winfo_rootx(), box.winfo_rooty() + box.winfo_height()
+        if y + th > top.winfo_screenheight():  # (no room below: above the box)
+            y = box.winfo_rooty() - th
+        top.geometry(f"+{max(0, min(x, top.winfo_screenwidth() - tw))}+{max(0, y)}")
+        self.show_row(self.hot, middle=True)
+        top.deiconify()
+        top.lift()
+        top.attributes("-topmost", True)
+        top.focus_force()
+        top.grab_set()  # (a click anywhere comes here: outside the list closes it)
+        top.bind("<ButtonPress>", self.press)
+        top.bind("<ButtonRelease-1>", self.release)
+        top.bind("<Motion>", self.motion)
+        bind_wheel(top, "<MouseWheel>", self.wheel)
+        for key, step in (("Up", -1), ("Down", 1), ("Prior", -self.SHOWN), ("Next", self.SHOWN),
+                          ("Home", -self.count), ("End", self.count)):
+            top.bind(f"<{key}>", lambda e, s=step: self.move(s))
+        top.bind("<Return>", lambda e: self.pick(self.hot))
+        top.bind("<Escape>", lambda e: self.close())
+        top.bind("<Key>", self.letter, add="+")
+        top.bind("<FocusOut>", lambda e: top.after(50, self.check_focus))
+
+    def kind(self, family):
+        """(has Latin letters, has Arabic letters) of a family, read from its font file."""
+        if family not in self.kinds:
+            letters, arabic = True, False
+            found = family_font(font_key(family), False, False)
+            if found and found[0]:
+                try:
+                    with PDF_LOCK:
+                        font = pymupdf.Font(fontfile=found[0])  # (not kept: just looked at)
+                        letters = bool(font.has_glyph(ord("a")) and font.has_glyph(ord("A")))
+                        arabic = all(font.has_glyph(ord(c)) for c in ARABIC_SAMPLE if c != " ")
+                except Exception:
+                    pass
+            self.kinds[family] = (letters, arabic)
+        return self.kinds[family]
+
+    def draw(self):
+        """The rows in sight (and one more each way) drawn - the rest aren't."""
+        c = self.canvas
+        c.delete("all")
+        top = int(c.canvasy(0))
+        first = max(0, top // self.ROW - 1)
+        last = min(self.count, (top + int(c.cget("height"))) // self.ROW + 2)
+        for i in range(first, last):
+            y = i * self.ROW
+            hot = i == self.hot
+            fg = select_colors()[1] if hot else self.text
+            if hot:
+                c.create_rectangle(0, y, self.w, y + self.ROW, fill=select_colors()[0], width=0)
+            if i == len(self.families):  # (Add a font...: under a line, in the plain font)
+                c.create_line(0, y, self.w, y, fill=theme_color("#A0A0A0", "text"))
+                c.create_text(8, y + self.ROW // 2, text=self.ADD, anchor="w", fill=fg,
+                              font=("Segoe UI", 11))
+                continue
+            family = self.families[i]
+            letters, arabic = self.kind(family)
+            c.create_text(8, y + self.ROW // 2, text=family, anchor="w", fill=fg,
+                          font=(family if letters else "Segoe UI", 12))
+            if arabic:
+                c.create_text(self.w - 8, y + self.ROW // 2, text=ARABIC_SAMPLE, anchor="e",
+                              fill=fg, font=(family, 11))
+
+    def show_row(self, i, middle=False):
+        """Row i scrolled into sight (to the middle, when the list opens)."""
+        c, h = self.canvas, int(self.canvas.cget("height"))
+        total = self.ROW * self.count
+        top = int(c.canvasy(0))
+        y = i * self.ROW
+        if middle:
+            top = y - (h - self.ROW) // 2
+        elif y < top:
+            top = y
+        elif y + self.ROW > top + h:
+            top = y + self.ROW - h
+        top = max(0, min(top, total - h))
+        c.yview_moveto(top / total if total else 0)
+        self.draw()
+
+    def scroll_bar(self, *args):
+        self.canvas.yview(*args)
+        self.draw()
+
+    def wheel(self, e):
+        self.canvas.yview_scroll(-3 * self.ROW * (1 if e.delta > 0 else -1), "units")
+        self.draw()
+        return "break"
+
+    def row_at(self, e):
+        """The row under the mouse (event e), or None when it isn't over the rows."""
+        c = self.canvas
+        x, y = e.x_root - c.winfo_rootx(), e.y_root - c.winfo_rooty()
+        if not (0 <= x < self.w and 0 <= y < int(c.cget("height"))):
+            return None
+        i = int(c.canvasy(y)) // self.ROW
+        return i if 0 <= i < self.count else None
+
+    def motion(self, e):
+        i = self.row_at(e)
+        if i is not None and i != self.hot:
+            self.hot = i
+            self.draw()
+
+    def press(self, e):
+        top = self.top
+        inside = (top.winfo_rootx() <= e.x_root < top.winfo_rootx() + top.winfo_width()
+                  and top.winfo_rooty() <= e.y_root < top.winfo_rooty() + top.winfo_height())
+        if not inside:
+            self.close()
+
+    def release(self, e):
+        i = self.row_at(e) if self.top else None
+        if i is not None:
+            self.pick(i)
+
+    def move(self, step):
+        self.hot = max(0, min(self.count - 1, self.hot + step))
+        self.show_row(self.hot)
+        return "break"
+
+    def letter(self, e):
+        """A letter typed: to the next font starting with it (again: the one after)."""
+        ch = (e.char or "").lower()
+        if not ch or not ch.isprintable() or ch == " ":
+            return
+        n = len(self.families)
+        for k in range(1, n + 1):
+            i = (min(self.hot, n - 1) + k) % n
+            if self.families[i].lower().startswith(ch):
+                self.hot = i
+                self.show_row(i)
+                return
+
+    def pick(self, i):
+        self.close()
+        if i == len(self.families):
+            self.add()
+        else:
+            self.chosen(self.families[i])
+
+    def check_focus(self):  # (switched to another program: closed, like a real list)
+        try:
+            f = self.top.focus_get() if self.top else None
+        except (KeyError, tk.TclError):
+            f = None
+        if self.top and (f is None or f.winfo_toplevel() is not self.top):
+            self.close()
+
+    def close(self):
+        if self.top:
+            top, self.top = self.top, None
+            top.grab_release()
+            top.destroy()
+            try:  # (the keyboard back to the window - the list had taken it)
+                self.box.winfo_toplevel().focus_force()
+                self.box.focus_set()
+            except tk.TclError:
+                pass
+
+
 class MenuBar(tk.Frame):
     """Classic menu bar under the title bar (File  Edit  View ... style): each title has its
     first letter underlined and works with a click or Alt + that letter. The titles are
@@ -2945,6 +3165,141 @@ class Cancelled(Exception):
     """Cancel was pressed while a job was running."""
 
 
+ARABIC_LETTER = re.compile("[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff\ufb50-\ufdff\ufe70-\ufeff]")
+
+
+def mend_rtl(blocks):
+    """Right-to-left text as Word (and others) save it, put in reading order: (1) letters drawn
+    as one joined shape (lam-alif "لأ", "الله") are listed backwards - the shape's first letters
+    have no width, its last carries it all: they're turned round; (2) a full stop, comma...
+    ending a line is listed first (it's drawn at the line's far left): it's put at the end - a
+    sign or space listed first but drawn inside the line, where it's drawn. So
+    the text found, selected, copied and retyped is the text as it's read. Changes blocks (from
+    get_text("rawdict")) in place."""
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        for line in block["lines"]:
+            spans = line["spans"]
+            if not any(ARABIC_LETTER.search(ch["c"]) for s in spans for ch in s.get("chars", [])):
+                continue
+            straight = abs(line["dir"][1]) < 0.01
+
+            def width(s, ch):  # (a letter's width along its line - turned lines too)
+                if straight:
+                    return ch["bbox"][2] - ch["bbox"][0]
+                try:
+                    q = pymupdf.recover_char_quad(line["dir"], s, ch)
+                    return abs(q.ur - q.ul)
+                except Exception:
+                    return 1.0
+            for s in spans:  # (letters in their joined shapes - "presentation forms", as
+                plain = []  # text laid out as HTML reads back: "ﺗﻘﺭﻳﺭ" - as the letters they are:
+                for ch in s.get("chars", []):  # "تقرير"; "ﻻ" two of them, side by side)
+                    c = ch["c"]
+                    if len(c) == 1 and ("ﭐ" <= c <= "﷿" or "ﹰ" <= c <= "﻿"):
+                        c = unicodedata.normalize("NFKC", c)
+                        if len(c) > 1 and ARABIC_LETTER.search(c):
+                            x0, y0, x1, y1 = ch["bbox"]
+                            w = (x1 - x0) / len(c)
+                            plain += [dict(ch, c=one, bbox=(x1 - (n + 1) * w, y0, x1 - n * w, y1))
+                                      for n, one in enumerate(c)]
+                            continue
+                        ch = dict(ch, c=c or ch["c"])
+                    plain.append(ch)
+                if "chars" in s:
+                    s["chars"] = plain
+            for s in spans:
+                chars = s.get("chars", [])
+                out, k = [], 0
+                while k < len(chars):
+                    j = k
+                    while j < len(chars) and width(s, chars[j]) < 0.01 \
+                            and ARABIC_LETTER.search(chars[j]["c"]):
+                        j += 1  # (letters with no width: the start of one joined shape...)
+                    if j > k and j < len(chars) and ARABIC_LETTER.search(chars[j]["c"]):
+                        out += chars[k:j + 1][::-1]  # (...and the letter carrying it: turned round)
+                        k = j + 1
+                    else:
+                        out.append(chars[k])
+                        k += 1
+                s["chars"] = out
+            every = [ch for s in spans for ch in s.get("chars", [])]
+            first = next((n for n, ch in enumerate(every) if ARABIC_LETTER.search(ch["c"])), 0)
+            lead = every[:first]  # (spaces too: Word puts a line's last space at its start)
+            if lead and straight and all(not ch["c"].isalnum() for ch in lead):
+                # (punctuation and spaces listed before the first letter go where they're
+                # drawn: before the first letter (not a space) found left of them - right to
+                # left, that's the one they come before; none: they end the line, before the
+                # spaces it ends with - "الله." - and a space between words listed first,
+                # "برنامج Master", goes back between them)
+                rest = [ch for ch in every[first:] if ch["c"].strip()]
+                before, at_end = {}, []
+                for ch in lead:
+                    to = next((r for r in rest if r["bbox"][2] <= ch["bbox"][0] + 0.5), None)
+                    if to is None:
+                        at_end.append(ch)
+                    else:
+                        before.setdefault(id(to), []).append(ch)
+                ids = {id(ch) for ch in lead}
+                for s in spans:
+                    if "chars" in s:
+                        cs = []
+                        for ch in s["chars"]:
+                            if id(ch) not in ids:
+                                cs += before.get(id(ch), []) + [ch]
+                        s["chars"] = cs
+                if at_end:
+                    last = next(s for s in reversed(spans) if s.get("chars") or s is spans[0])
+                    cs = last.setdefault("chars", [])
+                    end = len(cs)
+                    while end and not cs[end - 1]["c"].strip():
+                        end -= 1
+                    last["chars"] = cs[:end] + at_end[::-1] + cs[end:]  # (read right to left)
+            for s in spans:  # (each span's text: as its letters now are)
+                if "chars" in s:
+                    s["text"] = "".join(ch["c"] for ch in s["chars"])
+    return blocks
+
+
+def gap_spaces(blocks):
+    """The spaces a PDF leaves out: many write each word on its own, spaced by position with no
+    space letter between (justified text especially, set tightly) - so the text reads
+    "Intoday'stechnology". A gap clearly wider than the line's usual gap between letters
+    (letters' boxes are their advance widths: in a word they touch) gets a space put in, as
+    if it had been written. Changes blocks (from get_text("rawdict")) in place; returns them.
+    (Right-to-left text is put in reading order first - see mend_rtl.)"""
+    mend_rtl(blocks)
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        for line in block["lines"]:
+            if abs(line["dir"][1]) > 0.01 or line["dir"][0] < 0:
+                continue
+            seq = [(s, ch) for s in line["spans"] for ch in s["chars"]]
+            gaps = [b[1]["bbox"][0] - a[1]["bbox"][2] for a, b in zip(seq, seq[1:])
+                    if a[1]["c"].strip() and b[1]["c"].strip()]
+            if not gaps:
+                continue
+            usual = sorted(gaps)[len(gaps) // 2]
+            prev = None
+            for s in line["spans"]:
+                out = []
+                for ch in s["chars"]:
+                    if prev is not None and ch["c"].strip() and prev["c"].strip():
+                        gap = ch["bbox"][0] - prev["bbox"][2]
+                        size = s.get("size") or 10
+                        if gap > max(0.05 * size, usual + 0.06 * size) and gap < 3 * size:
+                            x = prev["bbox"][2]
+                            oy = (ch.get("origin") or ch["bbox"][:2])[1]
+                            out.append({"c": " ", "origin": (x, oy),
+                                        "bbox": (x, ch["bbox"][1], ch["bbox"][0], ch["bbox"][3])})
+                    out.append(ch)
+                    prev = ch
+                s["chars"] = out
+    return blocks
+
+
 def page_find(page, query):
     """(PDF_LOCK held) Every place query is on the page: [(rect, (before, the words, after))]
     - found letter by letter, the way they read: case and accents as typed don't matter,
@@ -2956,7 +3311,7 @@ def page_find(page, query):
     if not key:
         return []
     out = []
-    for block in page.get_text("rawdict")["blocks"]:
+    for block in gap_spaces(page.get_text("rawdict")["blocks"]):
         if block.get("type") != 0:
             continue
         for line in block["lines"]:
@@ -4429,6 +4784,25 @@ else:
                     os.path.expanduser("~/.local/share/fonts")]
 
 
+BUNDLED_FONTS = resource_path("fonts")  # (the free fonts Master PDF comes with - see fonts/)
+MY_FONTS = os.path.join(settings_folder(), "Master PDF", "fonts")  # (added in the app: My fonts)
+FONT_FOLDERS += [MY_FONTS, BUNDLED_FONTS]
+FONT_EXTS = (".ttf", ".otf", ".ttc")
+
+
+def my_fonts():
+    """The fonts added in the app (My fonts): [(file, its name)], A to Z."""
+    out = []
+    for path in font_files(MY_FONTS) if os.path.isdir(MY_FONTS) else []:
+        if path.lower().endswith(FONT_EXTS):
+            try:
+                names = sfnt_names(path)[0]
+            except Exception:
+                names = []
+            out.append((path, names[0] if names else os.path.basename(path)))
+    return sorted(out, key=lambda pn: pn[1].lower())
+
+
 def font_files(folder):
     """The font files in a folder and the folders in it."""
     out = []
@@ -4504,7 +4878,7 @@ def scan_fonts():
     index, families, styles, cut = {}, {}, {}, {}
     for folder in FONT_FOLDERS:
         for path in font_files(folder):
-            if not path.lower().endswith((".ttf", ".otf", ".ttc")):
+            if not path.lower().endswith(FONT_EXTS):
                 continue
             try:
                 names, family, subfamily = sfnt_names(path)
@@ -4561,9 +4935,103 @@ def chosen_style(family, bold, italic):
     return bold and any(not m[2] for m in members), italic and any(not m[3] for m in members)
 
 
+EMBED_DIR = os.path.join(tempfile.gettempdir(), "MasterPDF-fonts")
+
+
+def adopt_embedded_fonts(doc):
+    """(PDF_LOCK held; the installed fonts already looked up) The fonts a PDF carries that
+    this computer hasn't got (Aptos on a PC without the newest Office...) - taken out of it
+    and used like installed ones: text retyped in the PDF keeps its own font, and the typing
+    box shows it (on Windows, made known to this app only - nothing is installed). The ones
+    an earlier PDF brought are let go first. Only fonts with a letter map (TrueType /
+    OpenType) - of a font kept in several parts, the fullest."""
+    index = _FONTS["index"]
+    if index is None:
+        return
+    for key, entry in _FONTS.get("adopted", {}).items():  # (the last PDF's: let go)
+        if index.get(key) == entry:
+            del index[key]
+    _FONTS["adopted"] = {}
+    best = {}
+    for pno in range(doc.page_count):
+        try:
+            fonts = doc[pno].get_fonts()
+        except Exception:
+            continue
+        for xref, ext, _type, basefont, *_rest in fonts:
+            key = font_key(basefont)
+            if not key or key in index or ext not in ("ttf", "otf") or xref in best.get(key, ((),))[0:1]:
+                continue
+            try:
+                font = pymupdf.Font(fontbuffer=doc.extract_font(xref)[3])
+            except Exception:
+                continue
+            if not font.has_glyph(ord("e")) and not font.has_glyph(ord("a")):
+                continue  # (no letter map: its letters can't be told apart)
+            if key not in best or font.glyph_count > best[key][1]:
+                best[key] = (xref, font.glyph_count, ext, basefont)
+    if not best:
+        return
+    os.makedirs(EMBED_DIR, exist_ok=True)
+    for key, (xref, _count, ext, basefont) in best.items():
+        path = os.path.join(EMBED_DIR, f"{key}-{abs(hash(doc.name or '')) % 10 ** 8}-{xref}.{ext}")
+        try:
+            if not os.path.isfile(path):
+                with open(path, "wb") as f:
+                    f.write(doc.extract_font(xref)[3])
+            names, family, subfamily = sfnt_names(path)
+        except Exception:
+            continue
+        family = family or basefont.split("+")[-1]
+        installed = family_font(font_key(family), *style_of(subfamily or basefont)) \
+            if family else None
+        if installed:  # (a font this computer has, under a name that doesn't say so -
+            index[key] = installed  # "CIDFont+F2" is Calibri: the whole font, not the
+            _FONTS["adopted"][key] = installed  # letters the PDF kept of it)
+            continue
+        if sys.platform == "win32":  # (for the typing box: this app's own, while it runs)
+            try:
+                import ctypes
+                ctypes.windll.gdi32.AddFontResourceExW(path, 0x10, 0)  # FR_PRIVATE
+            except Exception:
+                pass
+        entry = (path, family)
+        index[key] = entry
+        _FONTS["styles"][path] = style_of(subfamily or basefont)
+        _FONTS["adopted"][key] = entry
+
+
 def real_style(path):
     """(bold, italic) a font file really is (False, False if it's not known)."""
     return _FONTS["styles"].get(path, (False, False))
+
+
+# fonts this computer may not have -> the ones to use instead, best first: the real one, then
+# a free one made to the same letter widths (text takes the same room: lines break alike)
+LOOK_ALIKES = [
+    (("calibri",), ["calibri", "carlito"]),
+    (("cambria",), ["cambria", "caladea"]),
+    (("segoe",), ["segoeui", "selawik"]),
+    (("comicsans",), ["comicsansms", "comicneue"]),
+    (("aptos",), ["aptos", "arial", "liberationsans"]),
+    (("arial", "helvetica", "arimo", "liberationsans"), ["arial", "liberationsans"]),
+    (("times", "tinos", "liberationserif"), ["timesnewroman", "liberationserif"]),
+    (("courier", "cousine", "liberationmono"), ["couriernew", "liberationmono", "courierprime"]),
+    (("georgia",), ["georgia", "ptserif", "liberationserif"]),
+    (("verdana", "tahoma", "trebuchet"), ["verdana", "tahoma", "dejavusans", "liberationsans"]),
+]
+
+
+def look_alikes(key, mono=False, serif=False):
+    """The fonts to use for the font key (not installed itself), best first."""
+    for names, alikes in LOOK_ALIKES:
+        if any(key.startswith(n) for n in names):
+            return alikes
+    if mono:
+        return ["couriernew", "liberationmono", "dejavusansmono"]
+    if serif:
+        return ["timesnewroman", "liberationserif", "dejavuserif"]
+    return ["arial", "liberationsans", "dejavusans"]
 
 
 def find_font(span_font, flags):
@@ -4595,10 +5063,10 @@ def find_font(span_font, flags):
     serif = not sans and (bool(flags & 4) or any(w in key for w in (
         "times", "serif", "georgia", "garamond", "cambria", "roman", "book")))
     mono = bool(flags & 8) or bool(re.search(r"courier|mono(?!type)|consol", key))
-    family = "couriernew" if mono else "timesnewroman" if serif else "arial"
-    for k in (family + style, family):
-        if k in index:
-            return index[k] + (bold, italic)
+    for family in look_alikes(key, mono, serif):  # (the font itself, or one as wide)
+        for k in (family + style, family):
+            if k in index:
+                return index[k] + (bold, italic)
     return None, ("Courier New" if mono else "Times New Roman" if serif else "Arial"), bold, italic
 
 
@@ -4629,7 +5097,7 @@ def tagged_owners(doc, i):
     out = {}
     for tag, blocks in found.items():  # (each piece drawn on its own, and read)
         tmp.update_stream(first, b"\n".join(blocks))
-        for b in tp.get_text("rawdict")["blocks"]:
+        for b in gap_spaces(tp.get_text("rawdict", clip=pymupdf.INFINITE_RECT())["blocks"]):
             for line in b.get("lines", []):
                 for s in line["spans"]:
                     for ch in s["chars"]:
@@ -4644,6 +5112,70 @@ def char_key(ch):
     return ch["c"], round(o[0] * 4), round(o[1] * 4)
 
 
+def visual_rtl(chars):
+    """A right-to-left line's text from its letters by where they are (see visual_order)."""
+    return re.sub(r" {2,}", " ", "".join(ch["c"] for ch in visual_order(chars)).replace(
+        "\xa0", " ")).strip()
+
+
+def visual_order(chars):
+    """A right-to-left line's letters in reading order, by where they are: from the right -
+    runs that aren't right to left ("Master PDF", "2.5") read left to right among them."""
+    chars = sorted((ch for ch in chars if ch.get("c")),
+                   key=lambda ch: -(ch["bbox"][0] + ch["bbox"][2]) / 2)
+    ltr = [bool(re.match(r"[A-Za-z0-9]", ch["c"])) for ch in chars]
+    strong = [bool(ARABIC_LETTER.search(ch["c"])) or ltr[n] for n, ch in enumerate(chars)]
+    for n in range(len(chars)):  # (a space or sign between two such: one of them)
+        if not strong[n]:
+            before = next((ltr[m] for m in range(n - 1, -1, -1) if strong[m]), False)
+            after = next((ltr[m] for m in range(n + 1, len(chars)) if strong[m]), False)
+            ltr[n] = before and after
+    out, n = [], 0
+    while n < len(chars):
+        if ltr[n]:
+            m = n
+            while m < len(chars) and ltr[m]:
+                m += 1
+            out += chars[n:m][::-1]
+            n = m
+        else:
+            out.append(chars[n])
+            n += 1
+    return out
+
+
+def same_baseline(lines):
+    """A piece's lines read as several on one baseline (right-to-left text written as HTML
+    reads back a line per run of it) put together: one line - its parts from the right if it's
+    mostly right to left, a space between."""
+    out = []
+    for o in sorted(lines, key=lambda o: (round(o["spans"][0]["origin"][1], 1), o["rect"].x0)):
+        prev = out[-1] if out else None
+        if prev is not None and abs(prev["spans"][0]["origin"][1] - o["spans"][0]["origin"][1]) < 0.6:
+            prev["parts"].append(o)
+        else:
+            out.append(dict(o, parts=[o]))
+    for o in out:
+        parts = sorted(o.pop("parts"), key=lambda p: p["rect"].x0)
+        if len(parts) < 2:
+            continue
+        said = " ".join(p["text"] for p in parts)
+        if len(ARABIC_LETTER.findall(said)) >= sum(1 for c in said if c.isascii() and c.isalpha()):
+            parts = sorted(parts, key=lambda p: -p["rect"].x1)  # (by right ends: a space can lie far out)
+        o["spans"] = [s for p in parts for s in p["spans"]]
+        o["all"] = [s for p in parts for s in p.get("all", p["spans"])]
+        o["text"] = re.sub(r" {2,}", " ", " ".join(p["text"] for p in parts)).strip()
+        if parts[0] is not sorted(parts, key=lambda p: p["rect"].x0)[0]:  # (right to left:
+            o["text"] = visual_rtl([ch for s in o["spans"] for ch in s.get("chars", [])]) \
+                or o["text"]  # read from its letters, where they are - the parts' boxes
+            # can overlap)
+        r = pymupdf.Rect(parts[0]["rect"])
+        for p in parts[1:]:
+            r |= p["rect"]
+        o["rect"] = r
+    return out
+
+
 def page_objects(page, owner=None):
     """(PDF_LOCK held) what's on the page that can be edited: its text lines and pictures,
     as dicts with "kind" ("text" / "image") and "rect" (in the page's own space). owner:
@@ -4651,7 +5183,10 @@ def page_objects(page, owner=None):
     None - the letters of a piece always make that piece, never mixed with others."""
     out = []
     mid = page.cropbox.width / 2  # (the page's middle, across)
-    blocks = page.get_text("rawdict")["blocks"]
+    # (turned text read straight can stand past the page's edge: read there too, then)
+    reach = pymupdf.INFINITE_RECT() if has_turns(page) else None
+    seen = pymupdf.TEXTFLAGS_RAWDICT | pymupdf.TEXT_CLIP  # (not text clipped out of sight)
+    blocks = straightened_blocks(gap_spaces(page.get_text("rawdict", clip=reach, flags=seen)["blocks"]))
     # (where the page's lines start across: a piece starting where others do starts a column)
     starts = [line["bbox"][0] for b in blocks if b["type"] == 0 for line in b["lines"]]
     for block in blocks:
@@ -4700,16 +5235,32 @@ def page_objects(page, owner=None):
                     space = dict(last, text=" ", chars=[{"c": " ", "origin": (prev["rect"].x1, 0),
                                                          "bbox": (prev["rect"].x1, prev["rect"].y0,
                                                                   o["rect"].x0, prev["rect"].y1)}])
+                    prev.setdefault("parts", [dict(prev)]).append(o)
                     prev["spans"] = prev["spans"] + o["spans"]
                     prev["all"] = prev["all"] + [space] + o["all"]
                     prev["text"] = re.sub(r" {2,}", " ", prev["text"] + " " + o["text"])
                     prev["rect"] = prev["rect"] | o["rect"]
                     continue
             joined.append(o)
+        for o in joined:  # (a line mostly right to left - Arabic...: its pieces read from the
+            parts = o.pop("parts", None)  # right, "النسخة 2.5" before "Master PDF" before
+            if parts and len(ARABIC_LETTER.findall(o["text"])) >= \
+                    sum(1 for c in o["text"] if c.isalpha() and c.isascii()):  # "متاحة الآن")
+                parts = sorted(parts, key=lambda p: -p["rect"].x1)
+                o["spans"], o["all"] = list(parts[0]["spans"]), list(parts[0]["all"])
+                for right, left in zip(parts, parts[1:]):
+                    space = dict(right["all"][-1], text=" ", chars=[
+                        {"c": " ", "origin": (left["rect"].x1, 0),
+                         "bbox": (left["rect"].x1, right["rect"].y0, right["rect"].x0, right["rect"].y1)}])
+                    o["spans"] += left["spans"]
+                    o["all"] += [space] + left["all"]
+                o["text"] = re.sub(r" {2,}", " ", " ".join(p["text"] for p in parts))
         out[first:] = joined
         peers = [o["rect"] for o in out[first:]]  # (the paragraph's lines, top to bottom)
         for o in out[first:]:
             o["peers"] = peers
+            if block.get("turned"):  # (text the PDF turned: a piece of its own, turned)
+                o["owner"] = block["turned"]
     # a line that's a paragraph on its own (PDFs often keep each line apart - and a line
     # retyped here is put apart): the lines just over and under it, across from it, count
     for o in out:
@@ -4744,6 +5295,7 @@ def page_objects(page, owner=None):
             known.setdefault(o["owner"], []).append(o)
     frames = []
     for who, lines in known.items():
+        lines[:] = same_baseline(lines)
         lines.sort(key=lambda o: (o["rect"].y0, o["rect"].x0))
         rect = pymupdf.Rect(lines[0]["rect"])
         for o in lines[1:]:
@@ -4756,6 +5308,11 @@ def page_objects(page, owner=None):
         for obj in frame_objects(f["lines"], mid, f["paras"], cells, page.rect):
             if f.get("owner") is not None:
                 obj["oid"] = f["owner"]
+            if isinstance(f.get("owner"), str):  # (the PDF's own turned text: see
+                info = TURNED_TEXT[f["owner"]]  # straightened_blocks)
+                obj["oid"] = None
+                obj["native"] = info["quads"]
+                obj["turn"] = (info["angle"], info["pivot"])
             out.append(obj)
     names = {}
     for item in page.get_images(full=True):
@@ -4765,6 +5322,14 @@ def page_objects(page, owner=None):
     except Exception:
         pass
     infos = page.get_image_info(xrefs=True)
+    try:  # (what the page draws, in the order it draws it: what's over what)
+        log = [(kind, pymupdf.Rect(r)) for kind, r in page.get_bboxlog()]
+    except Exception:
+        log = []
+    drawn = [k for k, (kind, _r) in enumerate(log) if kind == "fill-image"]
+    if len(drawn) != len(infos):
+        drawn = [None] * len(infos)
+    texts = [(k, r) for k, (kind, r) in enumerate(log) if kind in ("fill-text", "stroke-text")]
     uses = {}  # a picture used several times (a signature in every row...) is one picture
     for info in infos:  # drawn at several places: which time this is, of how many
         uses[info.get("xref")] = uses.get(info.get("xref"), 0) + 1
@@ -4774,10 +5339,1077 @@ def page_objects(page, owner=None):
         nth = seen[xref] = seen.get(xref, -1) + 1
         rect = pymupdf.Rect(info["bbox"])
         if xref and xref in names and not rect.is_empty:
+            z = drawn[k]
+            tm = pymupdf.Matrix(info["transform"])
+            shape = picture_outline(page, k, info)
+            full = rect
+            if shape:  # (a shape on a background saved into it: the shape is what's picked)
+                hull = [pymupdf.Point(u, v) * tm for u, v in shape]
+                rect = pymupdf.Rect(hull[0], hull[0])
+                for q in hull[1:]:
+                    rect |= q
             out.append({"kind": "image", "rect": rect, "xref": xref, "nth": nth,
                         "uses": uses[xref], "order": k, "pictures": len(infos),
-                        "transform": pymupdf.Matrix(info["transform"])})
+                        "transform": tm, "z": z,
+                        "poly": turned_box(hull) if shape else
+                        [pymupdf.Point(u, v) * tm for u, v in ((0, 0), (1, 0), (1, 1), (0, 1))],
+                        "shape": hull if shape else None, "full": full, "unit_shape": shape,
+                        "over": [r for n, r in texts if z is not None and n > z and r.intersects(rect)]})
+    for obj in page_drawings(page, log) + page_paths(page, log):
+        obj["over"] = [r for n, r in texts if n > obj["z_end"] and r.intersects(obj["rect"])]
+        out.append(obj)
     return out
+
+
+FILL_AND_STROKE = (b"B", b"B*", b"b", b"b*")  # (one shape, filled and outlined: two in the log)
+
+
+def _xobject_name(args):
+    m = re.search(rb"/([^\s/\[\]<>()]+)\s*$", args)
+    return m.group(1).decode("latin-1") if m else None
+
+
+def _paints_inside(doc, xref, depth=0):
+    """(PDF_LOCK held) How many shapes a drawing (form XObject) paints - drawings inside it too."""
+    try:
+        ops = content_ops(doc.xref_stream(xref) or b"")
+    except Exception:
+        return 0
+    n = 0
+    for op, _s, _e, args in ops:
+        if op in PAINT_OPS and op != b"n":
+            n += 2 if op in FILL_AND_STROKE else 1
+        elif op == b"Do" and depth < 4:
+            name = _xobject_name(args)
+            kind, value = doc.xref_get_key(xref, "Resources/XObject/" + name) if name else ("null", "")
+            if kind == "xref" and doc.xref_get_key(int(value.split()[0]), "Subtype")[1] == "/Form":
+                n += _paints_inside(doc, int(value.split()[0]), depth + 1)
+    return n
+
+
+def path_paints(page, ops, log):
+    """(PDF_LOCK held) {index in log (see page_drawings): the page's operator painting that
+    shape} for the shapes the page paints itself (not those inside its drawings) - {} when the
+    page's shapes and its log can't be matched up one for one."""
+    doc = page.parent
+    try:
+        forms = {name: x for x, name, invoker, _b in page.get_xobjects() if invoker == 0
+                 and doc.xref_get_key(x, "Subtype")[1] == "/Form"}
+    except Exception:
+        return {}
+    seq = []  # (each shape the log shows, in order: the operator painting it - None: inside a
+    for n, (op, _s, _e, args) in enumerate(ops):  # drawing, or the outline of a filled one)
+        if op in PAINT_OPS and op != b"n":
+            seq.append(n)
+            if op in FILL_AND_STROKE:
+                seq.append(None)
+        elif op == b"Do" and _xobject_name(args) in forms:
+            seq += [None] * _paints_inside(doc, forms[_xobject_name(args)])
+    shapes = [k for k, (kind, _r) in enumerate(log) if kind in ("fill-path", "stroke-path")]
+    if len(shapes) != len(seq):
+        return {}
+    return {k: n for k, n in zip(shapes, seq) if n is not None}
+
+
+def page_paths(page, log):
+    """(PDF_LOCK held) Shapes the page draws one after another, close together, in one colour -
+    letters turned into outlines (a slide's labels: a line as one shape, as PowerPoint saves
+    them, or each letter its own, as others do), a logo - picked up and moved like a picture:
+    "paths" (their places in log, the page's drawing in order). Lines and boxes (a table's, an
+    underline) aren't: a group needs a shape of many curves, as letters are."""
+    try:
+        ops = content_ops(page.read_contents())
+        fills = {d.get("seqno"): d.get("fill") for d in page.get_drawings()}
+    except Exception:
+        return []
+    paint_of = path_paints(page, ops, log)
+    area = abs(page.rect)
+    found, blank = [], set()
+    for k in sorted(paint_of):
+        kind, r = log[k]
+        if kind == "fill-path" and (r.is_empty or r.is_infinite or r.width > 1e6):
+            blank.add(k)  # (an empty shape - some save a space as one: it doesn't break a run)
+            continue
+        if kind != "fill-path" or abs(r) > 0.25 * area:
+            continue
+        n, j = paint_of[k], paint_of[k] - 1
+        while j >= 0 and ops[j][0] in PATH_OPS:
+            j -= 1
+        found.append((k, r, n - j - 1, fills.get(k)))
+    groups = []
+    for k, r, curves, fill in found:
+        g = groups[-1] if groups else None
+        if g:
+            last = g["last"]  # (the next letter, or line, of the same label: drawn next, near)
+            def size(b):  # (a letter's size, any way turned, thin ones too - or, for a
+                return min(max(b.width, b.height), 6 * min(b.width, b.height))  # line, a bit)
+            pad = 0.8 * max(size(r), size(last), 4)
+            near = (r + (-pad, -pad, pad, pad)).intersects(last) or \
+                (r + (-pad, -pad, pad, pad)).intersects(g["rect"]) and curves >= 8
+        if g and all(x in blank for x in range(g["paths"][-1] + 1, k)) and near:
+            g["paths"].append(k)
+            g["rect"] |= r
+            g["z_end"] = k
+            g["last"] = r
+            g["curves"].append(curves)
+        else:
+            groups.append({"kind": "image", "form": True, "paths": [k], "rect": pymupdf.Rect(r),
+                           "xref": -(k + 1), "name": None, "nth": 0, "uses": 1, "z": k,
+                           "z_end": k, "transform": pymupdf.Matrix(1, 0, 0, 1, 0, 0),
+                           "poly": None, "last": pymupdf.Rect(r), "fill": fill,
+                           "curves": [curves]})
+    out = []
+    for g in groups:  # (letters: a shape of many curves - not just boxes and lines)
+        cs = g.pop("curves")
+        g.pop("last")
+        if max(cs) >= 10 and sum(cs) / len(cs) >= 4 or len(cs) == 1 and cs[0] >= 8:
+            out.append(g)
+    return out
+
+
+def _path_parts(page):
+    """(PDF_LOCK held; the page's drawing tidied into one list) The content stream, its data,
+    its operators, the matrix at each, and which operator paints each shape of the page's log."""
+    doc = page.parent
+    page.clean_contents()
+    streams = page.get_contents()
+    if len(streams) != 1:
+        raise ValueError("these shapes couldn't be found on the page")
+    xref = streams[0]
+    data = doc.xref_stream(xref)
+    ops = content_ops(data)
+    log = [(kind, pymupdf.Rect(r)) for kind, r in page.get_bboxlog()]
+    paint_of = path_paints(page, ops, log)
+    return xref, data, ops, paint_of
+
+
+def move_paths(page, obj, matrix):
+    """(PDF_LOCK held) Shapes (obj["paths"], see page_paths) moved / turned / resized by matrix
+    (the page's own space): their curves' points changed right where the page draws them -
+    nothing else on the page is touched, and what's drawn over them stays over them."""
+    with turns_aside(page):
+        _move_paths(page, obj, matrix)
+
+
+def _move_paths(page, obj, matrix):
+    xref, data, ops, paint_of = _path_parts(page)
+    at = walk_ops(ops)[0]
+    T = page.transformation_matrix
+    move = T * matrix * ~T
+    edits = []
+    for k in obj["paths"]:
+        if k not in paint_of:
+            raise ValueError("these shapes couldn't be found on the page")
+        n = paint_of[k]
+        j = n - 1
+        while j >= 0 and ops[j][0] in PATH_OPS:
+            j -= 1
+        for q in range(j + 1, n):
+            op, s, e, args = ops[q]
+            if op == b"h":
+                continue
+            local = at[q] * move * ~at[q]  # (in the space the points are written in)
+            v = _numbers(args)
+
+            def pt(x, y):
+                np_ = pymupdf.Point(x, y) * local
+                return b"%.4f %.4f" % (np_.x, np_.y)
+            if op == b"re" and len(v) >= 4:
+                x, y, w, h = v[-4:]
+                new = b" %s m %s l %s l %s l h" % (pt(x, y), pt(x + w, y), pt(x + w, y + h), pt(x, y + h))
+            else:
+                pts = list(zip(v[0::2], v[1::2]))
+                new = b" " + b" ".join(pt(x, y) for x, y in pts) + b" " + op
+            edits.append((s - len(args), e, new))
+    for s, e, new in sorted(edits, reverse=True):
+        data = data[:s] + new + data[e:]
+    page.parent.update_stream(xref, data)
+
+
+def delete_paths(page, obj):
+    """(PDF_LOCK held) Shapes (obj["paths"]) taken off the page: they're no longer painted."""
+    with turns_aside(page):
+        xref, data, ops, paint_of = _path_parts(page)
+        for n in sorted((paint_of[k] for k in obj["paths"] if k in paint_of), reverse=True):
+            _op, s, e, _args = ops[n]
+            data = data[:s] + b"n" + data[e:]
+        page.parent.update_stream(xref, data)
+
+
+def paths_snapshot(doc, i, obj):
+    """(PDF_LOCK held) Shapes (obj["paths"]) exactly as page i draws them, as a one-page PDF
+    with nothing else showing, and the box round them (see drawing_snapshot)."""
+    tmp = pymupdf.open()
+    tmp.insert_pdf(doc, from_page=i, to_page=i, annots=False)
+    tp = tmp[0]
+    lift_turns(tp)  # (turned text: not in it)
+    xref, data, ops, paint_of = _path_parts(tp)
+    keep = {paint_of[k] for k in obj["paths"] if k in paint_of}
+    edits = []
+    for n, (op, s, e, args) in enumerate(ops):
+        if op in PAINT_OPS and op != b"n" and n not in keep:
+            edits.append((s, e, b"n"))  # (the other shapes: not painted)
+        elif op in (b"Do", b"sh"):
+            edits.append((s - len(args), e, b" "))  # (pictures, shadings: out)
+        elif op == b"BT":
+            edits.append((s, e, b"BT 3 Tr"))  # (text: not shown)
+        elif op == b"Tr":
+            edits.append((s - len(args), e, b" 3 Tr"))
+    for s, e, new in sorted(edits, reverse=True):
+        data = data[:s] + new + data[e:]
+    tmp.update_stream(xref, data)
+    return tmp.tobytes(garbage=3, deflate=True), pymupdf.Rect(obj["rect"]) + (-1, -1, 1, 1)
+
+
+# Windows' own text recognition (OCR), run through PowerShell - nothing to install: each picture
+# read in every language Windows can read, all at once; a line comes back for each word read -
+# "<picture> <TAB> <language> <TAB> <how far across> <TAB> <word>"
+OCR_SCRIPT = r"""
+param([string]$list)
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics, ContentType = WindowsRuntime]
+$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($op, $type) { $t = $asTask.MakeGenericMethod($type).Invoke($null, @($op)); $t.Wait(-1) | Out-Null; $t.Result }
+$engines = @([Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages | ForEach-Object { [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($_) })
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$n = 0
+foreach ($img in Get-Content -LiteralPath $list -Encoding UTF8) {
+  $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($img)) ([Windows.Storage.StorageFile])
+  $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+  $dec = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+  $bmp = Await ($dec.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+  foreach ($e in $engines) {
+    $res = Await ($e.RecognizeAsync($bmp)) ([Windows.Media.Ocr.OcrResult])
+    foreach ($line in $res.Lines) {
+      foreach ($w in $line.Words) {
+        [Console]::WriteLine($n.ToString() + "`t" + $e.RecognizerLanguage.LanguageTag + "`t" + [int]$w.BoundingRect.X + "`t" + $w.Text)
+      }
+    }
+  }
+  $stream.Dispose()
+  $n += 1
+}
+"""
+
+
+def ocr_pictures(images, again=True):
+    """Windows' text recognition: the words in each picture (Pillow pictures) - the reading
+    with the most letters, of every language Windows can read - or None if it can't be run
+    (not Windows). Shown no window. (Letters too big, it reads nothing: those pictures are
+    read again smaller.)"""
+    if sys.platform != "win32" or not images:
+        return None
+    folder = tempfile.mkdtemp(prefix="masterpdf-ocr-")
+    try:
+        files = []
+        for n, im in enumerate(images):
+            f = os.path.join(folder, f"{n}.png")
+            im.save(f)
+            files.append(f)
+        lst = os.path.join(folder, "list.txt")
+        with open(lst, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(files))
+        script = os.path.join(folder, "ocr.ps1")
+        with open(script, "w", encoding="utf-8-sig") as fh:
+            fh.write(OCR_SCRIPT)
+        run = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                              script, lst], capture_output=True, timeout=120,
+                             creationflags=0x08000000)  # CREATE_NO_WINDOW
+        rows = run.stdout.decode("utf-8", "replace").splitlines()
+    except Exception:
+        return None
+    finally:
+        import shutil
+        shutil.rmtree(folder, ignore_errors=True)
+    words = {}  # (picture, language) -> [(how far across, word)]
+    for row in rows:
+        parts = row.split("\t", 3)
+        if len(parts) == 4 and parts[0].isdigit():
+            try:
+                words.setdefault((int(parts[0]), parts[1]), []).append((int(parts[2]), parts[3]))
+            except ValueError:
+                continue
+    out = []
+    for n in range(len(images)):
+        best = ""
+        for (m, _lang), ws in words.items():
+            if m != n:
+                continue
+            arabic = any(RTL_LETTERS.search(w) for _x, w in ws)  # (right to left: right first)
+            text = " ".join(w for _x, w in sorted(ws, reverse=arabic))
+            if letters_in(text) > letters_in(best):
+                best = text
+        out.append(tidy_reading(best))
+    big = [n for n, (im, text) in enumerate(zip(images, out)) if not text and im.height > 110]
+    if again and big:
+        smaller = ocr_pictures([images[n].resize((max(1, round(images[n].width * 90 / images[n].height)), 90),
+                                                 Image.LANCZOS) for n in big], again=False) or []
+        for n, text in zip(big, smaller):
+            out[n] = text
+    return out
+
+
+def tidy_reading(text):
+    """A reading's usual slip mended: a capital I where a small l is meant (they look alike in
+    plain fonts) - "ProbIem", "SkiIIs", "AIgorithms" -> "Problem", "Skills", "Algorithms"."""
+    fixed = []
+    for word in text.split(" "):
+        if len(word) > 1 and not any(c.islower() for c in word.replace("l", "")) and                 any(c.isupper() for c in word):  # (a word in capitals: its "l" is an I - "APl")
+            word = word.replace("l", "I")
+        letters = list(word)
+        for k, c in enumerate(letters):
+            if c == "I" and k > 0 and (letters[k - 1].islower() or letters[k - 1] == "l" or (
+                    letters[k - 1].isalpha() and k + 1 < len(letters) and letters[k + 1].islower())):
+                letters[k] = "l"  # (after a small letter - or between a letter and a small one)
+        fixed.append("".join(letters))
+    return " ".join(fixed)
+
+
+# Master PDF's own reader of letters drawn as shapes - for every system, nothing to install.
+# Letters a PDF has as outlines (PowerPoint's labels...) were drawn from a font: each is matched
+# against the letters of the fonts this computer has (and those the app comes with), drawn the
+# same size, standing on the same line - so it finds the font, its boldness and size too.
+READ_LETTERS = ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                "&.,:;!?'\"()-/+%@#*=_$")
+READ_PAIRS = ("ff", "fi", "fl", "ft", "rt", "tt", "rn", "ry", "ty", "Te", "Ta", "To", "Tr", "Ty",
+              "Va", "Wa", "Ya", "LT", "AV", "Ty")  # (letters that touch in some fonts)
+READ_FAMILIES = ("Arial", "Calibri", "Segoe UI", "Verdana", "Tahoma", "Trebuchet MS",
+                 "Century Gothic", "Aptos", "Helvetica", "Times New Roman", "Cambria", "Georgia",
+                 "Garamond", "Book Antiqua", "Courier New", "Liberation Sans", "Carlito",
+                 "Liberation Serif", "Caladea", "Liberation Mono", "DejaVu Sans", "Lato", "Poppins",
+                 "PT Sans", "PT Serif", "Ubuntu", "Selawik", "Comic Sans MS", "Comic Neue")
+_LETTER_CACHE = {}
+
+
+def _ink(im):
+    """A Pillow "L" picture (black letters on white) as a numpy array: True where there's ink."""
+    import numpy as np
+    return np.asarray(im) < 128
+
+
+def _glyphs(ink):
+    """The letters in a line's ink (numpy): [(x0, y0, x1, y1, its ink)] left to right - its
+    pieces put together where one is over another (an i's dot, a colon)."""
+    import numpy as np
+    h, w = ink.shape
+    marks = Image.fromarray(np.where(ink, 255, 0).astype("uint8")).copy()  # (its own pixels)
+    data, label, boxes = marks.load(), 1, []
+    for y in range(h):
+        for x in range(w):
+            if data[x, y] == 255 and label < 250:
+                ImageDraw.floodfill(marks, (x, y), label)
+                label += 1
+    arr = np.asarray(marks)
+    for n in range(1, label):
+        ys, xs = np.nonzero(arr == n)
+        if len(xs) >= 3:
+            boxes.append([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1, [n]])
+    boxes.sort(key=lambda b: b[0])
+    merged = []
+    for b in boxes:  # (one over another - most of the narrower one's width: one letter)
+        last = merged[-1] if merged else None
+        if last and min(last[2], b[2]) - max(last[0], b[0]) >= 0.5 * min(last[2] - last[0], b[2] - b[0]):
+            last[:4] = [min(last[0], b[0]), min(last[1], b[1]), max(last[2], b[2]), max(last[3], b[3])]
+            last[4] += b[4]
+        else:
+            merged.append(b)
+    out = []
+    for x0, y0, x1, y1, labels in merged:
+        out.append((x0, y0, x1, y1, np.isin(arr[y0:y1, x0:x1], labels)))
+    return out
+
+
+def _letter(path, size, text):
+    """A letter (or two) of the font at path, drawn size pixels big: (its box from where it
+    starts on the line - x0, y0 (above the line: less than 0), x1, y1 -, its ink)."""
+    import numpy as np
+    key = (path, size, text)
+    if key not in _LETTER_CACHE:
+        from PIL import ImageFont
+        if (path, size) not in _LETTER_CACHE:  # (the font, made once at each size)
+            _LETTER_CACHE[(path, size)] = ImageFont.truetype(path, size)
+        font = _LETTER_CACHE[(path, size)]
+        box = font.getbbox(text, anchor="ls")
+        if box[2] <= box[0] or box[3] <= box[1]:
+            _LETTER_CACHE[key] = None
+        else:
+            im = Image.new("L", (box[2] - box[0], box[3] - box[1]), 255)
+            ImageDraw.Draw(im).text((-box[0], -box[1]), text, font=font, fill=0, anchor="ls")
+            ink = np.asarray(im) < 128
+            ys, xs = np.nonzero(ink)
+            if not len(xs):
+                _LETTER_CACHE[key] = None
+            else:  # (just its ink - not the room round it a font gives a letter)
+                x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+                _LETTER_CACHE[key] = ((box[0] + x0, box[1] + y0, box[0] + x1, box[1] + y1),
+                                      ink[y0:y1, x0:x1])
+    return _LETTER_CACHE[key]
+
+
+def _grow(a):
+    """Ink made a pixel thicker each way (numpy)."""
+    b = a.copy()
+    b[1:, :] |= a[:-1, :]
+    b[:-1, :] |= a[1:, :]
+    b[:, 1:] |= a[:, :-1]
+    b[:, :-1] |= a[:, 1:]
+    return b
+
+
+def _alike(g, base, letter, shifts=(-2, -1, 0, 1, 2)):
+    """How alike a letter seen (g: x0, y0, x1, y1, ink - base: its line) and a font's letter
+    are, both standing on the line - each ink's share near the other's (a pixel either way
+    allowed, and the font's letter shifted a little across): 1 the same, 0 nothing alike."""
+    import numpy as np
+    if letter is None:
+        return 0.0
+    (lx0, ly0, lx1, ly1), lk = letter
+    x0, y0, x1, y1, gk = g
+    gw, lw = x1 - x0, lx1 - lx0
+    if max(y1 - y0, ly1 - ly0) > 2.2 * min(y1 - y0, ly1 - ly0) + 3 or \
+            max(gw, lw) > 2.2 * min(gw, lw) + 4:
+        return 0.0  # (a different size or shape altogether)
+    top = min(y0 - base, ly0) - 1
+    bottom = max(y1 - base, ly1) + 1
+    pad = max(shifts) + 1
+    width = max(gw, lw) + 2 * pad
+    a = np.zeros((bottom - top, width), bool)
+    a[y0 - base - top:y1 - base - top, pad:pad + gw] = gk
+    ag = _grow(a)
+    na = np.count_nonzero(a)
+    best = 0.0
+    for dx in shifts:
+        b = np.zeros_like(a)
+        b[ly0 - top:ly1 - top, pad + dx:pad + dx + lw] = lk
+        nb = np.count_nonzero(b)
+        if not na or not nb:
+            continue
+        score = (np.count_nonzero(a & _grow(b)) + np.count_nonzero(b & ag)) / (na + nb)
+        best = max(best, score)
+    return best
+
+
+def read_letters(im, fonts=None, quick=False):
+    """Master PDF's own reader (see READ_LETTERS): a straight line of letters drawn as shapes
+    (a Pillow "L" picture, black on white) read: (text, how sure - 0 to 1 -, the font file,
+    bold, italic, its size in pixels, where its line is (y) and where its first letter starts
+    (x), in the picture's pixels) - or None. fonts: the font files to try ([(file, bold,
+    italic)] - None: every one there is; the one used last tried first). quick: only how sure,
+    of the likeliest font (the text not read) - to tell which way up a line reads."""
+    import numpy as np
+    global _LAST_FONT
+    ink = _ink(im)
+    if not ink.any():
+        return None
+    ys, xs = np.nonzero(ink)
+    tall = ys.max() - ys.min() + 1
+    k = min(1.0, 80.0 / max(1, tall))  # (looked at about 80 pixels tall: quick, and enough)
+    if k < 1:
+        im = im.resize((max(1, round(im.width * k)), max(1, round(im.height * k))), Image.LANCZOS)
+        ink = _ink(im)
+    glyphs = _glyphs(ink)
+    if not glyphs:
+        return None
+    base = int(np.median([g[3] for g in glyphs]))  # (the line: where most letters stand)
+    heights = sorted(g[3] - g[1] for g in glyphs)
+    cap = heights[int(len(heights) * 0.8)] if len(heights) > 1 else heights[0]
+    if fonts is None:
+        fonts = []
+        for family in READ_FAMILIES:
+            key = font_key(family)
+            for bold, italic in ((False, False), (True, False), (False, True), (True, True)):
+                found = family_font(key, bold, italic)
+                if found and found[0] and found[0].lower().endswith((".ttf", ".otf", ".ttc")) \
+                        and found[0] not in [f[0] for f in fonts]:
+                    fonts.append((found[0],) + real_style(found[0]))
+        if _LAST_FONT in fonts:  # (the font of the last label read: likeliest again)
+            fonts.remove(_LAST_FONT)
+            fonts.insert(0, _LAST_FONT)
+    if not fonts:
+        return None
+    step = max(1, len(glyphs) // 10)  # (up to 10 of its letters, from all along it)
+    probe = glyphs[::step][:10]
+    glance = glyphs[::max(1, len(glyphs) // 6)][:6]  # (for a first look: 6 of them)
+    letters = READ_LETTERS[:62]  # (the font: judged by letters and digits)
+
+    def judge(path, size, shifts, among=None):
+        among = among or probe
+        return sum(max(_alike(g, base, _letter(path, size, c), shifts) for c in letters)
+                   for g in among) / len(among)
+
+    def size_of(path):
+        h1 = _letter(path, 100, "H")
+        return (h1[0][3] - h1[0][1]) / 100.0 if h1 else None  # (a capital's height per pixel)
+    first = []
+
+    def glance_at(chosen):  # (a quick look at these fonts...)
+        for path, bold, italic in chosen:
+            try:
+                per = size_of(path)
+                if per is None:
+                    continue
+                score = max(judge(path, max(4, round(cap / per * s)), (0,), glance)
+                            for s in (0.92, 1.0, 1.08))  # (a few sizes: fonts' capitals differ)
+                first.append((score, path, bold, italic, per))
+                if score > 0.985:  # (it's this one: no need to look further)
+                    return True
+            except Exception:
+                continue
+        return False
+    upright = [f for f in fonts if not f[2]]  # (upright ones first: most text is - slanted
+    if not glance_at(upright) and max((f[0] for f in first), default=0) < 0.9:  # ones only
+        glance_at([f for f in fonts if f[2]])  # if none of them is like it)
+    if not first:
+        return None
+    first.sort(reverse=True)
+    last = next((f for f in first if (f[1], f[2], f[3]) == _LAST_FONT), None)
+    if last and last is not first[0] and last[0] >= first[0][0] - 0.03:
+        first.remove(last)  # (the font the last label was in, nearly as like as the likeliest:
+        first.insert(0, last)  # it stays - a page's labels are mostly in one font)
+    if quick:
+        return first[0][0]
+    fitted = []
+    for _s, path, bold, italic, per in first[:1 if first[0][0] > 0.985 else 5]:  # (...the
+        best = None  # likeliest finely - each at the size that fits it best)
+        for scale in (0.86, 0.9, 0.94, 0.97, 1.0, 1.03, 1.06, 1.1, 1.15):
+            size = max(4, round(cap / per * scale))
+            score = judge(path, size, (-2, -1, 0, 1, 2))
+            if best is None or score > best[0]:
+                best = (score, path, bold, italic, size)
+        fitted.append(best)
+    fitted.sort(reverse=True, key=lambda f: f[0] + (0.03 if (f[1], f[2], f[3]) == _LAST_FONT else 0))
+    _score, path, bold, italic, size = fitted[0]
+    _LAST_FONT = (path, bold, italic)
+    # each letter: the font's letter it's most like - or, the font not being quite it (this
+    # computer hasn't got it: a look-alike), the one the likeliest fonts agree on most
+    voters = [f for f in fitted if f[0] >= fitted[0][0] - 0.05] if fitted[0][0] < 0.985 else fitted[:1]
+    text, sure, last_x1 = "", [], None
+    for g in glyphs:
+        if last_x1 is not None and g[0] - last_x1 > 0.18 * size:
+            text += " "  # (a word's gap)
+        votes = {}  # (each font's say: as much as it's like the letters - more, much more)
+        weights = [vs ** 6 for vs, *_rest in voters]
+
+        def vote(cs):
+            for (_vs, vpath, _vb, _vi, vsize), wt in zip(voters, weights):
+                for c in cs:
+                    votes[c] = votes.get(c, 0.0) + wt * _alike(g, base, _letter(vpath, vsize, c))
+        vote(READ_LETTERS)
+        if max(votes.values()) < 0.8 * sum(weights):  # (no letter fits: two touching?)
+            vote(READ_PAIRS)
+        c = max(votes, key=votes.get)
+        text += c
+        sure.append(votes[c] / sum(weights))
+        last_x1 = g[2]
+    text = tidy_reading(text)
+    first_letter = _letter(path, size, text.strip()[:1]) if text.strip() else None
+    start = glyphs[0][0] - (first_letter[0][0] if first_letter else 0)
+    return (text, float(np.mean(sure)), path, bold, italic, size / k, base / k, start / k)
+
+
+_LAST_FONT = None  # (the font of the last line read_letters read)
+
+
+def level_angle(make, angle):
+    """The turn that stands a line of letters level: tried round angle (its outline's slant),
+    the one whose ink is least tall. make(angle) -> the line, turned by it (a Pillow "L"
+    picture, black on white)."""
+    import numpy as np
+
+    def tall(a):
+        ink = _ink(make(a))
+        rows = np.nonzero(ink.any(axis=1))[0]
+        return rows.max() - rows.min() if len(rows) else 1e9
+    best = (tall(angle), angle)
+    for step in (1.0, 0.5, 0.25):
+        for a in (best[1] - step, best[1] + step):
+            best = min(best, (tall(a), a))
+    return best[1]
+
+
+def word_pieces(im):
+    """A straight line's picture (black letters on white) cut at the gaps between its words:
+    each word's picture, left to right."""
+    inv = ImageOps.invert(im)
+    box = inv.getbbox()
+    if not box:
+        return []
+    w, h = im.size
+    tall = box[3] - box[1]
+    cols = inv.resize((w, 1), Image.BOX).load()  # (each column: anything in it?)
+    words, start, end, gap = [], None, 0, 0
+    for x in range(w + 1):
+        on = x < w and cols[x, 0] > 0
+        if on:
+            start = x if start is None else start
+            end, gap = x, 0
+        elif start is not None:
+            gap += 1
+            if gap > 0.18 * tall or x == w:  # (a word's gap: far wider than a letter's)
+                words.append(ImageOps.expand(im.crop((start, 0, end + 1, h)), 30, fill=255))
+                start = None
+    return words
+
+
+def in_word_order(lines, texts):
+    """Readings of lines (their pictures, see word_pieces) put in the order their words really
+    are: each word read again on its own, left to right - a sign the line's reading joined to
+    the wrong word ("& Testing" read "Testing&") put back where it is, the word it alone is
+    that couldn't be read alone. (Right to left - Arabic...: its words from the right.)"""
+    pieces = [word_pieces(im) for im in lines]
+    flat = [pic for ws in pieces for pic in ws]
+    alone = ocr_pictures(flat) if flat else None
+    if not alone:
+        return texts
+    out, k = [], 0
+    for ws, text in zip(pieces, texts):
+        words, k = alone[k:k + len(ws)], k + len(ws)
+        if RTL_LETTERS.search(text):
+            words = words[::-1]
+        if len(ws) < 2 or all(words) and "".join(words) == text.replace(" ", ""):
+            out.append(" ".join(words) if len(ws) >= 2 else text)
+            continue
+        left = list(text.replace(" ", ""))  # (what the line's reading has that its words don't)
+        for word in words:
+            for c in word:
+                if c in left:
+                    left.remove(c)
+        empty = [n for n, wd in enumerate(words) if not wd]
+        if left and empty and len(left) <= 2 * len(empty) and not any(c.isalnum() for c in left):
+            for n in empty:  # (the signs read nowhere else: in the words read as nothing)
+                words[n] = left.pop(0) if left else ""
+            out.append(" ".join(wd for wd in words if wd))
+        elif all(words):
+            out.append(" ".join(words))
+        else:
+            out.append(text)
+    return out
+
+
+def letters_in(text):
+    """How many real letters (and digits) a reading has - not the "?" of a wrong language."""
+    return sum(1 for c in text if c.isalnum())
+
+
+def drawn_points(page, k):
+    """(PDF_LOCK held) The points of shape k of the page's log (see page_drawings)."""
+    for d in page.get_drawings():
+        if d.get("seqno") != k:
+            continue
+        pts = []
+        for item in d["items"]:
+            for v in item[1:]:
+                if isinstance(v, pymupdf.Point):
+                    pts.append(v)
+                elif isinstance(v, pymupdf.Rect):
+                    pts += [v.tl, v.tr, v.br, v.bl]
+                elif isinstance(v, pymupdf.Quad):
+                    pts += [v.ul, v.ur, v.lr, v.ll]
+        return pts, d.get("fill")
+    return [], None
+
+
+def _rows_sharpness(im):
+    """How sharply a picture's ink falls into rows (its lines stood level: most)."""
+    rows = _ink(im).sum(axis=1).astype(float)
+    return float((rows ** 2).sum())
+
+
+def _lines_in(im):
+    """A straight label's picture (black on white) cut into its lines: [(top, bottom)] - rows
+    of ink, split where there's none."""
+    rows = _ink(im).any(axis=1)
+    out, start = [], None
+    for y, on in enumerate(list(rows) + [False]):
+        if on and start is None:
+            start = y
+        elif not on and start is not None:
+            out.append([start, y])
+            start = None
+    merged = []  # (a sliver - an i's dot, a comma over the next line: with the line beside it)
+    for top, bottom in out:
+        if merged and (bottom - top < 0.35 * max(b - t for t, b in out)) and top - merged[-1][1] < 6:
+            merged[-1][1] = bottom
+        else:
+            merged.append([top, bottom])
+    return merged
+
+
+def read_drawn_text(doc, i, obj):
+    """(PDF_LOCK held) Letters drawn as shapes (obj["paths"]: a label saved as outlines - a
+    line as one shape, or each letter its own) read back as text - by Master PDF's own reader
+    (read_letters: on every system, finding the font, its size and line too) or, where it isn't
+    sure (joined-up Arabic...), Windows' text recognition: (its turn - degrees clockwise -, the
+    middle it's turned round, [(text, its straight box, colour, (font file, bold, italic, size,
+    (x, y) where it starts on its line) - or None)] line by line) - or None if nothing could
+    be read."""
+    page = doc[i]
+    shapes = []
+    for k in obj["paths"]:
+        pts, fill = drawn_points(page, k)
+        if len(pts) >= 3:
+            shapes.append((k, pts, fill))
+    if not shapes:
+        return None
+    r = obj["rect"]
+    pivot = pymupdf.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+    # how its letters were saved: each letter a shape (most of them not much longer than
+    # wide), or each line as one (long, thin)
+    boxes = [pymupdf.Rect(min(q.x for q in pts), min(q.y for q in pts), max(q.x for q in pts),
+                          max(q.y for q in pts)) for _k, pts, _f in shapes]
+    longs = sorted(max(b.width, b.height) for b in boxes)  # (a letter: much smaller than its
+    by_letter = len(boxes) >= 4 and longs[len(longs) // 2] < 0.35 * max(r.width, r.height)  # label)
+    if by_letter:  # (its slant: the straight line through its letters' middles)
+        cs = [((b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2) for b in boxes]
+        mx, my = sum(c[0] for c in cs) / len(cs), sum(c[1] for c in cs) / len(cs)
+        sxx = sum((c[0] - mx) ** 2 for c in cs)
+        syy = sum((c[1] - my) ** 2 for c in cs)
+        sxy = sum((c[0] - mx) * (c[1] - my) for c in cs)
+        a = math.degrees(0.5 * math.atan2(2 * sxy, sxx - syy))
+        first, last = cs[0], cs[-1]  # (read from its first letter to its last)
+        if (last[0] - first[0]) * math.cos(math.radians(a)) + \
+                (last[1] - first[1]) * math.sin(math.radians(a)) < 0:
+            a += 180
+    else:  # (its slant: along its first line's longer side)
+        box = turned_box(convex_hull([(q.x, q.y) for q in shapes[0][1]]))
+        a = math.degrees(math.atan2(box[1].y - box[0].y, box[1].x - box[0].x))
+        if abs(box[1] - box[0]) < abs(box[3] - box[0]):
+            a = math.degrees(math.atan2(box[3].y - box[0].y, box[3].x - box[0].x))
+    zoom = 6
+    reach = max(r.width, r.height)
+    area = pymupdf.Rect(pivot.x - reach, pivot.y - reach, pivot.x + reach, pivot.y + reach)
+
+    def drawn(paths):  # (just these shapes, as drawn: black on white, whatever their colour)
+        data, _clip = paths_snapshot(doc, i, dict(obj, paths=paths))
+        src = pymupdf.open("pdf", data)
+        pix = src[0].get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=area, alpha=True)
+        src.close()
+        ink = Image.frombytes("RGBA", (pix.width, pix.height), pix.samples).split()[3]
+        whole = Image.new("L", (round(area.width * zoom), round(area.height * zoom)), 0)
+        whole.paste(ink, (pix.x - round(area.x0 * zoom), pix.y - round(area.y0 * zoom)))
+        return whole.point(lambda v: 0 if v > 60 else 255)  # (the square round its middle -
+        # all of it, where it runs off the page too: so its middle is the picture's middle)
+
+    def crop(im):  # (its ink, and a margin: the picture, and where it's cut from)
+        ink = ImageOps.invert(im).getbbox()
+        if not ink:
+            return None
+        x0, y0 = max(0, ink[0] - 20), max(0, ink[1] - 20)
+        return im.crop((x0, y0, ink[2] + 20, ink[3] + 20)), (x0, y0)
+    if by_letter:  # (the whole label: stood level, then cut into its lines)
+        flat = drawn(obj["paths"])
+        small = flat.resize((max(1, flat.width // 3), max(1, flat.height // 3)))
+        best = max((_rows_sharpness(small.rotate(x, fillcolor=255)), x)
+                   for x in range(0, 180, 3))  # (its rows of ink as sharp as can be: every
+        for step in (1.5, 0.75, 0.375):  # way looked at, then finely)
+            for x in (best[1] - step, best[1] + step):
+                best = max(best, (_rows_sharpness(small.rotate(x, fillcolor=255)), x))
+        a = best[1]
+
+        def cut(angle):
+            im = flat.rotate(angle, resample=Image.BICUBIC, fillcolor=255)
+            out = []
+            cols = ImageOps.invert(im)
+            for top, bottom in _lines_in(im):
+                band = cols.crop((0, top, im.width, bottom)).getbbox()
+                if band:
+                    x0, y0 = max(0, band[0] - 20), max(0, top - 20)
+                    out.append((im.crop((x0, y0, band[2] + 20, bottom + 20)), (x0, y0)))
+            return out
+    else:  # (each line its own shape: each stood level on its own)
+        flats = [drawn([k]) for k, _pts, _f in shapes]
+        a = level_angle(lambda ang: flats[0].rotate(ang, resample=Image.BICUBIC, fillcolor=255), a)
+
+        def cut(angle):
+            out = []
+            for flat in flats:
+                got = crop(flat.rotate(angle, resample=Image.BICUBIC, fillcolor=255))
+                if got:
+                    out.append(got)
+            return out
+    lines = cut(a)
+    if not lines:
+        return None
+    up = read_letters(lines[0][0], quick=True) or 0  # (which way up it reads)
+    flipped = None
+    if up < 0.9:
+        flipped = cut(a + 180)
+        down = (read_letters(flipped[0][0], quick=True) or 0) if flipped else 0
+        if down > up:
+            a, lines, flipped = a + 180, flipped, lines
+    mine, font = [], None
+    for im, at in lines:  # (each line read - in the font the first one is in)
+        got = read_letters(im, fonts=[font] if font else None)
+        if got and font is None:
+            font = got[2:5]
+        mine.append((got, at, im))
+    sure = min((g[1] for g, _at, _im in mine if g), default=0) if all(g for g, _at, _im in mine) else 0
+    texts = [g[0] if g else "" for g, _at, _im in mine]
+    infos = [(g[2], g[3], g[4], g[5] / zoom, (area.x0 + (at[0] + g[7]) / zoom,
+                                              area.y0 + (at[1] + g[6]) / zoom)) if g else None
+             for g, at, _im in mine]
+    if sure < 0.8:  # (not sure: Windows' text recognition, if it's there - which way up it
+        pics = [im for _g, _at, im in mine]  # is too, if Master PDF's reader couldn't tell:
+        other = [im for im, _at in flipped] if flipped and up < 0.9 else []  # read both ways)
+        readings = ocr_pictures(pics + other)
+        if readings:
+            readings, turned = readings[:len(pics)], readings[len(pics):]
+            if turned and sum(map(letters_in, turned)) > sum(map(letters_in, readings)):
+                a, lines, pics, readings = a + 180, flipped, other, turned
+                texts = [""] * len(lines)
+        if readings and (sum(map(letters_in, readings)) >= sum(map(letters_in, texts))
+                         or any(RTL_LETTERS.search(x) for x in readings)):  # (Arabic... -
+            texts = in_word_order(pics, readings)  # letters Master PDF's reader hasn't got)
+            infos = [None] * len(texts)
+        elif sure < 0.5:
+            return None
+    if not any(letters_in(x) for x in texts):
+        return None
+    back = (pymupdf.Matrix(1, 0, 0, 1, -pivot.x, -pivot.y) * pymupdf.Matrix(-a)
+            * pymupdf.Matrix(1, 0, 0, 1, pivot.x, pivot.y))
+    centres = [((pymupdf.Point((b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2) * back), f)
+               for b, (_k, _pts, f) in zip(boxes, shapes)]
+    out = []
+    for (im, at), text, info in zip(lines, texts, infos):
+        if not text.strip():
+            continue
+        sb = pymupdf.Rect(area.x0 + at[0] / zoom, area.y0 + at[1] / zoom,
+                          area.x0 + (at[0] + im.width) / zoom, area.y0 + (at[1] + im.height) / zoom)
+        sb = sb + (20 / zoom, 20 / zoom, -20 / zoom, -20 / zoom)  # (its ink, straight)
+        fill = next((f for c, f in centres if sb.y0 - 2 <= c.y <= sb.y1 + 2 and f), None) \
+            or shapes[0][2] or (0, 0, 0)  # (its colour: its letters')
+        if info is None:  # (read by Windows: no font told - Arial fitted to it)
+            info = fit_reading(text.strip(), im, sb)
+        out.append((text.strip(), sb, fill, info))
+    return (a + 180) % 360 - 180, pivot, sorted(out, key=lambda x: x[1].y0)
+
+
+def fit_reading(text, im, box):
+    """(PDF_LOCK held) Text read by Windows' text recognition (it tells no font) fitted to the
+    letters it read: im, their picture (black on white, straight), box, their ink on the page.
+    Arial, regular or bold - as thick as their strokes are -, at the size and in the place
+    that put its ink where theirs is: (font file, bold, italic, size, (x, baseline)) - as
+    read_letters tells - or None. (Right to left, x is where it starts once written ending
+    where its ink ends - see convert_to_text.)"""
+    ink = ImageOps.invert(im).getbbox()
+    if not ink or box.width <= 0:
+        return None
+    theirs = im.crop(ink)
+    want = sum(theirs.histogram()[:128]) / (theirs.width * theirs.height)  # (how much is ink)
+    rtl = bool(RTL_LETTERS.search(text))
+    best = None
+    for bold in (False, True):
+        path, family = find_family("Arial", bold, False)
+        if not path:
+            continue
+        span = {"font": family, "flags": 16 if bold else 0, "size": 20.0, "color": 0}
+        tmp = pymupdf.open()
+        try:
+            pg = tmp.new_page(width=14 * len(text) + 200, height=120)
+            start, end, base = 50.0, pg.rect.width - 50, 60.0
+            write_text(pg, pymupdf.Point(start, base), text, span, right=end if rtl else None,
+                       bold=bold, italic=False)
+            pix = pg.get_pixmap(matrix=pymupdf.Matrix(4, 4), colorspace=pymupdf.csGRAY)
+        finally:
+            tmp.close()
+        drawn = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+        got = ImageOps.invert(drawn).getbbox()
+        if not got:
+            continue
+        k = box.width / ((got[2] - got[0]) / 4)  # (its size: as wide as their ink)
+        mine = drawn.crop(got).resize((theirs.width, max(1, round(
+            (got[3] - got[1]) * theirs.width / (got[2] - got[0])))), Image.LANCZOS)
+        have = sum(mine.histogram()[:128]) / (mine.width * mine.height)
+        size = 20.0 * k
+        y = box.y1 - (got[3] / 4 - base) * k
+        if rtl:
+            ends = box.x1 + (end - got[2] / 4) * k
+            span["size"] = size
+            x = ends - write_text(pg, pymupdf.Point(0, y), text, span, bold=bold, italic=False,
+                                  measure=True)[0]
+        else:
+            x = box.x0 - (got[0] / 4 - start) * k
+        if best is None or abs(have - want) < best[0]:
+            best = (abs(have - want), (path, bold, False, size, (x, y)))
+    return best and best[1]
+
+
+def plain_drawing(doc, xref, depth=0):
+    """(PDF_LOCK held) Is a drawing (a form XObject) just shapes - a logo, a diagram drawn as
+    lines and fills - no text, no pictures (those are picked up on their own)? Drawings it
+    draws are looked into too."""
+    try:
+        ops = content_ops(doc.xref_stream(xref) or b"")
+    except Exception:
+        return False
+    if not ops or depth > 3:
+        return False
+    for op, _s, _e, args in ops:
+        if op in (b"BT", b"BI", b"ID"):
+            return False
+        if op == b"Do":
+            m = re.search(rb"/([^\s/\[\]<>()]+)\s*$", args)
+            if not m:
+                return False
+            kind, value = doc.xref_get_key(xref, "Resources/XObject/" + m.group(1).decode("latin-1"))
+            if kind != "xref":
+                return False
+            inner = int(value.split()[0])
+            if doc.xref_get_key(inner, "Subtype")[1] != "/Form" or not plain_drawing(doc, inner, depth + 1):
+                return False
+    return True
+
+
+def page_drawings(page, log):
+    """(PDF_LOCK held) The drawings a page draws itself (form XObjects of just shapes - a
+    journal's logo, a heading drawn as outlines) - picked up and moved like pictures: their
+    "rect" (the page's own space, just round what they draw), "form", "name", "nth" (which time
+    the page draws that name), "z" / "z_end" (where in log - the page's drawing in order -
+    what they draw is)."""
+    doc = page.parent
+    forms = {}
+    try:
+        for xref, name, invoker, _bbox in page.get_xobjects():
+            if invoker == 0 and doc.xref_get_key(xref, "Subtype")[1] == "/Form" \
+                    and plain_drawing(doc, xref):
+                forms[name] = xref
+    except Exception:
+        return []
+    if not forms:
+        return []
+    ops = content_ops(page.read_contents())
+    at = walk_ops(ops)[0]
+    T = page.transformation_matrix
+    area = abs(page.rect)
+    out, seen, used = [], {}, set()
+    for n, (op, _s, _e, args) in enumerate(ops):
+        if op != b"Do":
+            continue
+        m = re.search(rb"/([^\s/\[\]<>()]+)\s*$", args)
+        name = m.group(1).decode("latin-1") if m else None
+        if name not in forms:
+            continue
+        nth = seen[name] = seen.get(name, -1) + 1
+        xref = forms[name]
+        box = pymupdf.Rect(_pdf_array(doc, xref, "BBox") or (0, 0, 0, 0))
+        fm = pymupdf.Matrix(*(_pdf_array(doc, xref, "Matrix") or (1, 0, 0, 1, 0, 0)))
+        whole = fm * at[n] * T
+        rect = box * whole
+        if rect.is_empty or abs(rect) > 0.9 * area:
+            continue
+        reach = rect + (-1, -1, 1, 1)
+        inside = [(k, r) for k, (kind, r) in enumerate(log)
+                  if k not in used and not kind.endswith("text") and reach.contains(r)]
+        if not inside:
+            continue
+        used.update(k for k, _r in inside)
+        tight = pymupdf.Rect(inside[0][1])
+        for _k, r in inside[1:]:
+            tight |= r
+        poly = [pymupdf.Point(u, v) * whole for u, v in
+                ((box.x0, box.y1), (box.x1, box.y1), (box.x1, box.y0), (box.x0, box.y0))]
+        out.append({"kind": "image", "form": True, "rect": tight & rect, "xref": xref,
+                    "name": name, "nth": nth, "uses": 1, "z": inside[0][0],
+                    "z_end": inside[-1][0], "transform": pymupdf.Matrix(1, 0, 0, 1, 0, 0),
+                    "poly": poly if abs(poly[1].y - poly[0].y) > 0.5 else None})
+    return out
+
+
+TURNED_TEXT = {}  # (the PDF's own turned text, read straight: its turn and its letters' outlines)
+
+
+def straightened_blocks(blocks):
+    """A page's text blocks, with the lines the PDF has turned (not straight across) taken
+    out and put in blocks of their own, turned back straight round their middle - one block
+    for each turn - marked "turned" (its tag in TURNED_TEXT: the turn, and each letter's real
+    outline, to take the letters out exactly). So turned text is read as text, in lines and
+    paragraphs like any other."""
+    out, turned = [], []
+    for block in blocks:
+        if block.get("type") != 0:
+            out.append(block)
+            continue
+        keep, by_angle = [], {}
+        for line in block["lines"]:
+            dx, dy = line["dir"]
+            if abs(dy) > 0.01 or dx < 0:
+                by_angle.setdefault(round(math.degrees(math.atan2(dy, dx)), 1), []).append(line)
+            else:
+                keep.append(line)
+        if keep or not by_angle:
+            out.append(dict(block, lines=keep))
+        turned += list(by_angle.items())
+    for angle, lines in turned:
+        box = pymupdf.Rect(lines[0]["bbox"])
+        for line in lines[1:]:
+            box |= line["bbox"]
+        pivot = pymupdf.Point((box.x0 + box.x1) / 2, (box.y0 + box.y1) / 2)
+        back = (pymupdf.Matrix(1, 0, 0, 1, -pivot.x, -pivot.y) * pymupdf.Matrix(-angle)
+                * pymupdf.Matrix(1, 0, 0, 1, pivot.x, pivot.y))
+        quads, straight = [], []
+        for line in lines:
+            spans = []
+            for s in line["spans"]:
+                chars = []
+                for ch in s.get("chars", []):
+                    try:
+                        q = pymupdf.recover_char_quad(line["dir"], s, ch)
+                    except Exception:
+                        continue
+                    if ch["c"].strip():
+                        quads.append(q)
+                    o = pymupdf.Point(ch["origin"]) * back
+                    chars.append(dict(ch, bbox=tuple((q * back).rect), origin=(o.x, o.y)))
+                if not chars:
+                    continue
+                r = pymupdf.Rect(chars[0]["bbox"])
+                for ch in chars[1:]:
+                    r |= ch["bbox"]
+                spans.append(dict(s, chars=chars, bbox=tuple(r), origin=chars[0]["origin"]))
+            if spans:
+                r = pymupdf.Rect(spans[0]["bbox"])
+                for s in spans[1:]:
+                    r |= s["bbox"]
+                straight.append(dict(line, spans=spans, bbox=tuple(r), dir=(1.0, 0.0)))
+        if straight:
+            tag = f"turned{len(TURNED_TEXT)}"
+            TURNED_TEXT[tag] = {"angle": angle, "pivot": pivot, "quads": quads}
+            r = pymupdf.Rect(straight[0]["bbox"])
+            for line in straight[1:]:
+                r |= line["bbox"]
+            out.append({"type": 0, "lines": straight, "bbox": tuple(r), "turned": tag})
+    return out
+
+
+def remove_quads(page, quads):
+    """Take these letters (their outlines, as they're drawn - turned) out of the page - only
+    them: each is found by a spot at its middle. Master PDF's own text isn't touched."""
+    turned = lift_turns(page)  # (turned pieces, and Master PDF's text: out of the way
+    kept = take_tagged(page)  # meanwhile)
+    fonts = page_resources(page) if (kept or turned) else {}
+    for q in quads:
+        c = (q.ul + q.ur + q.ll + q.lr) / 4
+        page.add_redact_annot(pymupdf.Quad(*[c + (v - c) * 0.25 for v in (q.ul, q.ur, q.ll, q.lr)]),
+                              fill=False, cross_out=False)
+    page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                          graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                          text=pymupdf.PDF_REDACT_TEXT_REMOVE)
+    if kept or turned:
+        doc = page.parent
+        have = page_resources(page)
+        for (kind, name), ref in fonts.items():  # (its fonts: still there for it)
+            if (kind, name) not in have:
+                try:
+                    doc.xref_set_key(page.xref, f"Resources/{kind}/{name}", ref)
+                except Exception:
+                    pass
+    if kept:
+        page.wrap_contents()
+        last = page.get_contents()[-1]
+        doc.update_stream(last, doc.xref_stream(last) + b"".join(kept))
+    put_turns(page, turned)
 
 
 def split_at_gaps(spans):
@@ -4939,7 +6571,8 @@ def first_word_width(o):
         if not ch["c"].strip():
             break
         word.append(ch)
-    return (word[-1]["bbox"][2] - word[0]["bbox"][0]) if word else 0
+    return (max(ch["bbox"][2] for ch in word) - min(ch["bbox"][0] for ch in word)) if word else 0
+    # (right to left too: its first letter is its rightmost)
 
 
 def group_frames(lines, rules=()):
@@ -4985,12 +6618,7 @@ def group_frames(lines, rules=()):
 
 
 def frame_objects(lines, mid, paras=None, edges=(), page_rect=None):
-    """Lines that make a frame, as the Edit tool's objects: one frame - or, a line on its own
-    or right-to-left text, line by line."""
-    if any(RTL_LETTERS.search(o["text"]) for o in lines):  # (right-to-left: line by line)
-        for o in lines:
-            o["lines"], o["paras"] = [o], [[o]]
-        return list(lines)
+    """Lines that make a frame, as the Edit tool's objects: one frame - right to left too."""
     rect = pymupdf.Rect(lines[0]["rect"])
     for o in lines[1:]:
         rect |= o["rect"]
@@ -5025,7 +6653,11 @@ def split_paragraphs(ls, rect):
                or fits  # (ended, though the next word would have fitted)
                or span_bold(b["spans"][0]) and not span_bold(a["spans"][-1])  # (a bold label
                # starting it - "University: ..." - after a line that didn't end bold)
-               or not ragged and b["rect"].x0 > x0 + 1.2 * sb and a["rect"].x0 <= x0 + 1.2 * sa)
+               or not ragged and (  # (indented: from its start - right to left, the right)
+                   b["rect"].x1 < x1 - 1.2 * sb and a["rect"].x1 >= x1 - 1.2 * sa
+                   if RTL_LETTERS.search(b["text"][:1] or "") or RTL_LETTERS.match(
+                       next((c for c in b["text"] if c.isalpha()), "a"))
+                   else b["rect"].x0 > x0 + 1.2 * sb and a["rect"].x0 <= x0 + 1.2 * sa))
         if new:
             paras.append([b])
         else:
@@ -5067,15 +6699,35 @@ def text_of(tag):
 
 
 def label_drawn(page, before, tag):
-    """(PDF_LOCK held) What was drawn on the page since before ({content stream: its length}
-    then) labelled as piece tag's."""
+    """(PDF_LOCK held) What was drawn on the page since before ({content stream: what it was
+    then}) labelled as piece tag's - just that: wherever it went in. Writing on a page can also
+    put the page's own drawing in q ... Q (a "q" before it, a "Q" after it); that's left as it
+    is - never taken for the piece's."""
     doc = page.parent
+    drawn_before = b""  # (the page's drawing in the streams before this one)
     for x in page.get_contents():
         data = doc.xref_stream(x)
-        n = before.get(x, 0)
-        if len(data) > n:
-            doc.update_stream(x, data[:n] + b"\n/MasterPDF <</T %d>> BDC\n" % tag + data[n:]
-                              + b"\nEMC\n")
+        old = before.get(x, b"")
+        if len(data) > len(old):
+            if data.startswith(old):  # (drawn after what was there)
+                head, added, tail = old, data[len(old):], b""
+            elif old and data.endswith(old):  # (put before it: only a "q" to wrap it, if that)
+                head, added, tail = b"", data[:len(data) - len(old)], old
+            else:
+                at = data.find(old) if old else -1
+                if at < 0:  # (changed through and through: not labelled - can't be told apart)
+                    head = added = tail = None
+                else:
+                    head, added, tail = data[:at + len(old)], data[at + len(old):], b""
+            if added is not None:
+                m = re.match(rb"\s*Q\b", added)  # (a "Q" closing a "q" still open - put before
+                if m and sum(1 if op[0] == b"q" else -1 if op[0] == b"Q" else 0  # the page's
+                             for op in content_ops(drawn_before + head)) > 0:  # drawing)
+                    head, added = head + added[:m.end()], added[m.end():]
+                if added.strip(b" \t\r\nqQ"):  # (not just the page's drawing wrapped)
+                    data = head + b"\n/MasterPDF <</T %d>> BDC\n" % tag + added + b"\nEMC\n" + tail
+                    doc.update_stream(x, data)
+        drawn_before += data + b"\n"
 
 
 def frame_snapshot(doc, i, obj, others):
@@ -5104,13 +6756,42 @@ def frame_snapshot(doc, i, obj, others):
     return tmp.tobytes(garbage=3, deflate=True), clip
 
 
+def drawing_snapshot(doc, i, obj):
+    """(PDF_LOCK held) A drawing (obj["form"]) exactly as page i draws it, as a one-page PDF
+    with nothing else on it, and the box round it - to draw it elsewhere (see draw_snapshot)."""
+    if obj.get("paths"):
+        return paths_snapshot(doc, i, obj)
+    page = doc[i]
+    ops = content_ops(page.read_contents())
+    at = walk_ops(ops)[0]
+    mine = re.compile(rb"/" + re.escape(obj["name"].encode("latin-1")) + rb"\s*$")
+    ctm, count = None, -1
+    for n, (op, _s, _e, args) in enumerate(ops):
+        if op == b"Do" and mine.search(args):
+            count += 1
+            if count == obj.get("nth", 0):
+                ctm = at[n]
+                break
+    if ctm is None:
+        raise ValueError("this drawing couldn't be found on the page")
+    tmp = pymupdf.open()
+    tmp.insert_pdf(doc, from_page=i, to_page=i, annots=False)
+    tp = tmp[0]
+    x = tmp.get_new_xref()
+    tmp.update_object(x, "<<>>")
+    tmp.update_stream(x, b"q %.6f %.6f %.6f %.6f %.6f %.6f cm /" % tuple(ctm)
+                      + obj["name"].encode("latin-1") + b" Do Q")
+    tmp.xref_set_key(tp.xref, "Contents", f"{x} 0 R")
+    return tmp.tobytes(garbage=3, deflate=True), pymupdf.Rect(obj["rect"]) + (-1, -1, 1, 1)
+
+
 def restore_snapshot(page, data, clip):
     """(PDF_LOCK held) A frame drawn back exactly as it was (see frame_snapshot) - labelled as
     the piece being written now (TEXT_TAG)."""
     src = pymupdf.open("pdf", data)
     doc = page.parent
     page.wrap_contents()
-    before = {x: len(doc.xref_stream(x)) for x in page.get_contents()}
+    before = {x: doc.xref_stream(x) for x in page.get_contents()}
     page.show_pdf_page(clip, src, 0, clip=clip)
     if TEXT_TAG["tag"] is not None:
         label_drawn(page, before, TEXT_TAG["tag"])
@@ -5123,7 +6804,7 @@ def draw_snapshot(page, data, clip, dx, dy):
     src = pymupdf.open("pdf", data)
     doc = page.parent
     page.wrap_contents()
-    before = {x: len(doc.xref_stream(x)) for x in page.get_contents()}
+    before = {x: doc.xref_stream(x) for x in page.get_contents()}
     dest = clip + (dx, dy, dx, dy)
     page.show_pdf_page(dest, src, 0, clip=clip)
     if TEXT_TAG["tag"] is not None:
@@ -5182,13 +6863,14 @@ def remove_text(page, rect):
             return
     r = pymupdf.Rect(rect)
     r.y0, r.y1 = r.y0 + r.height * 0.3, r.y1 - r.height * 0.3
-    kept = take_tagged(page)  # (Master PDF's text: out of the way meanwhile)
-    fonts = page_resources(page) if kept else {}
+    turned = lift_turns(page)  # (turned pieces, and Master PDF's text: out of the way
+    kept = take_tagged(page)  # meanwhile)
+    fonts = page_resources(page) if (kept or turned) else {}
     page.add_redact_annot(r, fill=False, cross_out=False)
     page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
                           graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
                           text=pymupdf.PDF_REDACT_TEXT_REMOVE)
-    if kept:
+    if kept or turned:
         doc = page.parent
         have = page_resources(page)
         for (kind, name), ref in fonts.items():  # (its fonts: still there for it)
@@ -5197,9 +6879,11 @@ def remove_text(page, rect):
                     doc.xref_set_key(page.xref, f"Resources/{kind}/{name}", ref)
                 except Exception:
                     pass
+    if kept:
         page.wrap_contents()
         last = page.get_contents()[-1]
         doc.update_stream(last, doc.xref_stream(last) + b"".join(kept))
+    put_turns(page, turned)
 
 
 def write_text(page, origin, text, span, size=None, color=None, right=None, family=None,
@@ -5228,10 +6912,13 @@ def write_text(page, origin, text, span, size=None, color=None, right=None, fami
     needs = [c for c in text if not c.isspace()]
     if path and not all(loaded_font(path).has_glyph(ord(c)) for c in needs):
         path = None  # (this font hasn't got some of the letters)
-    if path is None:  # Arial has most of the world's letters
-        arial = find_family("Arial", bold, italic)[0]
-        if arial and all(loaded_font(arial).has_glyph(ord(c)) for c in needs):
-            path, family = arial, "Arial"
+    if path is None:  # (Arial has most of the world's letters - or those that come with
+        for name in ("Arial", "Liberation Sans", "DejaVu Sans", "Amiri", "Tajawal"):  # the app)
+            other, other_family = find_family(name, bold, italic)
+            if other and font_key(other_family or "").startswith(font_key(name)) and all(
+                    loaded_font(other).has_glyph(ord(c)) for c in needs):
+                path, family = other, other_family
+                break
     rb, ri = real_style(path) if path else (bold, italic)
     fake_bold, fake_italic = bold and not rb, italic and not ri  # (the family has none)
     if path:
@@ -5274,8 +6961,14 @@ def write_text(page, origin, text, span, size=None, color=None, right=None, fami
         if measure:
             return metrics
         top = origin.y - drop
+        tag = TEXT_TAG["tag"]
+        if tag is not None:
+            before = {x: page.parent.xref_stream(x) for x in page.get_contents()}
         page.insert_htmlbox(pymupdf.Rect(x0, top, x0 + width, top + size * 3), html, css=css,
                             archive=pymupdf.Archive(folder))
+        if tag is not None:  # (labelled with the piece it belongs to)
+            label_drawn(page, before, tag)
+            TEXT_TAG["boxes"].append(pymupdf.Rect(x0, top, x0 + width, top + size * 1.5))
         return metrics
     extra = {}
     if path:
@@ -5311,7 +7004,7 @@ def write_text(page, origin, text, span, size=None, color=None, right=None, fami
     tag = TEXT_TAG["tag"]
     doc = page.parent
     if tag is not None:
-        before = {x: len(doc.xref_stream(x)) for x in page.get_contents()}
+        before = {x: doc.xref_stream(x) for x in page.get_contents()}
     page.insert_text(origin, text, fontname=name, fontsize=size, color=rgb, rotate=rotate,
                      **extra)
     if tag is not None:  # (labelled with the piece it belongs to)
@@ -5581,102 +7274,157 @@ def shape_outline(annot, kind, box, w):
     return pts
 
 
+def _pdf_array(doc, xref, key):
+    kind, value = doc.xref_get_key(xref, key)
+    return [float(v) for v in value.strip("[]").split()] if kind == "array" else None
+
+
+def annot_form(doc, annot):
+    """(PDF_LOCK held) The annotation's appearance (the form that draws it), or None."""
+    kind, value = doc.xref_get_key(annot.xref, "AP/N")
+    return int(value.split()[0]) if kind == "xref" else None
+
+
+def form_to_pdf(doc, form, annot):
+    """(the matrix from the appearance's own space to the page's PDF space, its box)."""
+    box = pymupdf.Rect(_pdf_array(doc, form, "BBox") or (0, 0, 1, 1))
+    m = pymupdf.Matrix(*(_pdf_array(doc, form, "Matrix") or (1, 0, 0, 1, 0, 0)))
+    rect = pymupdf.Rect(_pdf_array(doc, annot.xref, "Rect") or tuple(box))
+    shown = box * m  # (PDF puts the box, so transformed, onto the annotation's Rect)
+    sx = rect.width / shown.width if shown.width else 1
+    sy = rect.height / shown.height if shown.height else 1
+    fit = pymupdf.Matrix(sx, 0, 0, sy, rect.x0 - shown.x0 * sx, rect.y0 - shown.y0 * sy)
+    return m * fit, box
+
+
+MASK_GS = "MPmask"  # (the graphics state an erased drawing's mask is set with)
+
+
+def mask_parts(doc, gs):
+    """(PDF_LOCK held) An eraser mask's parts: (its form, its picture's xref)."""
+    kind, value = doc.xref_get_key(gs, "SMask/G")
+    form = int(value.split()[0]) if kind == "xref" else None
+    kind, value = doc.xref_get_key(form, "Resources/XObject/MPi") if form else ("null", "")
+    return form, (int(value.split()[0]) if kind == "xref" else None)
+
+
+def attach_mask(doc, annot, gs):
+    """(PDF_LOCK held) The eraser mask gs put on the annotation's appearance (again, after its
+    appearance was made anew - moved, recoloured)."""
+    form = annot_form(doc, annot)
+    if not form:
+        return
+    kind, value = doc.xref_get_key(form, "Resources")
+    if kind == "xref":
+        holder, at = int(value.split()[0]), ""
+    else:
+        holder, at = form, "Resources/"
+    if kind == "null":
+        doc.xref_set_key(form, "Resources", f"<</ExtGState<</{MASK_GS} {gs} 0 R>>>>")
+    else:
+        k2, v2 = doc.xref_get_key(holder, at + "ExtGState")
+        if k2 == "null":
+            doc.xref_set_key(holder, at + "ExtGState", f"<</{MASK_GS} {gs} 0 R>>")
+        elif k2 == "xref":
+            doc.xref_set_key(int(v2.split()[0]), MASK_GS, f"{gs} 0 R")
+        else:
+            doc.xref_set_key(holder, at + "ExtGState/" + MASK_GS, f"{gs} 0 R")
+    data = doc.xref_stream(form) or b""
+    if not data.startswith(f"/{MASK_GS} gs".encode()):
+        doc.update_stream(form, f"/{MASK_GS} gs\n".encode() + data)
+    doc.xref_set_key(annot.xref, "MPDFMask", f"{gs} 0 R")
+
+
+def annot_mask(doc, annot):
+    """(PDF_LOCK held) The eraser mask on the annotation (its graphics state's xref), or None."""
+    kind, value = doc.xref_get_key(annot.xref, "MPDFMask")
+    return int(value.split()[0]) if kind == "xref" else None
+
+
+def shift_mask(doc, gs, dx, dy):
+    """(PDF_LOCK held) An eraser mask moved by (dx, dy) in PDF space - with its drawing."""
+    form, _img = mask_parts(doc, gs)
+    if not form:
+        return
+    box = pymupdf.Rect(_pdf_array(doc, form, "BBox")) + (dx, dy, dx, dy)
+    doc.xref_set_key(form, "BBox", f"[{box.x0:g} {box.y0:g} {box.x1:g} {box.y1:g}]")
+    doc.update_stream(form, f"q {box.width:g} 0 0 {box.height:g} {box.x0:g} {box.y0:g} cm "
+                            f"/MPi Do Q".encode())
+
+
+def erase_on_annot(page, annot, path, r):
+    """(PDF_LOCK held) The eraser's path (page points), r across, rubbed out of this drawing -
+    exactly what it went over, like Photoshop's: a mask on the drawing hides it there (added to
+    each time). The drawing is taken away once none of it is left. True if it changed."""
+    doc = page.parent
+    form = annot_form(doc, annot)
+    if not form:
+        return False
+    to_pdf, box = form_to_pdf(doc, form, annot)
+    to_form = page.transformation_matrix * ~to_pdf
+    pts = [pymupdf.Point(q) * to_form for q in path]
+    rf = r * abs(to_form.a * to_form.d - to_form.b * to_form.c) ** 0.5
+    reach = box + (-rf, -rf, rf, rf)
+    if not any(reach.contains(q) for q in pts) and not any(
+            pymupdf.Rect(a, b).normalize().intersects(reach) for a, b in zip(pts, pts[1:])):
+        return False
+    gs = annot_mask(doc, annot)
+    mask = None
+    if gs:
+        mform, img = mask_parts(doc, gs)
+        if img:
+            pix = pymupdf.Pixmap(doc, img)
+            mask = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+            box = pymupdf.Rect(_pdf_array(doc, mform, "BBox"))  # (the mask's own box)
+    k = min(4.0, 2400 / max(box.width, box.height, 1))  # (its pixels per point)
+    if mask is None:
+        mask = Image.new("L", (max(1, round(box.width * k)), max(1, round(box.height * k))), 255)
+    k = mask.width / max(box.width, 1e-6)
+    before = mask.tobytes()
+    d = ImageDraw.Draw(mask)
+    px = [((q.x - box.x0) * k, (box.y1 - q.y) * k) for q in pts]
+    rad = max(0.5, rf * k)
+    if len(px) > 1:
+        d.line(px, fill=0, width=max(1, round(2 * rad)))
+    for x, y in px:
+        d.ellipse((x - rad, y - rad, x + rad, y + rad), fill=0)
+    if mask.tobytes() == before:
+        return False
+    if mask.getextrema() == (0, 0):  # (all of it rubbed out: the drawing goes)
+        page.delete_annot(annot)
+        return True
+    if gs:
+        doc.update_stream(img, mask.tobytes())
+    else:
+        img = doc.get_new_xref()
+        doc.update_object(img, f"<</Type/XObject/Subtype/Image/Width {mask.width}/Height "
+                               f"{mask.height}/ColorSpace/DeviceGray/BitsPerComponent 8>>")
+        doc.update_stream(img, mask.tobytes())
+        mform = doc.get_new_xref()
+        doc.update_object(mform, f"<</Type/XObject/Subtype/Form/BBox[{box.x0:g} {box.y0:g} "
+                                 f"{box.x1:g} {box.y1:g}]/Group<</S/Transparency/CS/DeviceGray>>"
+                                 f"/Resources<</XObject<</MPi {img} 0 R>>>>>>")
+        doc.update_stream(mform, f"q {box.width:g} 0 0 {box.height:g} {box.x0:g} {box.y0:g} cm "
+                                 f"/MPi Do Q".encode())
+        gs = doc.get_new_xref()
+        doc.update_object(gs, f"<</Type/ExtGState/SMask<</Type/Mask/S/Luminosity/G {mform} 0 R>>>>")
+        attach_mask(doc, annot, gs)
+    return True
+
+
 def rub_out(page, path, r):
     """(PDF_LOCK held) The eraser rubbed along path (points, in the page's own space), r
-    across - like Photoshop's: what's under it goes, the rest stays. Pen and marker strokes,
-    and shapes drawn as an outline, lose just the parts under it, cut at its edge (a stroke
-    rubbed through the middle becomes two); a filled shape or an arrow it touches goes. True
-    if anything changed."""
-    segs = list(zip(path, path[1:])) or [(path[0], path[0])]
-    xs, ys = [p[0] for p in path], [p[1] for p in path]
+    across: every drawing it went over - pen and marker strokes, shapes, filled or not - loses
+    just what was under it (see erase_on_annot). True if anything changed."""
+    if not path:
+        return False
+    xs, ys = [q[0] for q in path], [q[1] for q in path]
     reach = pymupdf.Rect(min(xs) - r, min(ys) - r, max(xs) + r, max(ys) + r)
-
-    def under(p, w):
-        return any(seg_distance(p, a, b) <= r + w / 2 for a, b in segs)
     changed = False
     for annot in list(page.annots()):
-        kind = annot.type[1]
-        if kind not in RUBBABLE:
-            continue
-        box = pymupdf.Rect(annot.rect)
-        if not box.intersects(reach):
-            continue
-        w = (annot.border or {}).get("width") or 1
-        near = reach + (-w, -w, w, w)
-
-        def gone(q):
-            return near.contains(q) and under(q, w)
-
-        def edge(keep, cut):  # (where the eraser's edge crosses keep-cut)
-            for _ in range(10):
-                m = ((keep[0] + cut[0]) / 2, (keep[1] + cut[1]) / 2)
-                if gone(m):
-                    cut = m
-                else:
-                    keep = m
-            return keep
-        ends = annot.line_ends if kind in ("Line", "PolyLine") else None
-        if kind == "Ink":
-            strokes = [[tuple(v) for v in s] for s in annot.vertices or []]
-        elif not annot.colors.get("fill") and not any(ends or ()):
-            strokes = [shape_outline(annot, kind, box, w)]
-        else:  # (filled, or an arrow: touched anywhere, it goes)
-            outline = shape_outline(annot, kind, box, w)
-            line = list(zip(outline, outline[1:])) or [(outline[0], outline[0])] if outline else []
-            if any(seg_distance(p, a, b) <= r + w / 2 for a, b in line for p in path) or \
-                    any(under(a, w) for a, _ in line):
-                page.delete_annot(annot)
+        if annot.type[1] in RUBBABLE and pymupdf.Rect(annot.rect).intersects(reach):
+            if erase_on_annot(page, annot, path, r):
                 changed = True
-            continue
-        step = max(0.25, min(1.0, r / 4))
-        pieces, cut = [], False
-        for stroke in strokes:
-            pts = []  # (the stroke with points every so often - only its own kept, and the cuts)
-            for a, b in zip(stroke, stroke[1:]):
-                n = max(1, int(((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5 / step))
-                pts.append((a, True))
-                pts += [((a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n), False)
-                        for k in range(1, n)]
-            if stroke:
-                pts.append((stroke[-1], True))
-            run, prev, was = [], None, False
-            for q, own in pts:
-                now = gone(q)
-                if now:
-                    cut = True
-                    if prev is not None and not was:
-                        run.append(edge(prev, q))
-                    if len(run) > 1:
-                        pieces.append(run)
-                    run = []
-                else:
-                    if prev is not None and was:
-                        run.append(edge(q, prev))
-                    if own or not run:
-                        run.append(q)
-                prev, was = q, now
-            if prev is not None and not was and run and run[-1] != prev:
-                run.append(prev)
-            if len(run) > 1:
-                pieces.append(run)
-        if not cut:
-            continue
-        stroke_color, opacity = annot.colors.get("stroke"), annot.opacity
-        blend, info = annot.blendmode, annot.info
-        page.delete_annot(annot)
-        changed = True
-        if pieces:  # (what's left: the same colour, width and see-through)
-            new = page.add_ink_annot(pieces)
-            if stroke_color:
-                new.set_colors(stroke=stroke_color)
-            new.set_border(width=w)
-            if 0 <= opacity < 1:
-                new.set_opacity(opacity)
-            if blend:
-                new.set_blendmode(blend)
-            new.set_info(content=info.get("content", ""), title=info.get("title", ""),
-                         subject=info.get("subject", ""))
-            new.update()
     return changed
 
 
@@ -5689,10 +7437,34 @@ def retype_runs(page, obj, runs, align="left", ref=None):
     y, span = origin.y, main_span(obj)
     ref = ref or (obj["rect"].x0, obj["rect"].x1)
 
-    def write(x, text, st, measure=False):
+    def write(x, text, st, measure=False, right=None):
         family, size, bold, italic, color = st[:5]
         return write_text(page, pymupdf.Point(x, y), text, span, size, color, family=family,
-                          bold=bold, italic=italic, measure=measure)
+                          bold=bold, italic=italic, measure=measure, right=right)
+    merged = []  # (pieces side by side in one look: one piece)
+    for text, st in runs:
+        if merged and merged[-1][1] == st:
+            merged[-1] = (merged[-1][0] + text, st)
+        else:
+            merged.append((text, st))
+    runs = merged
+    said = "".join(text for text, _st in runs)
+    if len(runs) > 1 and len(ARABIC_LETTER.findall(said)) >= \
+            sum(1 for c in said if c.isascii() and c.isalpha()):
+        # (right to left, in more than one look: the pieces from the right end - a space at
+        # a piece's end kept, as one that isn't dropped)
+        runs = [(re.sub(r"^ | $", "\xa0", text) if RTL_LETTERS.search(text) else text, st)
+                for text, st in runs]
+        metrics = [write(0, text, st, True) for text, st in runs]
+        total = sum(m[0] for m in metrics)
+        x = line_start(ref, "right" if align == "justify" else align, total) + total
+        remove_text(page, obj["rect"])
+        out = []
+        for (text, st), (w, asc, desc) in zip(runs, metrics):
+            write(x - w, text, st, right=x)
+            out.append((pymupdf.Rect(x - w, y - asc * st[1], x, y - desc * st[1]), st))
+            x -= w
+        return out
     metrics = [write(0, text, st, True) for text, st in runs]
     total = sum(m[0] for m in metrics)
     spaces = sum(text.count(" ") for text, _ in runs)
@@ -5809,6 +7581,31 @@ def layout_frame(page, frame, paras, x0, x1, align="left", wrap=True, start_y=No
                     gap = justify_gap(room, total, spaces, measure(" ", line[0][0][1])[0], biggest)
                 how = "left"
             x = lx0 + first + line_start((0, room), how, total)
+            said = " ".join(t for w in line for t, _st in w)
+            if len(ARABIC_LETTER.findall(said)) >= sum(1 for c in said if c.isascii() and c.isalpha()):
+                # (right to left - Arabic...: each run of it in one look written whole, as
+                # one line is - laid out right to left, English in it too -, the runs from
+                # the line's right end)
+                looks = []
+                for t, st in (p for w in line for p in w):
+                    if looks and looks[-1][1] == st:
+                        looks[-1][0] += t
+                    else:
+                        looks.append([t, st])
+                looks[-1][0] = looks[-1][0].rstrip()
+                looks[0][0] = looks[0][0].lstrip()
+                for p in looks:  # (a space at a run's ends: kept - one laid out as HTML
+                    p[0] = re.sub(r"^ +", "\xa0", re.sub(r" +$", "\xa0", p[0]))  # there is dropped)
+                end = x + total
+                for t2, st in looks:
+                    wd = measure(t2, st)[0]
+                    _wd, asc, desc = write_text(page, pymupdf.Point(end - wd, y), t2, span, st[1],
+                                                st[4], family=st[0], bold=st[2], italic=st[3],
+                                                right=end, direction="rtl")
+                    placed.append((pymupdf.Rect(end - wd, y - asc * st[1], end, y - desc * st[1]), st))
+                    end -= wd
+                k += 1
+                continue
             for wn, w in enumerate(line):
                 for pn, (text, st) in enumerate(w):
                     last = wn == len(line) - 1 and pn == len(w) - 1
@@ -5956,17 +7753,457 @@ def move_line(page, obj, d):
     """Move a text line by d (its pieces keep their own fonts, sizes and colours)."""
     remove_text(page, obj["rect"])
     for span in obj["spans"]:
-        write_text(page, pymupdf.Point(span["origin"]) + d, span["text"], span)
+        right = span["bbox"][2] + d.x if RTL_LETTERS.search(span["text"]) else None
+        write_text(page, pymupdf.Point(span["origin"]) + d, span["text"], span, right=right)
+        # (right to left: it ends where it ended - moved)
 
 
-def redraw_image(page, obj, change):
-    """Change the instruction that draws a picture on the page: change(b"/Im1 Do") gives
-    what goes in its place. The page's drawing instructions are tidied into one list first.
-    The pictures' places were found in the order the page draws them, so the instruction
-    is found by counting: obj["order"] of all obj["pictures"] pictures drawn on the page -
-    which also works when the same picture is drawn at several places, or when the PDF
-    holds identical copies of it (Word does that: they're all found as one)."""
-    page.clean_contents()
+_CS_WS = b" \t\r\n\f\x00"
+_CS_DELIM = b"()<>[]{}/%"
+_CS_NUMBER = re.compile(rb"[+-]?(?:\d+\.?\d*|\.\d+)")
+_CS_EI = re.compile(rb"\sEI(?=[\s/\[<(%]|$)")
+PATH_OPS = {b"m", b"l", b"c", b"v", b"y", b"h", b"re"}
+PAINT_OPS = {b"n", b"f", b"F", b"f*", b"S", b"s", b"B", b"B*", b"b", b"b*"}
+# (what may be in a picture's own q ... Q besides drawing it: its place, its frame (a clip),
+# how it's drawn - nothing that draws something else)
+QUIET_OPS = PATH_OPS | {b"q", b"Q", b"cm", b"W", b"W*", b"n", b"gs", b"w", b"J", b"j", b"M",
+                        b"d", b"ri", b"i", b"rg", b"RG", b"g", b"G", b"k", b"K", b"cs", b"CS",
+                        b"sc", b"scn", b"SC", b"SCN", b"BDC", b"BMC", b"EMC", b"MP", b"DP"}
+
+
+def content_ops(data):
+    """A content stream's operators, in order: [(operator, start, end, operands)] - operands:
+    the bytes back to the previous operator. Strings, names, arrays, dictionaries and inline
+    pictures' data are stepped over whole."""
+    ops, i, n, last = [], 0, len(data), 0
+    while i < n:
+        c = data[i]
+        if c in _CS_WS:
+            i += 1
+        elif c == 0x25:  # % a comment, to the line's end
+            j = data.find(b"\n", i)
+            i = n if j < 0 else j
+        elif c == 0x28:  # ( a string - nested brackets, escapes
+            depth, j = 0, i
+            while j < n:
+                ch = data[j]
+                if ch == 0x5C:
+                    j += 2
+                    continue
+                if ch == 0x28:
+                    depth += 1
+                elif ch == 0x29:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            i = j + 1
+        elif c == 0x3C:  # < a hex string, or << a dictionary's start
+            if data[i + 1:i + 2] == b"<":
+                i += 2
+            else:
+                j = data.find(b">", i)
+                i = n if j < 0 else j + 1
+        elif c in b">[]{}":
+            i += 1
+        elif c == 0x2F:  # /Name
+            j = i + 1
+            while j < n and data[j] not in _CS_WS and data[j] not in _CS_DELIM:
+                j += 1
+            i = j
+        else:
+            j = i
+            while j < n and data[j] not in _CS_WS and data[j] not in _CS_DELIM:
+                j += 1
+            if j == i:
+                i += 1
+                continue
+            tok = data[i:j]
+            if not _CS_NUMBER.fullmatch(tok) and tok not in (b"true", b"false", b"null"):
+                ops.append((tok, i, j, data[last:i]))
+                last = j
+                if tok == b"ID":  # (an inline picture's data: up to its EI)
+                    m = _CS_EI.search(data, j + 1)
+                    j = m.end() if m else n
+                    last = j
+            i = j
+    return ops
+
+
+def _numbers(operands):
+    return [float(v) for v in _CS_NUMBER.findall(operands)]
+
+
+def walk_ops(ops, upto=None):
+    """The drawing state at each operator (before it acts): its matrix (PDF space,
+    pymupdf.Matrix) - and at the end (or at upto): the q's still open [(operator's index, the
+    matrix then, [clip boxes set inside it])] and the clip boxes set outside any q (PDF space)."""
+    ctm, saved, stack, top_clips = pymupdf.Matrix(1, 0, 0, 1, 0, 0), [], [], []
+    path, clip_next, at = None, None, []
+    for n, (op, _s, _e, args) in enumerate(ops):
+        if upto is not None and n >= upto:
+            break
+        at.append(ctm)
+        if op == b"q":
+            stack.append([n, ctm, []])
+            saved.append(ctm)
+        elif op == b"Q":
+            if stack:
+                stack.pop()
+            if saved:
+                ctm = saved.pop()
+        elif op == b"cm":
+            v = _numbers(args)[-6:]
+            if len(v) == 6:
+                ctm = pymupdf.Matrix(*v) * ctm
+        elif op in PATH_OPS:
+            v = _numbers(args)
+            if op == b"re" and len(v) >= 4:
+                x, y, w, h = v[-4:]
+                pts = [(x, y), (x + w, y + h)]
+            else:
+                pts = list(zip(v[0::2], v[1::2]))
+            for x, y in pts:
+                q = pymupdf.Point(x, y) * ctm
+                box = pymupdf.Rect(q, q)
+                path = box if path is None else path | q
+        elif op in (b"W", b"W*"):
+            clip_next = path
+        elif op in PAINT_OPS:
+            if clip_next is not None:
+                (stack[-1][2] if stack else top_clips).append(clip_next)
+            path = clip_next = None
+    return at, stack, top_clips
+
+
+def moved_in_place(data, a, b, move_pdf, new_box_pdf):
+    """The drawing instruction at data[a:b] (a picture's "/Name Do") moved by move_pdf (PDF
+    space) right where the page draws it - so what's drawn over it stays over it (text on a
+    picture). Its own q ... Q (its place, its frame) moves with it: a matrix put just inside
+    it. Returns the new data - or None when it can't be done there: the picture isn't in a
+    q ... Q of its own, or a frame round it (a table cell's) would hide it at its new place."""
+    ops = content_ops(data)
+    k = next((n for n, op in enumerate(ops) if op[0] == b"Do" and a <= op[1] < b), None)
+    if k is None:
+        return None
+    at, stack, top_clips = walk_ops(ops, upto=k)
+    closes, depth = [], 0  # (where each q still open is closed, innermost first)
+    for n in range(k + 1, len(ops)):
+        op = ops[n][0]
+        if op == b"q":
+            depth += 1
+        elif op == b"Q":
+            if depth:
+                depth -= 1
+            else:
+                closes.append(n)
+                if len(closes) == len(stack):
+                    break
+    best = None
+    for level in range(len(stack) - 1, -1, -1):  # (from the innermost q out)
+        j = len(stack) - 1 - level
+        if j >= len(closes):
+            break
+        q_at, end = stack[level][0], closes[j]
+        if any(op[0] not in QUIET_OPS and n != k for n, op in enumerate(ops[q_at + 1:end], q_at + 1)):
+            break
+        best = level
+    if best is None:
+        return None
+    outer = [c for entry in stack[:best] for c in entry[2]] + top_clips
+    if any(not (c + (-1, -1, 1, 1)).contains(new_box_pdf) for c in outer):
+        return None
+    c_q = stack[best][1]
+    x = c_q * move_pdf * ~c_q
+    q_end = ops[stack[best][0]][2]
+    return data[:q_end] + (b" %.6f %.6f %.6f %.6f %.6f %.6f cm" % tuple(x)) + data[q_end:]
+
+
+# Text turned with the Edit tool's rotate handle: Master PDF's own piece of text (see TEXT_TAG),
+# written straight as usual, inside a turn of its own -
+#     q /MPturn <</T piece /A degrees /X x /Y y>> BDC  (matrix) cm  ...the piece...  EMC Q
+# (degrees: clockwise as shown, round the point x, y - the page's own space). So it stays
+# turned in any PDF reader, and it can be straightened while it's read or changed: every way
+# the app changes text works on it as on any other (see straighten, settle).
+TURN_PROPS = re.compile(rb"/T\s+(\d+)\s*/A\s+([-\d.]+)\s*/X\s+([-\d.]+)\s*/Y\s+([-\d.]+)")
+
+
+STRAIGHT = b" 1 0 0 1 0 0.0001 "  # (a turn's matrix while it's straight: moves nothing you'd see -
+# a ten-thousandth of a point - but isn't left out when the page's drawing is tidied, as
+# "1 0 0 1 0 0" would be: the turn would be lost)
+
+
+def turn_matrix(page, angle, pivot):
+    """The PDF-space matrix turning a page's own space angle degrees clockwise (as it's shown)
+    round pivot."""
+    T = page.transformation_matrix
+    m = (pymupdf.Matrix(1, 0, 0, 1, -pivot.x, -pivot.y) * pymupdf.Matrix(angle)
+         * pymupdf.Matrix(1, 0, 0, 1, pivot.x, pivot.y))
+    return T * m * ~T
+
+
+def find_turns(data):
+    """The turns in a content stream (see TURN_PROPS): [{tag, angle, x, y, and where its parts
+    are: "q" (its start), "props", "nums" (its matrix's numbers), "body", "end"}]."""
+    ops = content_ops(data)
+    out = []
+    for k, (op, s, _e, args) in enumerate(ops):
+        if op != b"BDC" or b"/MPturn" not in args:
+            continue
+        m = TURN_PROPS.search(args)
+        if not m or k == 0 or ops[k - 1][0] != b"q":
+            continue
+        bare = k + 1 >= len(ops) or ops[k + 1][0] != b"cm"  # (its matrix gone: tidied away)
+        depth, j = 0, k + 1 if bare else k + 2
+        while j < len(ops):
+            if ops[j][0] in (b"BDC", b"BMC"):
+                depth += 1
+            elif ops[j][0] == b"EMC":
+                if depth == 0:
+                    break
+                depth -= 1
+            j += 1
+        if j + 1 >= len(ops) or ops[j + 1][0] != b"Q":
+            continue
+        if bare:  # (put back where it goes: right after the BDC)
+            at = ops[k][2]
+            nums, body = (at, at), (at, ops[j][1])
+        else:
+            cm = ops[k + 1]
+            nums, body = (cm[1] - len(cm[3]), cm[1]), (cm[2], ops[j][1])
+        out.append({"tag": int(m.group(1)), "angle": float(m.group(2)),
+                    "x": float(m.group(3)), "y": float(m.group(4)),
+                    "q": ops[k - 1][1], "props": (s - len(args), s), "bare": bare,
+                    "nums": nums, "body": body, "end": ops[j + 1][2]})
+    return out
+
+
+def page_turns(page):
+    """(PDF_LOCK held) {piece: (degrees, pivot)} of the page's turned text."""
+    doc = page.parent
+    out = {}
+    for x in page.get_contents():
+        data = doc.xref_stream(x) or b""
+        if b"/MPturn" in data:
+            for tn in find_turns(data):
+                out[tn["tag"]] = (tn["angle"], pymupdf.Point(tn["x"], tn["y"]))
+    return out
+
+
+def has_turns(page):
+    doc = page.parent
+    return any(b"/MPturn" in (doc.xref_stream(x) or b"") for x in page.get_contents())
+
+
+def straighten(page, tag=None):
+    """(PDF_LOCK held) The page's turned text (or just piece tag's) drawn straight - for it to
+    be read or changed as any other text; settle turns it back."""
+    doc = page.parent
+    for x in page.get_contents():
+        data = doc.xref_stream(x) or b""
+        if b"/MPturn" not in data:
+            continue
+        new = data
+        for tn in reversed(find_turns(data)):
+            if tag is None or tn["tag"] == tag:
+                a, b = tn["nums"]
+                new = new[:a] + STRAIGHT + (b" cm " if tn["bare"] else b"") + new[b:]
+        if new != data:
+            doc.update_stream(x, new)
+
+
+def settle(page, keep=None):
+    """(PDF_LOCK held) The page's turned text turned as it should be again, after a change:
+    the piece's text that was written anew (outside its turn) put back in it; a turn whose
+    text is all gone taken out; each turn's matrix set from its degrees and pivot (piece keep's
+    left straight: it's being typed in)."""
+    doc = page.parent
+    for _round in range(60):
+        streams = [(x, doc.xref_stream(x) or b"") for x in page.get_contents()]
+        turns = [(x, tn) for x, data in streams if b"/MPturn" in data for tn in find_turns(data)]
+        if not turns:
+            return
+        inside = {}  # (stream, start of a labelled block) of the blocks inside a turn
+        for x, tn in turns:
+            data = dict(streams)[x]
+            for m in TAGGED.finditer(data, tn["body"][0], tn["body"][1]):
+                inside[(x, m.start())] = int(m.group(1))
+        moved = False
+        for x, tn in turns:
+            stray = [(sx, m) for sx, data in streams for m in TAGGED.finditer(data)
+                     if int(m.group(1)) == tn["tag"] and (sx, m.start()) not in inside]
+            if stray:  # (written anew, outside: put in its turn - one at a time)
+                sx, m = stray[0]
+                data = dict(streams)[sx]
+                block = data[m.start():m.end()]
+                data = data[:m.start()] + b" " + data[m.end():]
+                if sx == x:
+                    doc.update_stream(sx, data)
+                    tn = next(t2 for t2 in find_turns(data) if t2["tag"] == tn["tag"])
+                    target = data
+                else:
+                    doc.update_stream(sx, data)
+                    target = doc.xref_stream(x)
+                    tn = next(t2 for t2 in find_turns(target) if t2["tag"] == tn["tag"])
+                at = tn["body"][1]
+                doc.update_stream(x, target[:at] + b"\n" + block + b"\n" + target[at:])
+                moved = True
+                break
+            if not any(v == tn["tag"] for (ix, _s), v in inside.items() if ix == x):
+                data = dict(streams)[x]  # (its text all gone: the turn goes too)
+                doc.update_stream(x, data[:tn["q"]] + b" " + data[tn["end"]:])
+                moved = True
+                break
+        if moved:
+            continue
+        for x, data in streams:  # (settled: each turn's matrix from its degrees and pivot)
+            if b"/MPturn" not in data:
+                continue
+            new = data
+            for tn in reversed(find_turns(data)):
+                a, b = tn["nums"]
+                if tn["tag"] == keep:
+                    nums = STRAIGHT
+                else:
+                    m = turn_matrix(page, tn["angle"], pymupdf.Point(tn["x"], tn["y"]))
+                    nums = b" %.6f %.6f %.6f %.6f %.6f %.6f " % tuple(m)
+                new = new[:a] + nums + (b" cm " if tn["bare"] else b"") + new[b:]
+            if new != data:
+                doc.update_stream(x, new)
+        return
+
+
+def lift_turns(page):
+    """(PDF_LOCK held) The page's turned pieces - each whole, q ... Q - taken out of its
+    drawing as they are (returned, to be put back by put_turns): a tidy-up or a redaction
+    rewrites the page's drawing, and would rearrange them past knowing."""
+    doc = page.parent
+    out = []
+    for x in page.get_contents():
+        data = doc.xref_stream(x) or b""
+        if b"/MPturn" not in data:
+            continue
+        for tn in reversed(find_turns(data)):
+            out.insert(0, data[tn["q"]:tn["end"]])
+            data = data[:tn["q"]] + b" " + data[tn["end"]:]
+        doc.update_stream(x, data)
+    return out
+
+
+def put_turns(page, blocks):
+    """(PDF_LOCK held) Turned pieces lifted out (see lift_turns) put back - on top."""
+    if not blocks:
+        return
+    doc = page.parent
+    page.wrap_contents()
+    last = page.get_contents()[-1]
+    doc.update_stream(last, doc.xref_stream(last) + b"\n" + b"\n".join(blocks) + b"\n")
+
+
+@contextlib.contextmanager
+def turns_aside(page):
+    """(PDF_LOCK held) While in it, the page's turned pieces are out of its drawing (see
+    lift_turns) - put back after."""
+    had = page_resources(page) if has_turns(page) else {}
+    blocks = lift_turns(page)
+    try:
+        yield
+    finally:
+        put_turns(page, blocks)
+        if blocks:  # (their fonts and the rest: a tidy-up drops what looks unused - and they
+            doc = page.parent  # were out of the page meanwhile)
+            have = page_resources(page)
+            for (kind, name), ref in had.items():
+                if (kind, name) not in have:
+                    try:
+                        doc.xref_set_key(page.xref, f"Resources/{kind}/{name}", ref)
+                    except Exception:
+                        pass
+
+
+def set_turn(page, tag, angle=None, shift=None):
+    """(PDF_LOCK held) Piece tag's turn given new degrees (angle) and / or its pivot moved by
+    shift (a point) - its matrix is set by settle."""
+    doc = page.parent
+    for x in page.get_contents():
+        data = doc.xref_stream(x) or b""
+        if b"/MPturn" not in data:
+            continue
+        for tn in reversed(find_turns(data)):
+            if tn["tag"] != tag:
+                continue
+            a = tn["angle"] if angle is None else angle
+            px, py = tn["x"] + (shift.x if shift else 0), tn["y"] + (shift.y if shift else 0)
+            s, e = tn["props"]
+            data = data[:s] + b" /MPturn <</T %d /A %.4f /X %.4f /Y %.4f>> " % (tag, a, px, py) + data[e:]
+        doc.update_stream(x, data)
+
+
+def turn_piece(page, tag, angle, pivot):
+    """(PDF_LOCK held) Piece tag's text (labelled, see TEXT_TAG) put in a turn of its own -
+    or, if it has one, that turn given these degrees."""
+    if tag in page_turns(page):
+        set_turn(page, tag, angle)
+        return
+    doc = page.parent
+    for x in page.get_contents():
+        data = doc.xref_stream(x) or b""
+        for m in TAGGED.finditer(data):
+            if int(m.group(1)) == tag and re.search(rb"\b(?:BT|Do|re|f|S)\b", m.group(0)):  # (the
+                # first of its blocks that draws something: the rest are moved in)
+                head = b"\nq /MPturn <</T %d /A %.4f /X %.4f /Y %.4f>> BDC" % (
+                    tag, angle, pivot.x, pivot.y) + STRAIGHT + b"cm\n"
+                doc.update_stream(x, data[:m.start()] + head + m.group(0) + b"\nEMC Q\n"
+                                  + data[m.end():])
+                return
+    raise ValueError("that text couldn't be found on the page")
+
+
+def turned_point(obj, p):
+    """A point on the page as it is in obj's own straight space (obj turned: turned back)."""
+    tn = obj.get("turn")
+    if not tn:
+        return p
+    angle, pivot = tn
+    return (pymupdf.Point(p) - pivot) * pymupdf.Matrix(-angle) + pivot
+
+
+def outline_of(obj):
+    """The four corners of what's picked up, as it's shown (turned: turned), page's own space -
+    top left, top right, bottom right, bottom left."""
+    if obj.get("poly"):
+        return [pymupdf.Point(q) for q in obj["poly"]]
+    r = pymupdf.Rect(obj.get("box") or obj["rect"])
+    pts = [r.tl, r.tr, r.br, r.bl]
+    tn = obj.get("turn")
+    if tn:
+        angle, pivot = tn
+        pts = [(q - pivot) * pymupdf.Matrix(angle) + pivot for q in pts]
+    return pts
+
+
+def in_outline(pts, p):
+    """Is the point p inside the four-cornered outline pts?"""
+    inside, n = False, len(pts)
+    for k in range(n):
+        a, b = pts[k], pts[(k + 1) % n]
+        if (a.y > p.y) != (b.y > p.y) and p.x < (b.x - a.x) * (p.y - a.y) / ((b.y - a.y) or 1e-9) + a.x:
+            inside = not inside
+    return inside
+
+
+def is_turned(obj):
+    """Is it shown turned (not straight across)?"""
+    pts = outline_of(obj)
+    return abs(pts[1].y - pts[0].y) > 0.5 or abs(pts[3].x - pts[0].x) > 0.5
+
+
+def find_draw(page, obj):
+    """(PDF_LOCK held; the page's drawing tidied) Where the page draws a picture: (content
+    stream's xref, start, end) of its "/Name Do". A picture is found by counting: obj["order"]
+    of all obj["pictures"] pictures drawn on the page - which also works when the same picture
+    is drawn at several places, or when the PDF holds identical copies of it (Word does that:
+    they're all found as one). A drawing (obj["form"]) by its name: the nth time it's drawn."""
     doc = page.parent
 
     def draws(names):  # [(content stream, where in it)] of each "/Name Do", in order
@@ -5975,6 +8212,12 @@ def redraw_image(page, obj, change):
         pattern = rb"/(?:" + b"|".join(re.escape(n.encode()) for n in names) + rb")\s+Do\b"
         return [(xref, m.span()) for xref in page.get_contents()
                 for m in re.finditer(pattern, doc.xref_stream(xref))]
+    if obj.get("form"):
+        mine = draws({obj["name"]})
+        if obj.get("nth", 0) >= len(mine):
+            raise ValueError("this drawing couldn't be found on the page")
+        xref, (a, b) = mine[obj.get("nth", 0)]
+        return xref, a, b
     images = page.get_images(full=True)
     every = draws({item[7] for item in images})  # every picture the page draws itself
     if len(every) == obj.get("pictures", -1):
@@ -5985,27 +8228,473 @@ def redraw_image(page, obj, change):
             raise ValueError("this picture is part of a group on the page, so it can't be "
                              "changed on its own")
         xref, (a, b) = mine[obj.get("nth", 0)]
+    return xref, a, b
+
+
+def convex_hull(points):
+    """The convex outline round points (x, y), corner by corner."""
+    pts = sorted(set(points))
+    if len(pts) < 3:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lo, hi = [], []
+    for q in pts:
+        while len(lo) >= 2 and cross(lo[-2], lo[-1], q) <= 0:
+            lo.pop()
+        lo.append(q)
+    for q in reversed(pts):
+        while len(hi) >= 2 and cross(hi[-2], hi[-1], q) <= 0:
+            hi.pop()
+        hi.append(q)
+    return lo[:-1] + hi[:-1]
+
+
+def turned_box(points):
+    """The smallest box round points (page's own space), turned as they are: its corners -
+    top left, top right, bottom right, bottom left, as shown (its top: the side nearest to
+    across)."""
+    best = None
+    pts = [pymupdf.Point(q) for q in points]
+    for a, b in zip(pts, pts[1:] + pts[:1]):
+        angle = math.degrees(math.atan2(b.y - a.y, b.x - a.x))
+        angle = (angle + 45) % 90 - 45  # (the side nearest to across: its top)
+        m = pymupdf.Matrix(-angle)
+        r = [q * m for q in pts]
+        x0, x1 = min(q.x for q in r), max(q.x for q in r)
+        y0, y1 = min(q.y for q in r), max(q.y for q in r)
+        area = (x1 - x0) * (y1 - y0)
+        if best is None or area < best[0] - 1e-6:
+            best = (area, angle, (x0, y0, x1, y1))
+    if best is None:
+        return None
+    _area, angle, (x0, y0, x1, y1) = best
+    back = pymupdf.Matrix(angle)
+    return [pymupdf.Point(x, y) * back for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
+
+
+_SHAPES = {}  # (the shapes inside pictures - see picture_shape - their outlines and pieces)
+
+
+def _picture_rgb(doc, xref, size):
+    """A picture as a Pillow RGB picture, no bigger than size across."""
+    pix = pymupdf.Pixmap(doc, xref)
+    if pix.n - pix.alpha != 3:
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+    if pix.alpha:
+        pix = pymupdf.Pixmap(pix, 0)
+    im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    im.thumbnail((size, size))
+    return im
+
+
+def _background_from_edges(alike):
+    """What's alike (255 in alike, an "L" picture) and joined to its edges: its background -
+    the rest (255) is what's on it."""
+    w, h = alike.size
+    edge = [(x, 0) for x in range(w)] + [(x, h - 1) for x in range(w)] + \
+        [(0, y) for y in range(h)] + [(w - 1, y) for y in range(h)]
+    for q in edge:
+        if alike.getpixel(q) == 255:
+            ImageDraw.floodfill(alike, q, 128)
+    return alike.point(lambda v: 0 if v == 128 else 255)
+
+
+def _shape_own(doc, xref, size):
+    """(PDF_LOCK held) A picture's shape, from the picture alone (see picture_shape): an "L"
+    picture (255: the shape) no bigger than size across - or None."""
+    im = _picture_rgb(doc, xref, size)
+    w, h = im.size
+    if w < 8 or h < 8:
+        return None
+    kind, value = doc.xref_get_key(xref, "SMask")
+    if kind == "xref":  # (its own see-through parts: what's solid is the shape)
+        sm = pymupdf.Pixmap(doc, int(value.split()[0]))
+        alpha = Image.frombytes("L" if sm.n == 1 else "RGB", (sm.width, sm.height),
+                                sm.samples).convert("L").resize((w, h))
+        return alpha.point(lambda v: 255 if v > 40 else 0)
+    px = im.load()  # (a background of one colour round it, from its edges in)
+    border = [px[x, 0] for x in range(w)] + [px[x, h - 1] for x in range(w)] + \
+        [px[0, y] for y in range(h)] + [px[w - 1, y] for y in range(h)]
+    groups = {}
+    for c in border:
+        groups.setdefault((c[0] // 24, c[1] // 24, c[2] // 24), []).append(c)
+    most = max(groups.values(), key=len)
+    if len(most) < 0.4 * len(border):
+        return None  # (no background round it: all picture)
+    mode = tuple(sorted(c[k] for c in most)[len(most) // 2] for k in range(3))
+    d = ImageChops.difference(im, Image.new("RGB", (w, h), mode)).split()
+    d = ImageChops.lighter(ImageChops.lighter(d[0], d[1]), d[2])
+    fg = _background_from_edges(d.point(lambda v: 255 if v <= 36 else 0))
+    if fg is not None:  # (lines on the background - a signature, a sketch: inside its
+        ink = ImageChops.multiply(fg, d.point(lambda v: 255 if v > 36 else 0))  # loops it's
+        if sum(ink.histogram()[255:]) < 0.75 * sum(fg.histogram()[255:]):  # the background
+            return None  # still - not a filled shape: the whole picture)
+    return fg
+
+
+def _shape_under(page, k, info, size):
+    """(PDF_LOCK held) The page's k-th picture's shape, judged against what the page draws
+    under it (see shape_on_page): an "L" picture (255: the shape) - or None."""
+    doc = page.parent
+    xref = info.get("xref")
+    r = pymupdf.Rect(info["bbox"])
+    m = pymupdf.Matrix(info["transform"])
+    if not xref or abs(m.b) > 1e-6 or abs(m.c) > 1e-6 or m.a <= 0 or m.d <= 0 \
+            or abs(r) > 0.5 * abs(page.rect) or r.width < 8 or r.height < 8:
+        return None  # (turned or flipped, or a page's background: not looked at)
+    if doc.xref_get_key(xref, "SMask")[0] != "null":
+        return None  # (see-through parts of its own: see _shape_own)
+    names = {item[7] for item in page.get_images(full=True)}
+    data = page.read_contents()
+    every = [mm.start() for mm in re.finditer(
+        rb"/(?:" + b"|".join(re.escape(n.encode()) for n in names) + rb")\s+Do\b", data)]
+    if len(every) != len(page.get_image_info()) or k >= len(every):
+        return None
+    a = every[k]
+    im = _picture_rgb(doc, xref, size)
+    w, h = im.size
+    depth = sum(1 if op[0] == b"q" else -1 if op[0] == b"Q" else 0 for op in content_ops(data[:a]))
+    tmp = pymupdf.open()  # (the page as it is under it: what it draws before it)
+    tmp.insert_pdf(doc, from_page=page.number, to_page=page.number, annots=False)
+    tp = tmp[0]
+    x = tmp.get_new_xref()
+    tmp.update_object(x, "<<>>")
+    tmp.update_stream(x, data[:a] + b" Q" * max(0, depth))
+    tmp.xref_set_key(tp.xref, "Contents", f"{x} 0 R")
+    under = tp.get_pixmap(matrix=pymupdf.Matrix(w / r.width, h / r.height), clip=r, alpha=False)
+    under = Image.frombytes("RGB", (under.width, under.height), under.samples).resize((w, h))
+    tmp.close()
+    d = ImageChops.difference(im, under).split()
+    d = ImageChops.lighter(ImageChops.lighter(d[0], d[1]), d[2])
+    alike = d.point(lambda v: 255 if v < 30 else 0)
+    edge = [(x, 0) for x in range(w)] + [(x, h - 1) for x in range(w)] + \
+        [(0, y) for y in range(h)] + [(w - 1, y) for y in range(h)]
+    if sum(1 for q in edge if alike.getpixel(q) == 255) < 0.7 * len(edge):
+        return None  # (it isn't sitting on what's under it: a picture of its own)
+    for q in edge:  # (the background: what's alike, from its edges in...)
+        if alike.getpixel(q) == 255:
+            ImageDraw.floodfill(alike, q, 128)
+    # ...and the coloured patches of it it encloses (a slide's band between a logo's rings) -
+    # not white or grey ones: they may be the picture's own (a shape's shine, a letter's inside)
+    data, label, least = alike.load(), 1, max(4, 0.001 * w * h)
+    for y in range(h):
+        for x in range(w):
+            if data[x, y] == 255 and label < 120:
+                ImageDraw.floodfill(alike, (x, y), label)
+                part = alike.point(lambda v, n=label: 255 if v == n else 0)
+                size = part.histogram()[255]
+                r_, g_, b_ = ImageStat.Stat(under, part).mean if size else (0, 0, 0)
+                hi, lo = max(r_, g_, b_), min(r_, g_, b_)
+                coloured = hi > 40 and (hi - lo) / hi > 0.18
+                ImageDraw.floodfill(alike, (x, y), 128 if coloured and size >= least else 0)
+                label += 1
+    return alike.point(lambda v: 0 if v == 128 else 255)
+
+
+def shape_in(fg):
+    """The shape in fg (an "L" picture: 255 where something is, 0 its background): (its
+    convex outline as parts of the width and height from the top left - [(u, v)] -, an "L"
+    picture of just its pieces) - or None. Bits at its edges much smaller than it (pieces of
+    the shapes beside it, saved into it) aren't part of it; what's inside its edges is."""
+    w, h = fg.size
+    data = fg.load()
+    parts, label = {}, 1  # (its pieces: each a colour of its own, its size, at an edge?)
+    for y in range(h):
+        for x in range(w):
+            if data[x, y] == 255 and label < 254:
+                ImageDraw.floodfill(fg, (x, y), label)
+                parts[label] = [fg.histogram()[label], False]
+                label += 1
+    if not parts:
+        return None
+    for x in range(w):
+        for y in (0, h - 1):
+            if data[x, y] in parts:
+                parts[data[x, y]][1] = True
+    for y in range(h):
+        for x in (0, w - 1):
+            if data[x, y] in parts:
+                parts[data[x, y]][1] = True
+    big = max(parts, key=lambda k: parts[k][0])
+    if parts[big][0] < 0.12 * w * h:
+        return None  # (hardly anything there: not a shape)
+    most = parts[big][0]  # (kept: it, what's inside its edges (letters...), and anything at
+    keep = {k for k, (size, edge) in parts.items()  # its edges nearly as big - not specks,
+            if k == big or (size >= 3 and (not edge or size >= 0.35 * most))}  # nor the bits
+    # of the shapes beside it, cut off at its edges)
+    pieces = fg.point(lambda v: 255 if v in keep else 0)
+    pts = []
+    for y in range(h):
+        xs = [x for x in range(w) if data[x, y] in keep]
+        if xs:
+            pts += [(xs[0] - 1, y - 1), (xs[-1] + 2, y - 1), (xs[0] - 1, y + 2), (xs[-1] + 2, y + 2)]
+    hull = convex_hull([(min(max(x, 0), w), min(max(y, 0), h)) for x, y in pts])
+    area = abs(sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(hull, hull[1:] + hull[:1]))) / 2
+    if len(hull) < 3 or area > 0.92 * w * h:
+        return None  # (it fills its box)
+    if sum(pieces.histogram()[255:]) < 0.4 * area:
+        return None  # (strokes - a signature, a sketch - not a filled shape: the whole picture)
+    return [(x / w, y / h) for x, y in hull], pieces
+
+
+def picture_shape(doc, xref):
+    """(PDF_LOCK held) The shape a picture shows, when it's on a plain background saved into
+    it (PowerPoint's shapes, clip art on white) or it has see-through parts of its own: its
+    outline, as parts of the picture's width and height from its top left - [(u, v)] - or None
+    when the picture is all picture (a photo). Bits at its edges much smaller than it (pieces
+    of the shapes beside it, saved into it) aren't part of it; letters inside it are."""
+    key = ("own", id(doc), xref)
+    if key not in _SHAPES:
+        _SHAPES[key] = None
+        try:
+            fg = _shape_own(doc, xref, 160)
+            _SHAPES[key] = shape_in(fg) if fg is not None else None
+        except Exception:
+            pass
+    return _SHAPES[key][0] if _SHAPES[key] else None
+
+
+def shape_on_page(page, k, info):
+    """(PDF_LOCK held) The shape the page's k-th picture (info: its get_image_info) shows,
+    whatever background was saved round it: the parts of it that look just like what the page
+    draws under it, joined to its edges and running along most of them, are that background
+    (a logo saved on a slide's two-coloured band...) - the rest is the shape. As picture_shape:
+    [(u, v)] or None - None for a picture that isn't on such a background (a photo)."""
+    key = ("under", id(page.parent), page.number, info.get("xref"),
+           tuple(round(v) for v in info["bbox"]))
+    if key not in _SHAPES:
+        _SHAPES[key] = None
+        try:
+            fg = _shape_under(page, k, info, 160)
+            _SHAPES[key] = shape_in(fg) if fg is not None else None
+        except Exception:
+            pass
+    return _SHAPES[key][0] if _SHAPES[key] else None
+
+
+def picture_outline(page, k, info):
+    """(PDF_LOCK held) The shape the page's k-th picture shows (see shape_on_page and
+    picture_shape), or None - judged against what's under it first: the surest."""
+    return shape_on_page(page, k, info) or picture_shape(page.parent, info.get("xref"))
+
+
+def picture_clip(page, k, info):
+    """(PDF_LOCK held) The page's k-th picture's shape exactly (not just round it, as
+    picture_outline: a logo's rings and the background between them told apart), as a clip
+    path in the picture's own square (PDF's way up) - b"... re ... re" - or None. Looked at
+    finely (400 pixels across), only its own pieces (see shape_in) kept."""
+    doc = page.parent
+    xref = info.get("xref")
+    own = ("own", id(doc), xref)
+    under = ("under", id(doc), page.number, xref, tuple(round(v) for v in info["bbox"]))
+    if shape_on_page(page, k, info):  # (as picture_outline: what's under it first)
+        key, fine = under, (lambda: _shape_under(page, k, info, 400))
+    elif picture_shape(doc, xref):
+        key, fine = own, (lambda: _shape_own(doc, xref, 400))
+    else:
+        return None
+    if ("clip",) + key in _SHAPES:
+        return _SHAPES[("clip",) + key]
+    _SHAPES[("clip",) + key] = None
+    try:
+        fg = fine()
+        if fg is None:
+            return None
+        pieces = _SHAPES[key][1].resize(fg.size).filter(ImageFilter.MaxFilter(5))
+        mask = ImageChops.multiply(fg, pieces)  # (finely - and only its own pieces)
+    except Exception:
+        return None
+    w, h = mask.size
+    data = mask.load()
+    rows = []  # (each row's runs of the shape: (from, to))
+    for y in range(h):
+        runs, start = [], None
+        for x in range(w + 1):
+            on = x < w and data[x, y] > 127
+            if on and start is None:
+                start = x
+            elif not on and start is not None:
+                runs.append((start, x))
+                start = None
+        rows.append(tuple(runs))
+    parts, y = [], 0
+    while y < h:  # (rows with the same runs: one box each, as tall as they are)
+        y1 = y + 1
+        while y1 < h and rows[y1] == rows[y]:
+            y1 += 1
+        for x0, x1 in rows[y]:  # (each box half a pixel bigger all round: boxes side by side
+            # overlap - drawn edge to edge, a hairline of what's under shows between them)
+            parts.append(b"%.5f %.5f %.5f %.5f re" % ((x0 - 0.5) / w, 1 - (y1 + 0.5) / h,
+                                                       (x1 - x0 + 1) / w, (y1 - y + 1) / h))
+        y = y1
+    _SHAPES[("clip",) + key] = b" ".join(parts) if parts else None
+    return _SHAPES[("clip",) + key]
+
+
+def clip_shapes(page, data, obj, old, new):
+    """(PDF_LOCK held; the page's drawing tidied - data: it) A picture being moved, turned or
+    resized, and the pictures drawn after it over where it was or goes: each that shows a
+    shape (see picture_shape) clipped to it, where the page draws it - so the background saved
+    round it (and the bits of its neighbours) doesn't cover what's beside it. The pictures
+    themselves aren't changed. Returns the new data."""
+    try:
+        page._image_info = None
+    except Exception:
+        pass
+    infos = page.get_image_info(xrefs=True)
+    names = {item[7] for item in page.get_images(full=True)}
+    if not names:
+        return data
+    every = [m.span() for m in re.finditer(
+        rb"/(?:" + b"|".join(re.escape(n.encode()) for n in names) + rb")\s+Do\b", data)]
+    if len(every) != len(infos):
+        return data
+    a = every[obj["order"]][0] if obj.get("order") is not None and obj["order"] < len(every) else None
+    edits = []
+    for k, ((ya, yb), info) in enumerate(zip(every, infos)):
+        r = pymupdf.Rect(info["bbox"])
+        if not info.get("xref") or not (k == obj.get("order") or (
+                a is not None and ya > a and (r.intersects(old) or r.intersects(new)))):
+            continue
+        before = data[max(0, ya - 3000):ya]
+        if before.rfind(b"/MPclip") > before.rfind(b"EMC"):
+            continue  # (clipped already)
+        path = picture_clip(page, k, info)
+        if not path:
+            continue  # (no shape: all picture)
+        edits.append((ya, yb, b"q /MPclip BMC " + path + b" W n " + data[ya:yb] + b" EMC Q"))
+    for s, e, new_do in sorted(edits, reverse=True):
+        data = data[:s] + new_do + data[e:]
+    return data
+
+
+_ALPHAS = {}  # (document, picture) -> its see-through parts, small (looked up by see_through_at)
+
+
+def see_through_at(doc, obj, p):
+    """(PDF_LOCK held) Is a picture see-through at the point p (the page's own space) - its
+    own see-through parts there (a logo's background taken out)? Clicks go through those."""
+    m = obj.get("transform")
+    if obj.get("form") or m is None or abs(m.b) > 1e-6 or abs(m.c) > 1e-6 or not m.a or not m.d:
+        return False
+    key = (id(doc), obj["xref"])
+    if key not in _ALPHAS:
+        _ALPHAS[key] = None
+        try:
+            kind, value = doc.xref_get_key(obj["xref"], "SMask")
+            if kind == "xref":
+                pix = pymupdf.Pixmap(doc, int(value.split()[0]))
+                im = Image.frombytes("L" if pix.n == 1 else "RGB", (pix.width, pix.height),
+                                     pix.samples).convert("L")
+                im.thumbnail((256, 256))
+                _ALPHAS[key] = im
+        except Exception:
+            pass
+    im = _ALPHAS[key]
+    r = obj.get("full") or obj["rect"]
+    if im is None or r.is_empty:
+        return False
+    u, v = (p.x - r.x0) / r.width, (p.y - r.y0) / r.height
+    u, v = (u if m.a > 0 else 1 - u), (v if m.d > 0 else 1 - v)
+    if not (0 <= u <= 1 and 0 <= v <= 1):
+        return False
+    x, y = min(im.width - 1, int(u * im.width)), min(im.height - 1, int(v * im.height))
+    return max(im.getpixel((min(im.width - 1, x + dx), min(im.height - 1, y + dy)))
+               for dx in (-1, 0, 1) for dy in (-1, 0, 1) if x + dx >= 0 and y + dy >= 0) < 40
+
+
+def redraw_image(page, obj, change):
+    """(see _redraw_image) - with the page's turned pieces out of the way meanwhile."""
+    with turns_aside(page):
+        return _redraw_image(page, obj, change)
+
+
+def _redraw_image(page, obj, change):
+    """Change the instruction that draws a picture on the page: change(b"/Im1 Do") gives
+    what goes in its place. The page's drawing instructions are tidied into one list first.
+    The pictures' places were found in the order the page draws them, so the instruction
+    is found by counting: obj["order"] of all obj["pictures"] pictures drawn on the page -
+    which also works when the same picture is drawn at several places, or when the PDF
+    holds identical copies of it (Word does that: they're all found as one)."""
+    page.clean_contents()
+    doc = page.parent
+    xref, a, b = find_draw(page, obj)
     data = doc.xref_stream(xref)
     old = data[a:b]
     doc.update_stream(xref, data[:a] + change(old) + data[b:])
     return old
 
 
-def place_image(page, obj, rect, behind=False):
-    """Draw a picture at rect (in the page's own space) instead of where it is. It's taken
-    out of where the page drew it and drawn again on top of the page: where it was, it may
-    be clipped to a frame (Word clips a picture to its table cell), which would hide it
-    once it's moved or made bigger."""
-    old, new = obj["rect"], pymupdf.Rect(rect)
-    move = (pymupdf.Matrix(1, 0, 0, 1, -old.x0, -old.y0)
-            * pymupdf.Matrix(new.width / old.width, 0, 0, new.height / old.height, 0, 0)
-            * pymupdf.Matrix(1, 0, 0, 1, new.x0, new.y0))
-    # its place, from its own square to the page: MuPDF's (transform, moved) is upside down
-    # to the picture's own square (flip) and in MuPDF's page space (back to PDF's with ~T)
+def turn_image(page, obj, angle):
+    """A picture (or a drawing) turned angle degrees clockwise (as shown) round its middle -
+    where the page draws it, as place_image."""
+    r = obj["rect"]
+    c = pymupdf.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+    m = (pymupdf.Matrix(1, 0, 0, 1, -c.x, -c.y) * pymupdf.Matrix(angle)
+         * pymupdf.Matrix(1, 0, 0, 1, c.x, c.y))
+    place_image(page, obj, None, matrix=m)
+
+
+def place_image(page, obj, rect, behind=False, matrix=None, top=False):
+    """(see _place_image) - with the page's turned pieces out of the way meanwhile."""
+    with turns_aside(page):
+        _place_image(page, obj, rect, behind, matrix, top)
+
+
+def _place_image(page, obj, rect, behind=False, matrix=None, top=False):
+    """Draw a picture (or a drawing, obj["form"]) at rect (in the page's own space) instead of
+    where it is - where the page draws it, so what's drawn over it stays over it (see
+    moved_in_place). Where it can't stay in place - a frame round it (Word clips a picture to
+    its table cell) would hide it - it's taken out and drawn again on top of the page;
+    behind: drawn first, under everything; top: drawn last, over everything (Bring to Front)."""
+    old = obj["rect"]
+    if matrix is not None:  # (any change of place - turned: see turn_image)
+        move = matrix
+        pts = [q * move for q in outline_of(obj)]
+        new = pymupdf.Rect(pts[0], pts[0])
+        for q in pts[1:]:
+            new |= q
+    else:
+        new = pymupdf.Rect(rect)
+        move = (pymupdf.Matrix(1, 0, 0, 1, -old.x0, -old.y0)
+                * pymupdf.Matrix(new.width / old.width, 0, 0, new.height / old.height, 0, 0)
+                * pymupdf.Matrix(1, 0, 0, 1, new.x0, new.y0))
     flip, T = pymupdf.Matrix(1, 0, 0, -1, 0, 1), page.transformation_matrix
-    ctm = flip * (obj["transform"] * move) * ~T
-    do = redraw_image(page, obj, lambda do: b"")
     doc = page.parent
+    if obj.get("paths"):  # (shapes the page draws itself: their points moved)
+        move_paths(page, obj, move)
+        return
+    page.clean_contents()
+    xref, a, b = find_draw(page, obj)
+    data = doc.xref_stream(xref)
+    if not obj.get("form"):  # (shapes saved on a background: clipped to themselves)
+        clipped = clip_shapes(page, data, obj, old, new)
+        if clipped != data:
+            doc.update_stream(xref, clipped)
+            xref, a, b = find_draw(page, obj)
+            data = doc.xref_stream(xref)
+    if not behind and not top:
+        moved = moved_in_place(data, a, b, T * move * ~T, new * ~T)
+        if moved is not None:
+            doc.update_stream(xref, moved)
+            return
+    if obj.get("form"):  # (its place: where the page drew it, moved)
+        ops = content_ops(data)
+        k = next(n for n, op in enumerate(ops) if op[0] == b"Do" and a <= op[1] < b)
+        ctm = walk_ops(ops, upto=k + 1)[0][k] * (T * move * ~T)
+    else:
+        # its place, from its own square to the page: MuPDF's (transform, moved) is upside
+        # down to the picture's own square (flip) and in MuPDF's page space (back with ~T)
+        ctm = flip * (obj["transform"] * move) * ~T
+    do = data[a:b]
+    doc.update_stream(xref, data[:a] + data[b:])
+    infos = [] if obj.get("form") else page.get_image_info(xrefs=True)
+    path = picture_clip(page, obj["order"], infos[obj["order"]]) \
+        if obj.get("order") is not None and obj["order"] < len(infos) else None
+    if path:  # (drawn anew: clipped to its shape again - see clip_shapes)
+        do = path + b" W n " + do
     draw = b"\nq %.6f %.6f %.6f %.6f %.6f %.6f cm " % tuple(ctm) + do + b" Q\n"
     if behind:  # (behind the text: drawn first, the page's own drawing over it)
         xref = doc.get_new_xref()
@@ -6020,6 +8709,9 @@ def place_image(page, obj, rect, behind=False):
 
 
 def delete_image(page, obj):
+    if obj.get("paths"):
+        delete_paths(page, obj)
+        return
     redraw_image(page, obj, lambda do: b"")
 
 
@@ -6787,7 +9479,9 @@ class DocView(tk.Frame):
             return False
         px, py = getattr(self, "_pointer", (-1e9, -1e9))
         x0, y0, x1, y1 = self.to_canvas(sel[0], sel[1]["rect"])
-        return x0 - 8 <= px <= x1 + 8 and y0 - 8 <= py <= y1 + 8
+        hx, hy = self.rotate_spot(*sel)[:2]
+        return (x0 - 8 <= px <= x1 + 8 and y0 - 8 <= py <= y1 + 8) or \
+            (abs(px - hx) <= 9 and abs(py - hy) <= 9)
 
     def draw_overlays(self):
         c = self.canvas
@@ -6813,13 +9507,38 @@ class DocView(tk.Frame):
             sel = self.edit_sel
             over_pic = self.over_picked_picture()  # (the text under it isn't outlined)
             if self.hover and not (sel and self.hover[1] is sel[1]) and not over_pic                     and self.hover[0] < len(self.rects):
-                x0, y0, x1, y1 = self.to_canvas(self.hover[0], self.hover[1]["rect"])
-                c.create_rectangle(x0 - 2, y0 - 2, x1 + 2, y1 + 2, outline=color, dash=(1, 2),
-                                   tags="overlay")
+                if is_turned(self.hover[1]):  # (turned: its outline, turned)
+                    c.create_polygon(*[v for q in self.outline_on_canvas(*self.hover) for v in q],
+                                     outline=color, fill="", dash=(1, 2), tags="overlay")
+                else:
+                    x0, y0, x1, y1 = self.to_canvas(self.hover[0], self.hover[1]["rect"])
+                    c.create_rectangle(x0 - 2, y0 - 2, x1 + 2, y1 + 2, outline=color,
+                                       dash=(1, 2), tags="overlay")
             if sel and sel[0] < len(self.rects) and not self.editor:  # (typing: no box)
                 x0, y0, x1, y1 = self.to_canvas(sel[0], sel[1].get("box") or sel[1]["rect"])
-                c.create_rectangle(x0 - 2, y0 - 2, x1 + 2, y1 + 2, outline=color, tags="overlay")
-                if sel[1].get("frame"):  # a frame: handles at its corners and sides (wider /
+                turned = is_turned(sel[1])
+                if turned:  # (turned: its outline, turned)
+                    c.create_polygon(*[v for q in self.outline_on_canvas(*sel) for v in q],
+                                     outline=color, fill="", width=1, tags="overlay")
+                else:
+                    c.create_rectangle(x0 - 2, y0 - 2, x1 + 2, y1 + 2, outline=color, tags="overlay")
+                # the rotate handle: a round button over its top, on a stalk (as Word's)
+                hx, hy, tx, ty, _mx, _my = self.rotate_spot(*sel)
+                # (the stalk: from the outline as it's drawn - a straight box 2 px out - to
+                # the bottom of the arrow's ring, meeting both)
+                ux, uy = hx - tx, hy - ty
+                n = math.hypot(ux, uy) or 1
+                ux, uy = ux / n, uy / n
+                out = 0 if turned else 2
+                ring = ROTATE_ICON * 0.30  # (into the ring's stroke, from the picture's middle)
+                c.create_line(tx + ux * out, ty + uy * out, hx - ux * ring, hy - uy * ring,
+                              fill=color, tags="overlay")
+                if getattr(self, "_rotate_photo", None) is None:
+                    self._rotate_photo = ImageTk.PhotoImage(rotate_icon(), master=c)
+                c.create_image(hx, hy, image=self._rotate_photo, tags="overlay")
+                if sel[1].get("turn"):
+                    pass  # (turned text: no stretching handles)
+                elif sel[1].get("frame"):  # a frame: handles at its corners and sides (wider /
                     for _code, hx, hy in self.frame_handles(x0, y0, x1, y1):  # narrower: rewrapped)
                         c.create_oval(hx - 4, hy - 4, hx + 4, hy + 4, fill="#FFFFFE",
                                       outline=color, width=2, tags="overlay")
@@ -6951,7 +9670,9 @@ class DocView(tk.Frame):
             if (hover and hover[1]) is not (self.hover and self.hover[1]):
                 self.hover = hover
                 self.draw_overlays()
-            if h is not None:
+            if h == "rot":
+                cursor = "exchange"
+            elif h is not None:
                 if isinstance(h, str):  # (a frame's: its corners slanted, its sides across)
                     cursor = ("size_nw_se" if h in ("nw", "se") else
                               "size_ne_sw" if h in ("ne", "sw") else "sb_h_double_arrow")
@@ -7017,6 +9738,23 @@ class DocView(tk.Frame):
             u.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, W.WPARAM, W.LPARAM]
             self._view_box = (0, 0, 0, 0)  # (the pages' place on the screen: kept up to date)
             log = os.environ.get("MASTERPDF_WHEEL_LOG")
+            u.WindowFromPoint.restype = ctypes.c_void_p
+            u.WindowFromPoint.argtypes = [W.POINT]
+            u.GetAncestor.restype = ctypes.c_void_p
+            u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            # (the app window's own handle, kept up to date by take_wheel: Tk makes the window's
+            # frame anew at times - maximized, its title bar set up - and it changes then)
+            self._root_of = lambda h: u.GetAncestor(ctypes.c_void_p(h), 2)  # GA_ROOT
+            self._main_hwnd = self._root_of(self.winfo_toplevel().winfo_id())
+
+            def ours(hwnd, x, y):  # (sent to the app's own window - a pinch goes to the one
+                # with the keyboard - or the window under the mouse is the app's: not a file
+                # dialog or other box over the pages, which has its own scrolling)
+                main = self._main_hwnd
+                if hwnd and u.GetAncestor(ctypes.c_void_p(hwnd), 2) == main:
+                    return True
+                under = u.WindowFromPoint(W.POINT(x, y))
+                return bool(under) and u.GetAncestor(ctypes.c_void_p(under), 2) == main
 
             def hook(code, wp, lp):
                 if code >= 0:
@@ -7025,7 +9763,7 @@ class DocView(tk.Frame):
                         x = ctypes.c_short(m.lParam & 0xFFFF).value
                         y = ctypes.c_short((m.lParam >> 16) & 0xFFFF).value
                         x0, y0, x1, y1 = self._view_box
-                        if x0 <= x < x1 and y0 <= y < y1:
+                        if x0 <= x < x1 and y0 <= y < y1 and ours(m.hwnd, x, y):
                             if wp == 1:  # (taken off the queue: noted once)
                                 delta = ctypes.c_short((m.wParam >> 16) & 0xFFFF).value
                                 ctrl = bool(m.wParam & 8) or bool(u.GetKeyState(0x11) & 0x8000)
@@ -7036,6 +9774,10 @@ class DocView(tk.Frame):
                                         f.write(f"{time.monotonic():.3f} {'H' if m.message == 0x020E else 'V'}"
                                                 f" delta={delta} ctrl={ctrl} hwnd={m.hwnd}\n")
                             m.message = 0  # (WM_NULL: Tk doesn't act on it too)
+                        elif log and wp == 1:  # (left to Tk: noted too, to see why)
+                            with open(log, "a") as f:
+                                f.write(f"{time.monotonic():.3f} left x={x} y={y} box={self._view_box}"
+                                        f" hwnd={m.hwnd}\n")
                 return u.CallNextHookEx(None, code, wp, lp)
             self._hook_proc = hook_type(hook)  # (kept: Windows calls it as long as the app runs)
             self._hook = u.SetWindowsHookExW(3, self._hook_proc, None, k.GetCurrentThreadId())
@@ -7053,6 +9795,8 @@ class DocView(tk.Frame):
             c = self.canvas
             x, y = c.winfo_rootx(), c.winfo_rooty()
             self._view_box = (x, y, x + c.winfo_width(), y + c.winfo_height())
+            if getattr(self, "_root_of", None):  # (see hook_wheel)
+                self._main_hwnd = self._root_of(self.winfo_toplevel().winfo_id())
         except tk.TclError:
             return
         msgs, self._wheel[:] = list(self._wheel), []
@@ -7210,6 +9954,14 @@ class DocView(tk.Frame):
         tool = self.app.tool
         if tool == "edit":
             h = self.handle_at(cx, cy)
+            if h == "rot":  # the rotate handle: turned round its middle as it's dragged
+                si, obj = self.edit_sel
+                _hx, _hy, _tx, _ty, mx, my = self.rotate_spot(si, obj)
+                self.press = ("rotate", si, obj, (mx, my), math.atan2(cy - my, cx - mx),
+                              self.outline_on_canvas(si, obj))
+                self._ghost = 0.0
+                self._rotating = None  # (how far it's been turned: from this press)
+                return
             if h is not None:  # a picture's corner: resize it; a line's round handle: the
                 si, obj = self.edit_sel  # line bigger or smaller
                 kind = "reflow" if isinstance(h, str) else "stretch" if h > 3 else "resize"
@@ -7445,12 +10197,44 @@ class DocView(tk.Frame):
             boxes, _text = self.app.pick_letters(i, self.to_pdf(i, sx, sy), self.to_pdf(i, cx, cy))
             self.text_sel = {"page": i, "boxes": boxes, "text": ""} if boxes else None
             self.draw_overlays()
+        elif p[0] == "rotate":  # (Shift: in steps of 15 degrees)
+            _, i, obj, (mx, my), start, pts = p
+            # (turned by how far the mouse goes round the middle - slower the nearer the
+            # middle it is, so it can be turned finely there; far out, as it goes)
+            rot = self._rotating = getattr(self, "_rotating", None) or {"last": start, "turn": 0.0}
+            now = math.atan2(cy - my, cx - mx)
+            step = (math.degrees(now - rot["last"]) + 180) % 360 - 180
+            rot["last"] = now
+            rot["turn"] += step * min(1.0, max(0.15, math.hypot(cx - mx, cy - my) / 250))
+            angle = (rot["turn"] + 180) % 360 - 180
+            if e.state & 1:  # (Shift: in steps of 15 degrees)
+                angle = round(angle / 15) * 15
+            else:  # (whole degrees - and near 0, 15, 30, 45... it settles on them)
+                near = round(angle / 15) * 15
+                angle = near if abs(angle - near) <= 2 else round(angle)
+            self._ghost = angle
+            a = math.radians(angle)
+            ca, sa = math.cos(a), math.sin(a)
+            turned = [(mx + (x - mx) * ca - (y - my) * sa, my + (x - mx) * sa + (y - my) * ca)
+                      for x, y in pts]
+            c.delete("ghost")
+            c.create_polygon(*[v for q in turned for v in q], outline="#000000", fill="",
+                             dash=(1, 1), tags=("ghost", "overlay"))
+            c.create_text(cx + 14, cy + 14, text=f"{round(angle)}\u00b0", anchor="nw",
+                          fill=untranslated(select_colors()[0], "edge"), font=FONT,
+                          tags=("ghost", "overlay"))
         elif p[0] in ("move", "shift"):
             _, i, xref, sx, sy, (x0, y0, x1, y1) = p[:6]
             dx, dy = cx - sx, cy - sy
             c.delete("ghost")
-            c.create_rectangle(x0 + dx, y0 + dy, x1 + dx, y1 + dy, outline="#000000",
-                               dash=(1, 1), tags=("ghost", "overlay"))
+            obj = p[2] if p[0] == "shift" else None
+            if obj is not None and is_turned(obj):  # (turned: its outline, turned)
+                pts = self.outline_on_canvas(i, obj)
+                c.create_polygon(*[v for q in pts for v in (q[0] + dx, q[1] + dy)],
+                                 outline="#000000", fill="", dash=(1, 1), tags=("ghost", "overlay"))
+            else:
+                c.create_rectangle(x0 + dx, y0 + dy, x1 + dx, y1 + dy, outline="#000000",
+                                   dash=(1, 1), tags=("ghost", "overlay"))
         elif p[0] == "rub":
             if abs(cx - p[2][-1][0]) + abs(cy - p[2][-1][1]) >= 1:
                 self.rub_paint([p[2][-1], (cx, cy)])
@@ -7512,6 +10296,11 @@ class DocView(tk.Frame):
                 self.set_text_sel(i, boxes, text)
             else:
                 self.clear_text_sel()
+        elif p[0] == "rotate":
+            _, i, obj = p[:3]
+            angle, self._ghost = self._ghost, None
+            if angle and abs(angle) >= 0.5:
+                self.app.rotate_object(i, obj, angle)
         elif p[0] == "reflow":
             _, i, obj, h, (x0, y0, x1, y1) = p
             g, self._ghost = self._ghost, None
@@ -7711,17 +10500,20 @@ class DocView(tk.Frame):
             return
         with PDF_LOCK:
             page = self.app.doc[i]
-            hide = [(a, a.flags) for a in page.annots() if a.type[1] in RUBBABLE]
-            if not hide:
+            if not any(a.type[1] in RUBBABLE for a in page.annots()):
                 return
-            for a, flags in hide:  # (hidden just for this picture)
-                a.set_flags(flags | pymupdf.PDF_ANNOT_IS_HIDDEN)
-            try:
-                clean = tile_picture(page, self.scale, getattr(self, "stretch", 1.0),
-                                     (x0 - x, y0 - y, x1 - x, y1 - y), (w, h))
-            finally:
-                for a, flags in hide:
-                    a.set_flags(flags)
+            # (the picture from a copy of the page with the drawings taken off - the drawings
+            # themselves untouched: changing them, even hiding them for a moment, has MuPDF
+            # make their look again, and what was rubbed out of them comes back)
+            copy = pymupdf.open()
+            copy.insert_pdf(self.app.doc, from_page=i, to_page=i)
+            cp = copy[0]
+            for a in list(cp.annots()):
+                if a.type[1] in RUBBABLE:
+                    cp.delete_annot(a)
+            clean = tile_picture(cp, self.scale, getattr(self, "stretch", 1.0),
+                                 (x0 - x, y0 - y, x1 - x, y1 - y), (w, h))
+            copy.close()
         self._rubview = {"at": (x0, y0), "clean": clean.convert("RGBA"),
                          "mask": Image.new("L", clean.size, 0), "cells": {}}
 
@@ -7863,6 +10655,7 @@ class DocView(tk.Frame):
             return
         found = self.annot_at(i, cx, cy)
         menu = PopupMenu(self)
+        self.field_items(menu, i, self.to_pdf(i, cx, cy))
         if found is not None:
             xref, kind, _rect = found
             self.select((i, xref))
@@ -7894,11 +10687,34 @@ class DocView(tk.Frame):
         return (("nw", x0 - 2, y0 - 2), ("ne", x1 + 2, y0 - 2), ("w", x0 - 2, m), ("e", x1 + 2, m),
                 ("sw", x0 - 2, y1 + 2), ("se", x1 + 2, y1 + 2))
 
+    def point_on_canvas(self, i, pt):
+        x0, y0, _x1, _y1 = self.to_canvas(i, pymupdf.Rect(pt, pt))
+        return x0, y0
+
+    def outline_on_canvas(self, i, obj):
+        """What's picked up (or under the mouse): its four corners on the canvas, as shown."""
+        return [self.point_on_canvas(i, q) for q in outline_of(obj)]
+
+    def rotate_spot(self, i, obj):
+        """Where the rotate handle is, over what's picked up (as Word's): (handle x, y, the
+        middle of its top side x, y, its middle x, y) on the canvas."""
+        pts = self.outline_on_canvas(i, obj)
+        mx, my = sum(q[0] for q in pts) / 4, sum(q[1] for q in pts) / 4
+        tx, ty = (pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2
+        dx, dy = tx - mx, ty - my
+        n = math.hypot(dx, dy) or 1
+        return tx + dx / n * 22, ty + dy / n * 22, tx, ty, mx, my
+
     def handle_at(self, cx, cy):
-        """Which handle of what's picked up is at (cx, cy): a picture's corner, 0 to 3; a
-        line's left end 4, its right end 5 - or None."""
+        """Which handle of what's picked up is at (cx, cy): the rotate handle "rot"; a
+        picture's corner, 0 to 3; a line's left end 4, its right end 5 - or None."""
         sel = self.edit_sel
         if not sel or sel[0] >= len(self.rects) or self.editor:
+            return None
+        hx, hy = self.rotate_spot(*sel)[:2]
+        if abs(cx - hx) <= ROTATE_ICON // 2 and abs(cy - hy) <= ROTATE_ICON // 2:  # (its picture)
+            return "rot"
+        if sel[1].get("turn"):  # (turned text: turned, moved and retyped - not stretched)
             return None
         box = self.to_canvas(sel[0], sel[1].get("box") or sel[1]["rect"])
         if sel[1].get("frame"):
@@ -7932,7 +10748,13 @@ class DocView(tk.Frame):
     def edit_line(self, i, obj):
         """Retype a line of the PDF's text in a box over it, each letter in its own font,
         size, colour and marks (the line itself is hidden meanwhile). Selected letters can be
-        given another look with the third toolbar; with none selected it's the whole line."""
+        given another look with the third toolbar; with none selected it's the whole line.
+        Turned text is shown straight while it's typed in, and turned back after."""
+        if obj.get("native"):  # (the PDF's own turned text: Master PDF's piece first)
+            obj = self.app.adopt_turned(i, obj)
+            if obj is None:
+                return
+            self.select_object((i, obj))
         span = main_span(obj)
         self.app.wait_fonts()
         _path, family, bold, italic = find_font(span["font"], span["flags"])
@@ -7944,6 +10766,11 @@ class DocView(tk.Frame):
                          commit=lambda new: self.app.replace_runs(
                              i, obj, new, ed.get("align"), ed.get("dir")))
         ed = self.editor
+        if obj.get("turn") and obj.get("oid") is not None:  # (turned: shown straight while
+            self.app._straight = (i, obj["oid"])  # it's typed in - see close_editor)
+            with PDF_LOCK:
+                straighten(self.app.doc[i], obj["oid"])
+            self.invalidate([i])
         box = ed["box"]
         box.config(exportselection=False)  # (the font list taking the keyboard keeps it)
         ed.update(kind="line", rich=True, styles={}, default=runs[0][1] if runs else None,
@@ -7959,6 +10786,14 @@ class DocView(tk.Frame):
             ed["frame"], ed["wrap"] = True, round(x1 - x0) + 6
         for text, st in runs:
             box.insert("end", text, self.style_tag(st))
+        if obj.get("frame"):  # (typed in place: the box right over the text, looking like it)
+            self.fit_editor_to_frame(i, obj, ed, x0)
+            ed["frame_align"] = self.app.line_alignment(i, obj)
+            box.bind("<KeyPress>", lambda e: self.unjustify_box(ed) if (  # (typing: plain,
+                e.char and (e.char.isprintable() or ord(e.char[0]) in (13, 9, 8, 127, 22, 24))
+                or e.keysym in ("BackSpace", "Delete", "Return", "Tab")) else None, add="+")
+            box.bind("<KeyRelease>", lambda e: self.justify_box_soon(ed), add="+")  # justified after)
+            self.after(50, lambda: self.justify_box_soon(ed))
         ed["was"] = self.editor_runs(ed)
         box.edit_reset()
         box.mark_set("insert", "end")
@@ -8005,6 +10840,7 @@ class DocView(tk.Frame):
 
     def retag_typed(self, ed):
         """Letters typed without a look take the one of the letter before them."""
+        self.unjustify_box(ed)
         box = ed["box"]
         n = len(box.get("1.0", "end-1c"))
         last = ed["default"]
@@ -8018,6 +10854,7 @@ class DocView(tk.Frame):
 
     def editor_runs(self, ed):
         """The box's text as pieces in one look each: [(text, look)] (one line)."""
+        self.unjustify_box(ed)
         box = ed["box"]
         text = box.get("1.0", "end-1c")
         runs, last = [], ed["default"]
@@ -8043,6 +10880,8 @@ class DocView(tk.Frame):
         """The selected letters (none selected: all of them) given a new look: change(look)
         gives each one's new look. The selection stays."""
         ed = self.editor
+        self.unjustify_box(ed)
+        self.after_idle(lambda: self.justify_box_soon(ed))
         box = ed["box"]
         sel = box.tag_ranges("sel")
         a, b = (str(sel[0]), str(sel[1])) if sel else ("1.0", "end-1c")
@@ -8059,19 +10898,44 @@ class DocView(tk.Frame):
         ed["grow"]()  # (its size follows the text)
         box.focus_set()
 
+    def field_items(self, menu, i, pt):
+        """A form field under the right-click (a signing app's "SIGN here" box...): an item to
+        delete it from the file - else nothing (the field is left as it is)."""
+        with PDF_LOCK:
+            try:
+                fields = [(w.xref, w.field_type_string) for w in self.app.doc[i].widgets()
+                          if pymupdf.Rect(w.rect).contains(pt)]
+            except Exception:
+                fields = []
+        for xref, kind in fields[:1]:
+            label = "Delete signature field" if kind == "Signature" else "Delete form field"
+            menu.add_command(label=label, command=lambda x=xref: self.app.delete_field(i, x))
+            menu.add_separator()
+
     def edit_menu(self, i, cx, cy, x, y):
         """Right-click with the Edit tool."""
         obj = self.app.object_at(i, self.to_pdf(i, cx, cy))
         menu = PopupMenu(self)
+        self.field_items(menu, i, self.to_pdf(i, cx, cy))
         if obj:
             self.select_object((i, obj))
             if obj["kind"] == "text":
                 menu.add_command(label="Edit text", command=lambda: self.edit_line(i, obj))
             else:
+                if obj.get("paths"):  # (letters drawn as shapes)
+                    menu.add_command(label="Convert to text",
+                                     command=lambda: self.app.convert_to_text(i, obj))
+                    menu.add_separator()
                 menu.add_command(label="Replace picture...",
                                  command=lambda: self.app.replace_picture(i, obj))
                 menu.add_command(label="Save picture as...",
-                                 command=lambda: self.app.save_picture(obj))
+                                 command=lambda: self.app.save_picture(obj, i))
+                if not obj.get("paths"):
+                    menu.add_separator()
+                    menu.add_command(label="Bring to Front",
+                                     command=lambda: self.app.layer_picture(i, obj, True))
+                    menu.add_command(label="Send to Back",
+                                     command=lambda: self.app.layer_picture(i, obj, False))
             menu.add_separator()
             menu.add_command(label="Copy", command=lambda: self.app.copy_object((i, obj)))
             if getattr(self.app, "_copied", None):
@@ -8089,6 +10953,95 @@ class DocView(tk.Frame):
         menu.tk_popup(x, y)
 
     # ---- typing a text annotation (or retyping the PDF's text), right on the page ----
+    # ---- justified text, in the typing box (Tk can't justify: done by hand) ----
+    def box_justified(self, ed):
+        return ed.get("frame") and (ed.get("align") or ed.get("frame_align")) == "justify"
+
+    def unjustify_box(self, ed):
+        """The spacers that justify the box's lines taken out (before its text is read, or
+        changed: they'd count as letters)."""
+        if not ed or not ed.get("spacers"):
+            return
+        box = ed["box"]
+        for _kind, _name, index in reversed(box.dump("1.0", "end", image=True)):
+            box.delete(index)
+        ed["spacers"] = False
+
+    def justify_box_soon(self, ed):
+        job = ed.get("justify_job")
+        if job:
+            self.after_cancel(job)
+        ed["justify_job"] = self.after(120, lambda: self.justify_box(ed))
+
+    def justify_box(self, ed):
+        """The box's lines justified, as the page will have them: each line but a paragraph's
+        last as wide as the box - invisible spacers, 1 px high, after its spaces."""
+        ed["justify_job"] = None
+        if self.editor is not ed:
+            return
+        self.unjustify_box(ed)
+        if not self.box_justified(ed):
+            return
+        box = ed["box"]
+        box.update_idletasks()
+        width = box.winfo_width() - 2 * int(box.cget("padx")) - 2 * int(box.cget("bd")) - 1
+        if width < 20:
+            return
+        pics = ed.setdefault("spacer_pics", {})
+        n = 0
+        while True:
+            start = box.index(f"1.0 + {n} display lines")
+            if n and box.compare(start, "==", box.index(f"1.0 + {n - 1} display lines")):
+                break
+            end = box.index(f"{start} display lineend")
+            n += 1
+            if box.compare(end, "==", f"{start} lineend"):  # (a paragraph's last line)
+                if box.compare(end, ">=", "end-1c"):
+                    break
+                continue
+            text = box.get(start, end)
+            spaces = [k for k, ch in enumerate(text.rstrip()) if ch == " "]
+            info = box.dlineinfo(start)
+            if not spaces or not info:
+                continue
+            extra = width - info[0] - info[2] + 1  # (the room left at the line's end)
+            if extra <= 0 or extra > 0.6 * width:
+                continue
+            per = extra / len(spaces)
+            for k in reversed(range(len(spaces))):  # (from the end: the places before stay put)
+                w = int(per * (k + 1)) - int(per * k)
+                if w <= 0:
+                    continue
+                if w not in pics:
+                    pics[w] = tk.PhotoImage(master=box, width=w, height=1)
+                box.image_create(f"{start} + {spaces[k] + 1} chars", image=pics[w])
+            ed["spacers"] = True
+
+    def fit_editor_to_frame(self, i, obj, ed, x0):
+        """The typing box made to look like the frame it retypes, where it is: no border, its
+        first line on the frame's first baseline, its lines as far apart as the frame's (and
+        its paragraphs' gaps and first-line indents the frame's) - so the text is edited in
+        place, not in a box of its own."""
+        box = ed["box"]
+        base, leading, gaps, indents = frame_geometry(obj)
+        f = font_of(box.cget("font"), box)
+        line_px = f.metrics("linespace")
+        extra = max(0, round(leading * self.scale * max(1.0, main_span(obj)["size"] / base)
+                             - line_px))
+        box.config(bd=0, relief="flat", padx=0, pady=0, spacing1=0, spacing2=extra,
+                   spacing3=extra)
+        for n in range(int(box.index("end-1c").split(".")[0])):  # (each paragraph: its gap
+            tag = f"para{n}"  # after it, its first line's indent)
+            gap = gaps[n] if n < len(gaps) else 0
+            box.tag_configure(tag, spacing3=extra + max(0, round((gap - leading) * self.scale)),
+                              lmargin1=round((indents[n] if n < len(indents) else 0) * self.scale))
+            box.tag_add(tag, f"{n + 1}.0", f"{n + 1}.end+1c")
+            box.tag_lower(tag)
+        first = obj["lines"][0]["spans"][0]["origin"]
+        bx, by = self.to_canvas(i, pymupdf.Rect(first[0], first[1], first[0], first[1]))[:2]
+        self.canvas.coords(ed["item"], x0, by - f.metrics("ascent"))  # (first baseline: on it)
+        ed["wrap"] = max(20, ed.get("wrap", 0) - 4)
+
     def open_editor(self, i, cx, cy, text="", size=None, color=None, replace=None,
                     family="Arial", bold=False, italic=False, commit=None):
         """A text box on the page at (cx, cy), in the text's size and colour; it grows as you
@@ -8119,8 +11072,9 @@ class DocView(tk.Frame):
             if ed and ed.get("wrap"):  # (a frame's box: as wide as the frame, as tall as its
                 self.canvas.itemconfigure(item, width=ed["wrap"])  # lines wrap to)
                 box.update_idletasks()
-                tall = box.count("1.0", "end", "ypixels")
-                self.canvas.itemconfigure(item, height=(tall[0] if tall else 20) + 6)
+                tall = box.count("1.0", "end", "update", "ypixels")  # (every line laid out)
+                tall = tall[0] if isinstance(tall, tuple) else tall
+                self.canvas.itemconfigure(item, height=(tall or 20) + 6)
                 box.yview_moveto(0)
                 return
             lines = box.get("1.0", "end-1c").split("\n")
@@ -8154,8 +11108,15 @@ class DocView(tk.Frame):
 
     def close_editor(self, commit=True):
         ed, self.editor = self.editor, None
+        straight, self.app._straight = getattr(self.app, "_straight", None), None
+        if straight and self.app.doc is not None:  # (turned text typed in: turned back)
+            with PDF_LOCK:
+                if straight[0] < self.app.doc.page_count:
+                    settle(self.app.doc[straight[0]])
+            self.invalidate([straight[0]])
         if not ed:
             return
+        self.unjustify_box(ed)
         text = ed["box"].get("1.0", "end-1c").rstrip()
         runs = self.editor_runs(ed) if ed.get("rich") else None
         self.canvas.delete(ed["item"])
@@ -9882,7 +12843,9 @@ class App(BaseTk):
         self.font_cb = ttk.Combobox(f, textvariable=self.font_var, width=22, state="readonly")
         self.font_cb.pack(side="left", padx=(0, 2))
         self.font_cb.bind("<<ComboboxSelected>>", lambda e: self.font_chosen())
-        self.font_cb.bind("<Button-1>", lambda e: self.fill_fonts(), add="+")
+        self.font_cb.bind("<Button-1>", lambda e: self.open_font_list())  # (its own list)
+        for key in ("<Down>", "<Alt-Down>"):
+            self.font_cb.bind(key, lambda e: self.open_font_list())
         self.size_var = tk.StringVar()
         self.size_cb = ttk.Combobox(f, textvariable=self.size_var, values=TEXT_SIZES, width=4)
         self.size_cb.pack(side="left", padx=(0, 2))
@@ -9952,7 +12915,7 @@ class App(BaseTk):
                lambda: self.view.edit_sel and self.replace_picture(*self.view.edit_sel),
                "Puts another picture in its place.", label="Replace...")
         button(f, "pic_save", self.icons["save"], "Save picture",
-               lambda: self.view.edit_sel and self.save_picture(self.view.edit_sel[1]),
+               lambda: self.view.edit_sel and self.save_picture(self.view.edit_sel[1], self.view.edit_sel[0]),
                "Saves the picture as a file.", label="Save as...")
         button(f, "pic_delete", self.icons["eraser"], "Delete picture", self.delete_object,
                "Takes the picture off the page (Delete).", label="Delete")
@@ -10115,8 +13078,11 @@ class App(BaseTk):
 
     # ---- the keyboard ----
     def bind_keys(self):
-        def typing():  # (the keys keep their usual jobs in text boxes)
-            return isinstance(self.focus_get(), (tk.Entry, tk.Text, ttk.Entry))
+        def typing():  # (the keys keep their usual jobs in text boxes - not in a list that
+            w = self.focus_get()  # can't be typed in, like the font box)
+            if isinstance(w, ttk.Combobox) and w.instate(["readonly"]):
+                return False
+            return isinstance(w, (tk.Entry, tk.Text, ttk.Entry))
 
         shortcuts = {}  # (Windows key code, Shift held) -> (action, in_text): Ctrl + a letter
 
@@ -10166,6 +13132,7 @@ class App(BaseTk):
         key("<Home>", lambda: self.doc and self.set_current(0))
         key("<End>", lambda: self.doc and self.set_current(self.doc.page_count - 1))
         key("<Delete>", self.on_delete_key)
+        key("<KP_Delete>", self.on_delete_key)  # (the number pad's Del)
         for name, dx, dy in (("Left", -1, 0), ("Right", 1, 0), ("Up", 0, -1), ("Down", 0, 1)):
             for shift in (False, True):  # (the arrows: what's picked up moved - Shift: further)
                 self.bind(f"<{'Shift-' if shift else ''}{name}>",
@@ -10599,10 +13566,19 @@ class App(BaseTk):
         tag = obj.get("oid") if obj else None  # (the piece of text changed, if one is)
         meta = meta or self.wrap_state()  # (the pictures' layouts, as they were)
         with PDF_LOCK:
+            turned = [p for p in (pages if pages is not None else range(self.doc.page_count))
+                      if p < self.doc.page_count and has_turns(self.doc[p])]
+            for p in turned:  # (as it really is, for Undo - not straight for typing)
+                settle(self.doc[p])
             before = self.doc.tobytes()
             try:
+                for p in turned:  # (turned text straight - it's changed as it's written)
+                    straighten(self.doc[p])
                 with text_of(tag) as boxes:
                     result = fn()
+                for p in range(self.doc.page_count) if pages is None else pages:
+                    if p < self.doc.page_count and has_turns(self.doc[p]):
+                        settle(self.doc[p], keep=self.straight_piece(p))
             except Exception as e:  # half done: back to how it was
                 self.doc.close()
                 self.doc = self.reopen(before)
@@ -10617,6 +13593,11 @@ class App(BaseTk):
             dialog("Master PDF", f"Couldn't {what}:\n{failed}", sound="error")
             return None
         self.undo_stack.append((before, self.current, what, meta))
+        mark, self._adopted = getattr(self, "_adopted", None), None
+        if mark is not None and mark == len(self.undo_stack) - 1 and len(self.undo_stack) >= 2:
+            new = self.undo_stack.pop()  # (made Master PDF's piece just before: one step)
+            prev = self.undo_stack.pop()
+            self.undo_stack.append((prev[0], prev[1], new[2], prev[3]))
         del self.undo_stack[:-30]  # (the last 30 changes can be taken back)
         self.redo_stack.clear()
         self.dirty = True
@@ -10659,6 +13640,7 @@ class App(BaseTk):
         if not take or not self.doc:
             return
         self.view.close_editor(commit=False)
+        self._adopted = None  # (see adopt_turned)
         data, page, what, *meta = take.pop()
         self._frames = {}  # (the pages as they were: read as they are)
         with PDF_LOCK:
@@ -10930,7 +13912,7 @@ class App(BaseTk):
             align, direction = self.text_style["align"], self.text_style["dir"]
         elif picked:
             align = (ed and ed.get("align")) or self.line_alignment(*picked)
-            direction = (ed and ed.get("dir")) or self.line_direction(picked[1])
+            direction = (ed and ed.get("dir")) or self.line_direction(*picked)
         else:
             align = direction = None
         for kind, _tip in self.ALIGNS:
@@ -11107,6 +14089,7 @@ class App(BaseTk):
             ed = self.editing_rich()
             if ed:
                 ed["align"] = kind
+                self.view.justify_box_soon(ed)  # (justified in the box too - or not any more)
                 self.refresh_props()
                 ed["box"].focus_set()
                 return
@@ -11139,8 +14122,12 @@ class App(BaseTk):
         self.restyle_editor()
         self.refresh_props()
 
-    def line_direction(self, obj):
-        """A line's direction: right-to-left if its first letter is (Arabic...)."""
+    def line_direction(self, i, obj):
+        """A line's direction: as chosen here (while the PDF is open), else right-to-left if
+        its first letter is (Arabic...)."""
+        memo = self._para.get((i, round(obj["spans"][0]["origin"][1])))
+        if memo and memo.get("dir"):
+            return memo["dir"]
         first = next((c for c in obj["text"] if c.isalpha()), "")
         return "rtl" if RTL_LETTERS.match(first) else "ltr"
 
@@ -11242,6 +14229,85 @@ class App(BaseTk):
         if not self.font_cb.cget("values"):
             self.wait_fonts()
             self.font_cb.config(values=font_families())
+
+    def open_font_list(self):
+        """The font box's list: each font shown in itself (see FontList)."""
+        self.fill_fonts()
+        if self.font_cb.instate(["!disabled"]):
+            def chosen(family):
+                self.font_var.set(family)
+                self.font_chosen()
+                if not self.view.editor:  # (the keyboard to the pages: Delete, the arrows...)
+                    self.view.canvas.focus_set()
+            def add():  # (a font added: chosen straight away)
+                families = self.add_fonts()
+                if families:
+                    chosen(families[0])
+            self.font_list = FontList(self.font_cb, list(self.font_cb.cget("values")),
+                                      self.font_var.get(), chosen, add)
+        return "break"  # (not ttk's own list)
+
+    def add_fonts(self, paths=None):
+        """Font files (asked for, if not given) added to the app - copied into its own folder
+        (MY_FONTS), so they stay after the file downloaded is deleted, and after an update;
+        nothing is installed on the computer. Returns the families added (A to Z)."""
+        if paths is None:
+            paths = file_dialog("open_many", self, title="Add a font",
+                                filetypes=[("Fonts", " ".join("*" + e for e in FONT_EXTS)),
+                                           ("All files", "*.*")])
+        if not paths:
+            return []
+        import shutil
+        os.makedirs(MY_FONTS, exist_ok=True)
+        families, added, bad = set(), [], []
+        for src in paths:
+            try:
+                names, family, _sub = sfnt_names(src)
+                if not names or not src.lower().endswith(FONT_EXTS):
+                    raise ValueError
+            except Exception:
+                bad.append(os.path.basename(src))
+                continue
+            families.add(family or names[0])
+            base, ext = os.path.splitext(os.path.basename(src))
+            dest, n = os.path.join(MY_FONTS, base + ext), 2
+            while os.path.exists(dest):
+                with open(dest, "rb") as a, open(src, "rb") as b:
+                    if a.read() == b.read():  # (added before: not twice)
+                        break
+                dest, n = os.path.join(MY_FONTS, f"{base} ({n}){ext}"), n + 1
+            else:
+                shutil.copyfile(src, dest)
+                added.append(dest)
+        show_fonts(added)
+        self.fonts_changed()
+        if bad:
+            dialog("Add a font", "These files aren't fonts Master PDF can use (.ttf, .otf or "
+                   ".ttc):\n\n" + "\n".join(bad), parent=self, sound="error")
+        return sorted(families, key=str.lower)
+
+    def remove_font(self, path):
+        """A font added to the app (My fonts) taken out of it - text already written with it
+        keeps it (a PDF carries its fonts)."""
+        show_fonts([path], on=False)
+        _FONTS["fonts"].pop(path, None)
+        try:
+            os.remove(path)
+        except OSError as e:
+            show_fonts([path])
+            dialog("Remove font", f"The font couldn't be removed:\n{e}", parent=self,
+                   sound="error")
+        self.fonts_changed()
+
+    def fonts_changed(self):
+        """The fonts looked up again (one added or removed): the font list, the PDF's own
+        fonts (looked up again when next needed) and Settings' My fonts list."""
+        self.wait_fonts()
+        scan_fonts()
+        self._fonts_of = None
+        self.font_cb.config(values=())  # (filled again when it's opened)
+        if self.settings_win is not None and getattr(self, "my_fonts_list", None):
+            self.fill_my_fonts()
 
     def font_chosen(self):
         family = self.font_var.get()
@@ -11406,6 +14472,7 @@ class App(BaseTk):
         if i not in self._chars:
             with PDF_LOCK:
                 d = self.doc[i].get_text("rawdict")
+                gap_spaces(d["blocks"])  # (spaces the PDF left out: selected and copied too)
             out = []
             for nb, block in enumerate(d["blocks"]):
                 for nl, line in enumerate(block.get("lines", [])):
@@ -11431,6 +14498,8 @@ class App(BaseTk):
         if best is None or (near is not None and dist > near * near):
             return None
         ch = chars[best]
+        if RTL_LETTERS.match(ch[4]):  # (right to left: its right half is before it)
+            return best if p.x > (ch[0] + ch[2]) / 2 else best + 1
         return best + 1 if p.x > (ch[0] + ch[2]) / 2 else best
 
     def letters(self, i, lo, hi):
@@ -11460,6 +14529,17 @@ class App(BaseTk):
 
     # ---- selected text: copied, marked, or edited (the floating toolbar over it) ----
     def copy_selection(self):
+        ed = self.view.editor
+        if ed:  # (typing in a text box - the focus gone to the toolbar meanwhile: its selection)
+            try:
+                text = ed["box"].get("sel.first", "sel.last")
+            except tk.TclError:
+                text = ""
+            if text:
+                self.clipboard_clear()
+                self.clipboard_append(text)
+                self.say("Copied.")
+            return
         if self.tool == "edit" and self.view.edit_sel and not self.view.editor:
             self.copy_object()
             return
@@ -11475,6 +14555,10 @@ class App(BaseTk):
         text exactly as it looks (its own fonts and places), its words on Windows'
         clipboard too."""
         i, obj = sel or self.view.edit_sel
+        if obj.get("native"):  # (the PDF's own turned text: Master PDF's piece first)
+            obj = self.adopt_turned(i, obj)
+            if obj is None:
+                return
         if obj["kind"] == "text":
             others = [o for o in self.objects_on(i) if o["kind"] == "text" and o is not obj]
             with PDF_LOCK:
@@ -11484,6 +14568,12 @@ class App(BaseTk):
             self.clipboard_clear()
             self.clipboard_append(obj["text"])
             self.say("Copied the text - paste it with Ctrl + V (where the mouse is).")
+        elif obj.get("form"):  # (a drawing: exactly as it's drawn)
+            with PDF_LOCK:
+                snap = drawing_snapshot(self.doc, i, obj)
+            self._copied = {"kind": "image", "snap": snap, "rect": pymupdf.Rect(obj["rect"]),
+                            "page": i, "doc": self.doc}
+            self.say("Copied the drawing - paste it with Ctrl + V (where the mouse is).")
         else:
             with PDF_LOCK:
                 pix = pymupdf.Pixmap(self.doc, obj["xref"])
@@ -11494,7 +14584,8 @@ class App(BaseTk):
                     pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
                 png = pix.tobytes("png")
             self._copied = {"kind": "image", "xref": obj["xref"], "png": png,
-                            "rect": pymupdf.Rect(obj["rect"]), "page": i, "doc": self.doc}
+                            "rect": pymupdf.Rect(obj.get("full") or obj["rect"]), "page": i,
+                            "doc": self.doc}
             self.say("Copied the picture - paste it with Ctrl + V (where the mouse is).")
 
     def paste_target(self):
@@ -11541,7 +14632,10 @@ class App(BaseTk):
         else:
             def do():
                 page = self.doc[i]
-                if c["doc"] is self.doc:  # (the same picture, drawn once more)
+                if c.get("snap"):  # (a drawing: drawn once more, exactly)
+                    data, clip = c["snap"]
+                    draw_snapshot(page, data, clip, dx, dy)
+                elif c["doc"] is self.doc:  # (the same picture, drawn once more)
                     page.insert_image(put, xref=c["xref"])
                 else:
                     page.insert_image(put, stream=c["png"])
@@ -11695,6 +14789,7 @@ class App(BaseTk):
         def do():
             page = self.doc[i]
             annot = page.load_annot(xref)
+            gs = annot_mask(self.doc, annot)  # (rubbed out in places: that goes with it)
             if annot.type[1] == "Ink":  # (a drawing's lines are moved: it's made again)
                 lines = [[(x + d.x, y + d.y) for x, y in line] for line in annot.vertices]
                 stroke, width = annot.colors.get("stroke"), annot.border.get("width", 1)
@@ -11729,6 +14824,10 @@ class App(BaseTk):
                     r = r + (w, w, -w, -w)
                 annot.set_rect(r)
             annot.update()
+            if gs:  # (its appearance was made anew: the mask put back, moved with it)
+                dp = d * page.transformation_matrix - pymupdf.Point(0, 0) * page.transformation_matrix
+                shift_mask(self.doc, gs, dp.x, dp.y)
+                attach_mask(self.doc, annot, gs)
             return annot.xref
         new = self.change("move", do, pages={i})
         if new:
@@ -11847,11 +14946,16 @@ class App(BaseTk):
 
     # ---- the Edit tool: the PDF's own text lines and pictures ----
     def wait_fonts(self):
-        """The installed fonts' list is made at start; wait for it if it isn't ready yet."""
+        """The installed fonts' list is made at start; wait for it if it isn't ready yet -
+        and the fonts the open PDF carries that aren't installed, added to it (once a PDF)."""
         if self._font_scan.is_alive():
             self.say("Looking up the installed fonts...")
             self.update_idletasks()
             self._font_scan.join()
+        if self.doc is not None and getattr(self, "_fonts_of", None) is not self.doc:
+            self._fonts_of = self.doc
+            with PDF_LOCK:
+                adopt_embedded_fonts(self.doc)
 
     def objects_on(self, i):
         """What's on page i that the Edit tool can pick up. Its text is grouped into pieces
@@ -11859,8 +14963,9 @@ class App(BaseTk):
         so later it's always the same piece - text moved over another, or another moved over
         it, never mixes with it (and taking one out never takes the other)."""
         if i not in self._objects:
+            self.wait_fonts()  # (the PDF's own fonts known first: its text's fonts read right)
             if i not in self._owners:  # (the first time: Master PDF's own pieces, by label)
-                with PDF_LOCK:
+                with PDF_LOCK:  # (each read straight, on its own: turned or not)
                     self._owners[i] = tagged_owners(self.doc, i)
                 if self._owners[i]:
                     self._next_oid = max(self._next_oid, max(self._owners[i].values()))
@@ -11869,6 +14974,9 @@ class App(BaseTk):
                     self._owners[i].update(tagged_owners(self.doc, i))
             owners = self._owners[i]
             claims = self._claims.pop(i, [])
+            with PDF_LOCK:
+                page = self.doc[i]
+                turns = page_turns(page) if has_turns(page) else {}
 
             def owner(ch):
                 who = owners.get(char_key(ch))
@@ -11881,10 +14989,22 @@ class App(BaseTk):
                 return who
             with PDF_LOCK:
                 page = self.doc[i]
-                objs = page_objects(page, owner if owners or claims else None)
+                if turns:  # (turned text read straight - as it's written - then turned back)
+                    straighten(page)
+                try:
+                    objs = page_objects(page, owner if owners or claims else None)
+                finally:
+                    if turns:
+                        settle(page, keep=self.straight_piece(i))
             for o in objs:
                 if o["kind"] != "text":
                     continue
+                if o.get("native"):  # (the PDF's own turned text: made Master PDF's piece
+                    self._next_oid += 1  # when it's first changed - see adopt_turned)
+                    o["oid"] = self._next_oid
+                    continue
+                if o.get("oid") in turns:
+                    o["turn"] = turns[o["oid"]]
                 if o.get("oid") is None:
                     self._next_oid += 1
                     o["oid"] = self._next_oid
@@ -11925,21 +15045,35 @@ class App(BaseTk):
         self._frames[i] = keep
         return objs
 
+    def straight_piece(self, i):
+        """The turned piece of text on page i being typed in - shown straight meanwhile - or None."""
+        s = getattr(self, "_straight", None)
+        return s[1] if s and s[0] == i else None
+
     def object_at(self, i, point):
         """The text line (or, if none, the picture) at a point on page i - the smallest one
-        there - or None."""
+        there - or None. (Turned text: found where it's shown.)"""
         p = pymupdf.Point(point)
         hits = [o for o in self.objects_on(i)
-                if ((o.get("box") or o["rect"]) + (-2, -2, 2, 2)).contains(p)]
+                if ((o.get("box") or o["rect"]) + (-2, -2, 2, 2)).contains(turned_point(o, p))
+                and (not o.get("poly") or not is_turned(o) or in_outline(outline_of(o), p))
+                and (not o.get("shape") or in_outline(o["shape"], p))]
         with PDF_LOCK:
             area = abs(self.doc[i].rect)
-        over = [o for o in hits if o["kind"] == "image" and abs(o["rect"]) < 0.5 * area
+            # (a picture there - not where text is drawn over it (that's picked: it can be
+            # retyped), nor where it's see-through)
+            seen = [o for o in hits if o["kind"] == "image"
+                    and not any((r + (-1, -1, 1, 1)).contains(p) for r in o.get("over", ()))
+                    and not see_through_at(self.doc, o, p)]
+        over = [o for o in seen if abs(o["rect"]) < 0.5 * area
                 and self.picture_layout(i, o) != "behind"]  # (a picture over the text - not
-        if over:  # a page's background, or one put behind it: picked, as Word's)
-            return min(over, key=lambda o: abs(o["rect"]))
+        if over:  # a page's background, or one put behind it: picked, as Word's - the one
+            return max(over, key=lambda o: (o.get("z") is not None, o.get("z") or 0,  # on top
+                                            -abs(o["rect"])))
+        hits = [o for o in hits if o["kind"] != "image" or o in seen]
         pool = [o for o in hits if o["kind"] == "text" and (
             not any(h["kind"] == "image" for h in hits)  # (a picture behind: the text only
-            or any((line["rect"] + (-2, -3, 2, 3)).contains(p)  # where its lines are)
+            or any((line["rect"] + (-2, -3, 2, 3)).contains(turned_point(o, p))  # where its lines are)
                    for line in o.get("lines") or [o]))] or             [o for o in hits if o["kind"] == "image"] or hits
         return min(pool, key=lambda o: o["rect"].width * o["rect"].height, default=None)
 
@@ -12120,6 +15254,12 @@ class App(BaseTk):
         """The Edit tool's box put back: the line written piece by piece in each one's look,
         its underline / strike-out / highlight marks put where the pieces now are - lined up
         as it was (align: as chosen, in its paragraph). direction: "rtl" / "ltr" chosen."""
+        obj = self.adopt_turned(i, obj)
+        if obj is None:
+            return
+        if direction:  # (remembered: the direction buttons show it - see line_direction)
+            self.line_ref(i, obj)
+            self._para[(i, round(obj["spans"][0]["origin"][1]))]["dir"] = direction
         if obj.get("frame"):  # (a frame: wrapped across it)
             self.replace_frame(i, obj, runs, align, direction)
             return
@@ -12206,6 +15346,7 @@ class App(BaseTk):
     def selected_looks(self):
         """The looks of the letters selected in the Edit tool's box (or all of them)."""
         ed = self.editing_rich()
+        self.view.unjustify_box(ed)
         box = ed["box"]
         sel = box.tag_ranges("sel")
         a, b = (str(sel[0]), str(sel[1])) if sel else ("1.0", "end-1c")
@@ -12217,6 +15358,9 @@ class App(BaseTk):
                      italic=None, align=None, direction=None):
         """A line retyped (or in another size, colour, font...), lined up as it was - or as
         chosen (align), in its paragraph."""
+        obj = self.adopt_turned(i, obj)
+        if obj is None:
+            return
         if obj.get("frame"):  # (a frame: all of it in the size / colour / font... asked)
             if not text.strip():
                 self.replace_frame(i, obj, [("", None)])
@@ -12255,12 +15399,20 @@ class App(BaseTk):
                                            ax + (r.x1 - ax) * k, r.y1), "text")
 
     def move_object(self, i, obj, d):
+        obj = self.adopt_turned(i, obj)
+        if obj is None:
+            return
         self.wait_fonts()
         moved = obj["rect"] + (d.x, d.y, d.x, d.y)
 
         def do():
             page = self.doc[i]
             if obj["kind"] == "text":
+                if obj.get("turn"):  # (turned: its turn's middle moved with it, so it moves
+                    for line in obj.get("lines") or [obj]:  # just as it's dragged)
+                        move_line(page, line, d)
+                    set_turn(page, obj["oid"], shift=d)
+                    return
                 for line in obj.get("lines") or [obj]:  # (a frame: every line of it)
                     move_line(page, line, d)
             else:
@@ -12271,6 +15423,10 @@ class App(BaseTk):
             return
         self.change("move text" if obj["kind"] == "text" else "move picture", do, pages={i},
                     obj=obj if obj["kind"] == "text" else None)
+        if obj.get("turn"):  # (picked up again: the same piece)
+            got = next((o for o in self.objects_on(i) if o.get("oid") == obj.get("oid")), None)
+            self.view.select_object((i, got) if got else None)
+            return
         rec = self.wrap_record(i, obj) if obj["kind"] == "text" else None
         if rec is not None:  # (moved: it's where it is now)
             self._wrapped[i].remove(rec)
@@ -12278,6 +15434,153 @@ class App(BaseTk):
             self._boxes[(i, obj["oid"])] += (d.x, d.y, d.x, d.y)
             self._objects.pop(i, None)
         self.view.reselect(i, moved, obj["kind"])
+
+    def delete_field(self, i, xref):
+        """A form field (a signature field's "SIGN here" box...) taken out of the file - what
+        was signed or drawn on the page stays. One change, for Undo."""
+        def do():
+            page = self.doc[i]
+            w = next((w for w in page.widgets() if w.xref == xref), None)
+            if w is not None:
+                page.delete_widget(w)
+        self.change("delete form field", do, pages={i})
+
+    def layer_picture(self, i, obj, front):
+        """Bring to Front: the picture drawn over everything on the page (text, drawings,
+        other pictures, white-outs); Send to Back: under everything. One change, for Undo."""
+        if self.doc is None or obj.get("paths"):
+            return
+
+        def do():
+            place_image(self.doc[i], obj, obj["rect"], behind=not front, top=front)
+        self.change("bring to front" if front else "send to back", do, pages={i})
+        self.view.reselect(i, obj["rect"], "image")
+
+    def adopt_turned(self, i, obj):
+        """The PDF's own turned text (see straightened_blocks), about to be changed: made a
+        piece of Master PDF's, turned as it is (see TURN_PROPS) - its letters taken out and
+        written again straight, in their own fonts, sizes and places, inside a turn - looking
+        just as before. Then it's changed like any turned text; Undo takes both back at once.
+        Returns the piece (or obj, if it's not such text)."""
+        if not obj or not obj.get("native"):
+            return obj
+        self.wait_fonts()
+        oid, (angle, pivot), quads = obj["oid"], obj["turn"], obj["native"]
+        lines = obj.get("lines") or [obj]
+
+        def do():
+            page = self.doc[i]
+            remove_quads(page, quads)
+            for line in lines:
+                for s in line["spans"]:
+                    if s["text"].strip():  # (right to left: ending where it ended)
+                        write_text(page, pymupdf.Point(s["origin"]), s["text"], s,
+                                   right=s["bbox"][2] if RTL_LETTERS.search(s["text"]) else None)
+            turn_piece(page, oid, angle, pivot)
+        self.change("change text", do, pages={i}, obj={"oid": oid})
+        self._adopted = len(self.undo_stack)  # (the change that follows: one with this)
+        self._objects.pop(i, None)
+        return next((o for o in self.objects_on(i) if o.get("oid") == oid), None)
+
+    def convert_to_text(self, i, obj):
+        """Letters saved as drawn shapes (a label PowerPoint saved as outlines) made real text:
+        read (see read_drawn_text), written in their place - in their font, size and colour,
+        turned as they were - as text that can be retyped. One change, for Undo."""
+        self.wait_fonts()
+        self.say("Reading the letters...")
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            with PDF_LOCK:
+                found = read_drawn_text(self.doc, i, obj)
+        finally:
+            self.config(cursor="")
+        if not found:
+            dialog("Master PDF", "No letters could be read in this drawing.", sound="error")
+            self.say_tool()
+            return
+        angle, pivot, lines = found
+        path, family = find_family("Arial")
+        font = loaded_font(path) if path else None
+        self._next_oid += 1
+        oid = self._next_oid
+
+        def do():
+            page = self.doc[i]
+            delete_paths(page, obj)
+            for text, box, fill, info in lines:
+                rgb = [round(v * 255) for v in fill[:3]]
+                color = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]
+                if info:  # (read by Master PDF's reader: its own font, size and place)
+                    file, bold, italic, size, (x, base) = info
+                    name = sfnt_names(file)[1] or family or "Arial"
+                    span = {"font": name, "flags": (16 if bold else 0) | (2 if italic else 0),
+                            "size": size, "color": color}
+                    right = None
+                    if RTL_LETTERS.search(text):  # (right to left: ending where it's to end)
+                        right = x + write_text(page, pymupdf.Point(x, base), text, span, bold=bold,
+                                               italic=italic, measure=True)[0]
+                    write_text(page, pymupdf.Point(x, base), text, span, bold=bold, italic=italic,
+                               right=right)
+                    continue
+                width = font.text_length(text, 1) if font else len(text) * 0.5
+                size = max(4.0, box.width / max(width, 1e-6))  # (as wide as the letters were)
+                low = any(c in text for c in "gjpqy,;")  # (letters going below the line)
+                base = box.y1 - (0.21 * size if low else 0.0)
+                span = {"font": family or "Arial", "flags": 0, "size": size, "color": color}
+                write_text(page, pymupdf.Point(box.x0, base), text, span)
+            turn_piece(page, oid, angle, pivot)
+        self.change("convert to text", do, pages={i}, obj={"oid": oid})
+        got = next((o for o in self.objects_on(i) if o.get("oid") == oid), None)
+        self.view.select_object((i, got) if got else None)
+        self.say(f"Converted to text: {' / '.join(x[0] for x in lines)}. Check it reads right - "
+                 f"click it again to retype it.")
+
+    def rotate_object(self, i, obj, angle):
+        """What's picked up with the Edit tool turned angle degrees clockwise (the rotate
+        handle): a picture or a drawing round its middle; text round its middle too - it stays
+        text (see TURN_PROPS): it can be retyped, restyled and moved as before."""
+        if abs(angle) < 0.05 or self.doc is None:
+            return
+        obj = self.adopt_turned(i, obj)
+        if obj is None:
+            return
+        self.wait_fonts()
+        if obj["kind"] == "image":
+            r = obj["rect"]
+            mid = pymupdf.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+
+            def do():
+                turn_image(self.doc[i], obj, angle)
+            self.change("rotate picture", do, pages={i})
+            pics = [o for o in self.objects_on(i) if o["kind"] == "image"]
+            best = min(pics, key=lambda o: abs((o["rect"].x0 + o["rect"].x1) / 2 - mid.x)
+                       + abs((o["rect"].y0 + o["rect"].y1) / 2 - mid.y), default=None)
+            self.view.select_object((i, best) if best else None)
+            return
+        tn = obj.get("turn")
+        box = pymupdf.Rect(obj.get("box") or obj["rect"])
+        pivot = tn[1] if tn else pymupdf.Point((box.x0 + box.x1) / 2, (box.y0 + box.y1) / 2)
+        new = ((tn[0] if tn else 0.0) + angle + 180) % 360 - 180
+        oid = obj.get("oid")
+        if tn:
+            def do():
+                set_turn(self.doc[i], oid, new)
+        else:
+            others = [o for o in self.objects_on(i) if o["kind"] == "text" and o is not obj]
+            with PDF_LOCK:
+                snap = frame_snapshot(self.doc, i, obj, others)
+
+            def do():
+                page = self.doc[i]
+                for line in obj.get("lines") or [obj]:  # (taken out - and drawn again exactly
+                    remove_text(page, line["rect"])  # as it was, as Master PDF's piece)
+                restore_snapshot(page, *snap)
+                turn_piece(page, oid, new, pivot)
+        self.change("rotate text", do, pages={i}, obj=obj)
+        self._objects.pop(i, None)
+        got = next((o for o in self.objects_on(i) if o.get("oid") == oid), None)
+        self.view.select_object((i, got) if got else None)
 
     # ---- a picture's layout (Word's Layout Options): text round it, or behind / in front ----
     def picture_layout(self, i, obj):
@@ -12466,7 +15769,8 @@ class App(BaseTk):
                         else:
                             for line in info["orig"]:
                                 for s in line["spans"]:
-                                    write_text(page, pymupdf.Point(s["origin"]), s["text"], s)
+                                    write_text(page, pymupdf.Point(s["origin"]), s["text"], s,
+                                               right=s["bbox"][2] if RTL_LETTERS.search(s["text"]) else None)
                     if e["obj"].get("oid") is not None and boxes:
                         self._claims.setdefault(i, []).append((e["obj"]["oid"], list(boxes)))
                     for kind, stroke, opacity, rects in info["orig_marks"]:
@@ -12558,8 +15862,19 @@ class App(BaseTk):
         """A picture on page i moved to page j, at rect there (one change, for Undo) - the
         same picture, not a copy; its layout goes with it."""
         def do():
+            if obj.get("form"):  # (a drawing: drawn there exactly, made to fit rect)
+                data, clip = drawing_snapshot(self.doc, i, obj)
+                delete_image(self.doc[i], obj)
+                self.doc[j].show_pdf_page(pymupdf.Rect(rect) + (-1, -1, 1, 1), pymupdf.open("pdf", data), 0, clip=clip)
+                return
             delete_image(self.doc[i], obj)
-            self.doc[j].insert_image(rect, xref=obj["xref"])
+            put = pymupdf.Rect(rect)
+            if obj.get("full"):  # (its shape dropped at rect: the whole picture round it)
+                r, f = obj["rect"], obj["full"]
+                kx, ky = put.width / max(r.width, 1e-6), put.height / max(r.height, 1e-6)
+                put = pymupdf.Rect(put.x0 + (f.x0 - r.x0) * kx, put.y0 + (f.y0 - r.y0) * ky,
+                                   put.x0 + (f.x1 - r.x0) * kx, put.y0 + (f.y1 - r.y0) * ky)
+            self.doc[j].insert_image(put, xref=obj["xref"])
         self.change("move picture", do, pages={i, j})
         entry = self.wrap_entry(i, obj)
         if entry:
@@ -12587,6 +15902,9 @@ class App(BaseTk):
         if not sel:
             return
         i, obj = sel
+        obj = self.adopt_turned(i, obj)
+        if obj is None:
+            return
         self.view.select_object(None)
 
         def do():
@@ -12681,7 +15999,7 @@ class App(BaseTk):
 
         def do():
             page = self.doc[i]
-            if obj.get("uses", 1) > 1:  # the same picture elsewhere too (a signature in every
+            if obj.get("uses", 1) > 1 or obj.get("form"):  # the same picture elsewhere too (a signature in every
                 # row...): just this one is taken off, and the new picture put there
                 delete_image(page, obj)
                 page.insert_image(fit, filename=path)
@@ -12691,9 +16009,14 @@ class App(BaseTk):
         self.change("replace picture", do, pages={i})
         self.view.reselect(i, fit, "image")
 
-    def save_picture(self, obj):
+    def save_picture(self, obj, i=None):
         with PDF_LOCK:
-            info = self.doc.extract_image(obj["xref"])
+            if obj.get("form"):  # (a drawing: saved as a picture of it, sharp)
+                data, clip = drawing_snapshot(self.doc, self.current if i is None else i, obj)
+                pix = pymupdf.open("pdf", data)[0].get_pixmap(dpi=300, clip=clip, alpha=True)
+                info = {"ext": "png", "image": pix.tobytes("png")}
+            else:
+                info = self.doc.extract_image(obj["xref"])
         ext = {"jpx": "jp2"}.get(info.get("ext"), info.get("ext") or "png")
         path = file_dialog("save", self, title="Save picture as",
                                             defaultextension="." + ext, initialdir=self.last_folder(),
@@ -12732,18 +16055,22 @@ class App(BaseTk):
         rub = getattr(self, "_rub", None)
         if not rub or rub["page"] != i:
             return
-        with PDF_LOCK:
-            page = self.doc[i]  # (kept: an annotation can't outlive its page)
-            changed = rub_out(page, path, r)
-        if changed:  # (drawn again when let go: the screen shows it rubbed out meanwhile)
-            rub["changed"] = True
+        if rub.get("path") and path:  # (the whole stroke, rubbed out when let go - the screen
+            path = path[1:] if rub["path"][-1] == path[0] else path  # shows it meanwhile)
+        rub.setdefault("path", []).extend(path)
+        rub["r"] = r
 
     def end_rub(self):
         """The eraser let go: what it rubbed out is one change, for Undo."""
         rub, self._rub = getattr(self, "_rub", None), None
-        if not rub or not rub["changed"]:
+        if not rub or not rub.get("path"):
             return False
         i = rub["page"]
+        with PDF_LOCK:
+            page = self.doc[i]  # (kept: an annotation can't outlive its page)
+            rub["changed"] = rub_out(page, rub["path"], rub["r"])
+        if not rub["changed"]:
+            return False
         self.undo_stack.append((rub["before"], self.current, "erase", self.wrap_state()))
         del self.undo_stack[:-30]
         self.redo_stack.clear()
@@ -13422,6 +16749,13 @@ class App(BaseTk):
         "Show the ? button in the title bar":
             "Shows or hides the ? button in the title bar - the one you just used. Untick it "
             "and it disappears from every window (turn it back on here).",
+        "My fonts": "The fonts you've added to Master PDF (from a .ttf, .otf or .ttc file - "
+                    "a font downloaded from the internet, say). They show in the font list "
+                    "and are used for text, by this app only: nothing is installed.",
+        "Add font...": "Adds font files to Master PDF. They're copied into its own folder, so "
+                       "they stay even if you delete the file you downloaded.",
+        "Remove": "Takes the font picked in the list out of Master PDF. Text already "
+                  "written with it keeps it.",
         "Updates": "Which version of Master PDF you have, and a button to look for a newer one.",
         "Check for updates": "Looks for a newer version now. If there is one, you can install "
                              "it straight away - the app restarts by itself.",
@@ -13440,6 +16774,8 @@ class App(BaseTk):
             return notes["Updates"]
         if widget is self.update_status:
             return notes["update_status"]
+        if widget is getattr(self, "my_fonts_list", None):
+            return notes["My fonts"]
         if isinstance(widget, ttk.Combobox):
             var = str(widget.cget("textvariable"))
             return notes["Appearance" if var == str(self.appearance_var) else "Color palette"]
@@ -13474,6 +16810,30 @@ class App(BaseTk):
         win.bind("<Destroy>", lambda e: e.widget is win and setattr(self, "settings_win", None),
                  add="+")
         show_dialog(win, self, focus=ok)
+
+    def fill_my_fonts(self, keep=False):
+        """Settings' My fonts list, from the fonts folder (keep: only the Remove button set)."""
+        box = self.my_fonts_list
+        if not keep:
+            self._my_fonts = my_fonts()
+            box.delete(0, "end")
+            for _path, name in self._my_fonts:
+                box.insert("end", name)
+            if not self._my_fonts:
+                box.insert("end", "(none yet - add one with Add font...)")
+                box.itemconfig(0, fg="#808080")
+        chosen = bool(self._my_fonts and box.curselection())
+        self.remove_font_btn.config(state="normal" if chosen else "disabled")
+
+    def remove_chosen_font(self):
+        box = self.my_fonts_list
+        if not self._my_fonts or not box.curselection():
+            return
+        path, name = self._my_fonts[box.curselection()[0]]
+        if dialog("Remove font", f"Remove {name} from Master PDF?\n\nText already written "
+                  "with it stays as it is.", buttons=("Remove", "Cancel"),
+                  parent=self.settings_win) == "Remove":
+            self.remove_font(path)
 
     def build_settings(self, parent):
         page = tk.Frame(parent, bg=BG, padx=12, pady=10)
@@ -13556,6 +16916,33 @@ class App(BaseTk):
         EngravedLabel(box, text="Changes here are saved as the Custom theme.",
                       anchor="w").pack(fill="x", pady=(6, 0))
         self.color_dropdown_lists()
+
+        # the fonts added to the app (Add a font... in the font list, or here)
+        box = tk.LabelFrame(page, text=" My fonts ", bg=BG, font=FONT, padx=8, pady=8)
+        box.pack(fill="x", pady=(6, 0))
+        row = tk.Frame(box, bg=BG)
+        row.pack(fill="x")
+        btns = tk.Frame(row, bg=BG)
+        btns.pack(side="right", anchor="n", padx=(6, 0))
+        xp_button(btns, "Add font...", self.add_fonts).pack(fill="x")
+        self.remove_font_btn = xp_button(btns, "Remove", self.remove_chosen_font)
+        self.remove_font_btn.pack(fill="x", pady=(6, 0))
+        bar = ttk.Scrollbar(row, orient="vertical")
+        self.my_fonts_list = tk.Listbox(row, height=4, font=FONT, relief="sunken", bd=2,
+                                        bg=theme_color("#FFFFFF", "box"),
+                                        fg=theme_color("#000000", "text"),
+                                        selectbackground=select_colors()[0],
+                                        selectforeground=select_colors()[1],
+                                        highlightthickness=0, activestyle="none",
+                                        exportselection=False, yscrollcommand=bar.set)
+        bar.config(command=self.my_fonts_list.yview)
+        self.my_fonts_list.pack(side="left", fill="both", expand=True)
+        bar.pack(side="left", fill="y")
+        self.my_fonts_list.bind("<<ListboxSelect>>", lambda e: self.fill_my_fonts(keep=True))
+        self.my_fonts_list.bind("<Delete>", lambda e: self.remove_chosen_font())
+        EngravedLabel(box, text="Fonts you add are kept by Master PDF and used by it only - "
+                      "nothing is installed.", anchor="w").pack(fill="x", pady=(6, 0))
+        self.fill_my_fonts()
 
         # Window and Help side by side, as two equal boxes
         pair = tk.Frame(page, bg=BG)
@@ -13794,6 +17181,11 @@ def self_test_steps(app):
     retyped, a picture added, searched, the dark theme, saved and read back. Returns the
     problems (empty: all good)."""
     problems = []
+    app.wait_fonts()
+    for name, want in (("Calibri", "carlito"), ("Arial", "liberationsans"), ("Times New Roman", "liberationserif")):
+        found = find_font(name, 0)
+        if not found[0] or not (font_key(found[1]).startswith(font_key(name)) or font_key(found[1]).startswith(want)):
+            problems.append(f"no font for {name} (got {found[1]})")
     folder = tempfile.mkdtemp(prefix="masterpdf-selftest-")
     src = os.path.join(folder, "test.pdf")
     doc = pymupdf.open()
@@ -13869,6 +17261,56 @@ def self_test_main(app):
     app.destroy()
 
 
+def show_fonts(files, on=True):
+    """Font files made usable on screen (the font list, the typing box) for this app only -
+    nothing is installed: on Windows added for this process, on macOS for this app (on Linux
+    see use_bundled_fonts). on=False: let go again (before a file is deleted)."""
+    if not files:
+        return
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            gdi = ctypes.windll.gdi32
+            for f in files:
+                (gdi.AddFontResourceExW if on else gdi.RemoveFontResourceExW)(f, 0x10, 0)  # FR_PRIVATE
+        elif sys.platform == "darwin":
+            import ctypes, ctypes.util
+            ct = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreText"))
+            cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+            cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+            cf.CFURLCreateFromFileSystemRepresentation.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                                                   ctypes.c_long, ctypes.c_bool]
+            register = (ct.CTFontManagerRegisterFontsForURL if on
+                        else ct.CTFontManagerUnregisterFontsForURL)
+            register.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+            for f in files:
+                raw = f.encode()
+                url = cf.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), False)
+                if url:
+                    register(ctypes.c_void_p(url), 1, None)  # (kCTFontManagerScopeProcess)
+    except Exception:
+        pass  # (then they're still used for writing - only not shown in the box)
+
+
+def use_bundled_fonts():
+    """The fonts the app comes with, and the ones added in it (My fonts), made usable on
+    screen for this app only (see show_fonts) - on Linux through a fontconfig file of its own,
+    made before Tk starts (a font added later shows there from the next start)."""
+    folders = [f for f in (MY_FONTS, BUNDLED_FONTS) if os.path.isdir(f)]
+    if sys.platform in ("win32", "darwin"):
+        show_fonts([f for d in folders for f in font_files(d) if f.lower().endswith(FONT_EXTS)])
+    elif folders and not os.environ.get("FONTCONFIG_FILE"):
+        try:
+            conf = os.path.join(tempfile.gettempdir(), "masterpdf-fonts.conf")
+            with open(conf, "w", encoding="utf-8") as fh:
+                fh.write('<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "fonts.dtd">'
+                         "<fontconfig><include ignore_missing=\"yes\">/etc/fonts/fonts.conf</include>"
+                         + "".join(f"<dir>{d}</dir>" for d in folders) + "</fontconfig>")
+            os.environ["FONTCONFIG_FILE"] = conf
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     # Programs started from here (the update's installer, and through it the new version)
     # must start fresh: a PyInstaller app hands its children variables saying "your files
@@ -13881,4 +17323,5 @@ if __name__ == "__main__":
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MasterPDF.App")
         except Exception:
             pass
+    use_bundled_fonts()
     App().mainloop()
