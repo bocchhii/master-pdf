@@ -1,24 +1,42 @@
 #!/usr/bin/env bash
 # Builds "Master PDF.app" and puts it in a disk image (.dmg) to drag into Applications.
-# Needs Python 3.10+ with Tk. Run from the project folder on a Mac:
-#   bash packaging/build_mac.sh [name of the .dmg, without .dmg]
+# Needs Qt 6 (macdeployqt on the PATH), MuPDF from packaging/build_mupdf.sh, and the Homebrew libraries the GitHub
+# build installs (.github/workflows/release.yml). Run from the project folder on a Mac:
+#   bash packaging/build_mac.sh [name of the .dmg, without .dmg] [version] [MuPDF's folder]
 set -e
 cd "$(dirname "$0")/.."
 NAME="${1:-MasterPDF-macOS}"
+VERSION="${2:-dev}"
+MUPDF="${3:-$PWD/build-deps/mupdf}"
+QT="$(dirname "$(dirname "$(command -v macdeployqt)")")"
+BREW="$(brew --prefix)"
 
-python3 -m pip install -r requirements.txt pyinstaller
-python3 -m PyInstaller --noconfirm --clean --windowed --name "Master PDF" --icon icon.png \
-    --osx-bundle-identifier com.bocchhii.masterpdf \
-    --add-data "icon.ico:." --add-data "icon.png:." --add-data "fonts:fonts" \
-    --collect-all tkinterdnd2 --collect-all pymupdf --hidden-import PIL._tkinter_finder master_pdf.py
+cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DMASTERPDF_VERSION="$VERSION" \
+    -DCMAKE_PREFIX_PATH="$MUPDF;$QT;$BREW;$(brew --prefix jpeg-turbo)"
+cmake --build build-mac
+APP=build-mac/MasterPDF.app
+
+# the app's icon, from the same picture as Windows'
+ICONSET=build-mac/MasterPDF.iconset
+rm -rf "$ICONSET"
+mkdir -p "$ICONSET"
+for s in 16 32 128 256 512; do
+    sips -z $s $s resources/icons/app.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+    sips -z $((s * 2)) $((s * 2)) resources/icons/app.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/MasterPDF.icns"
+
+# Qt and the other libraries copied into the app, then signed for this Mac (ad hoc: no developer account)
+macdeployqt "$APP" -always-overwrite
+codesign --force --deep --sign - "$APP"
 
 # the disk image: the app, and a shortcut to Applications to drag it onto
-rm -rf build/dmg
-mkdir -p build/dmg installer_output
-cp -R "dist/Master PDF.app" build/dmg/
-ln -s /Applications build/dmg/Applications
+rm -rf build-mac/dmg
+mkdir -p build-mac/dmg installer_output
+cp -R "$APP" "build-mac/dmg/Master PDF.app"
+ln -s /Applications build-mac/dmg/Applications
 for attempt in 1 2 3; do  # (hdiutil now and then finds the disk busy: tried again)
-    hdiutil create -volname "Master PDF" -srcfolder build/dmg -ov -format UDZO "installer_output/$NAME.dmg" && break
+    hdiutil create -volname "Master PDF" -srcfolder build-mac/dmg -ov -format UDZO "installer_output/$NAME.dmg" && break
     sleep 5
 done
 test -f "installer_output/$NAME.dmg"

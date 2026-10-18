@@ -1,44 +1,8 @@
 @echo off
-setlocal
-cd /d "%~dp0"
-echo ===== Master PDF: build =====
-
-python --version >nul 2>&1
-if errorlevel 1 goto :nopython
-
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt pyinstaller
-if errorlevel 1 goto :fail
-
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name MasterPDF --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --add-data "fonts;fonts" --collect-all tkinterdnd2 --collect-all pymupdf master_pdf.py
-if errorlevel 1 goto :fail
+rem Builds Master PDF (C++) with MSYS2's UCRT64 tools: Qt 6, MuPDF, CMake, Ninja.
+rem The program ends up in build\MasterPDF.exe - start it with run.bat.
+set PATH=C:\msys64\ucrt64\bin;%PATH%
+cmake -S "%~dp0." -B "%~dp0build" -G Ninja -DCMAKE_BUILD_TYPE=Release || exit /b 1
+cmake --build "%~dp0build" || exit /b 1
 echo.
-echo Built the app: dist\MasterPDF.exe
-
-set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
-if not exist "%ISCC%" set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
-if not exist "%ISCC%" goto :noinno
-
-"%ISCC%" installer.iss
-if errorlevel 1 goto :fail
-echo.
-echo DONE! Send this file to people: installer_output\MasterPDF-Windows-Setup.exe
-goto :end
-
-:noinno
-echo.
-echo Inno Setup is not installed, so the Setup file was not made.
-echo Install it free from https://jrsoftware.org/isdl.php then run build.bat again.
-goto :end
-
-:nopython
-echo Python was not found. Install it from https://www.python.org/downloads/
-echo and tick "Add python.exe to PATH" during install, then run this again.
-goto :end
-
-:fail
-echo.
-echo Something went wrong - see the messages above.
-
-:end
-pause
+echo Built: %~dp0build\MasterPDF.exe

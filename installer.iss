@@ -1,12 +1,12 @@
-; Inno Setup script - builds MasterPDF-Windows-Setup.exe
+; Inno Setup script - builds MasterPDF-Windows-Setup.exe from dist\ (packaging/build_windows.sh makes it)
 #define MyAppName "Master PDF"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "2.0.0"
 #endif
 #define MyAppExe "MasterPDF.exe"
 
 [Setup]
-; the app's own id: every version has the same one, so installing a new version upgrades
+; the app's own id - the Python version's too: every version has the same one, so installing a new version upgrades
 ; the one that's there instead of adding a second copy
 AppId={{20336EE8-615D-4A02-8FBC-82E3144648B5}
 AppName={#MyAppName}
@@ -17,9 +17,11 @@ DisableProgramGroupPage=yes
 ; installs just for the current user by default, so no admin password is needed
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=installer_output
 OutputBaseFilename=MasterPDF-Windows-Setup
-SetupIconFile=icon.ico
+SetupIconFile=resources\icons\app.ico
 UninstallDisplayIcon={app}\{#MyAppExe}
 Compression=lzma2
 SolidCompression=yes
@@ -35,7 +37,19 @@ SetupLogging=yes
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "dist\{#MyAppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+; an update: what the last version had beside the program (Qt's plugins...) cleared first, so nothing old is left
+Type: filesandordirs; Name: "{app}\fonts"
+Type: filesandordirs; Name: "{app}\tessdata"
+Type: filesandordirs; Name: "{app}\platforms"
+Type: filesandordirs; Name: "{app}\imageformats"
+Type: filesandordirs; Name: "{app}\styles"
+Type: filesandordirs; Name: "{app}\tls"
+Type: filesandordirs; Name: "{app}\networkinformation"
+Type: filesandordirs; Name: "{app}\generic"
+Type: filesandordirs; Name: "{app}\iconengines"
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
@@ -47,17 +61,13 @@ Filename: "{app}\{#MyAppExe}"; Description: "Launch {#MyAppName}"; Flags: nowait
 Filename: "{app}\{#MyAppExe}"; Flags: nowait; Check: WizardSilent
 
 [Code]
-{ The in-app update runs this installer silently, from the app, just before the app closes.
-  The app is a one-file bundle: two processes run MasterPDF.exe (a small launcher, and the
-  app itself), and they need a moment to exit. If the installer goes ahead while they're
-  still running, the file can't be replaced and a silent install quietly fails (and the
-  "close running apps" step can leave the launcher stuck, holding the file). So before any
-  file is touched: wait for Master PDF to close by itself, and end whatever is still running
-  after that - it's a leftover of the app that asked for this update. }
+{ The in-app update runs this installer silently once the app has closed (a small helper waits for it). If the app
+  were still running, its files couldn't be replaced and a silent install would quietly fail. So before any file is
+  touched: wait for Master PDF to close by itself, and end whatever is still running after that - it's a leftover of
+  the app that asked for this update. }
 
-{ True while the installed .exe is still open (the app, or its launcher, running): the very
-  thing that stops it from being replaced. Tested directly - can it be opened exclusively
-  for writing? - rather than by looking for the process by name. }
+{ True while the installed .exe is still open (the app running): the very thing that stops it from being replaced.
+  Tested directly - can it be opened exclusively for writing? - rather than by looking for the process by name. }
 function AppFileInUse(): Boolean;
 var
   FileName: String;
@@ -78,11 +88,8 @@ end;
 function SetEnvironmentVariable(Name, Value: String): Boolean;
   external 'SetEnvironmentVariableW@kernel32.dll stdcall';
 
-{ As soon as the installer starts: the app that asked for this update (a PyInstaller one-file
-  app) passed its "your files are unpacked in my temp folder" variables down to this installer,
-  and they'd reach the new version that [Run] starts too - which would then look for its files
-  in the old app's temp folder (deleted by now) and never start. This tells PyInstaller to
-  ignore them and start fresh (it only affects programs started from this installer). }
+{ An update from the Python version (a PyInstaller one-file app): it passed its "your files are unpacked in my temp
+  folder" variables down to this installer - harmless to this version, cleared all the same. }
 function InitializeSetup(): Boolean;
 begin
   SetEnvironmentVariable('PYINSTALLER_RESET_ENVIRONMENT', '1');

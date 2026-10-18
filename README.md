@@ -1,99 +1,72 @@
 # Master PDF
 
-Ever needed to fix a typo in a PDF, sign a form or put a few files together, and ended up on
-some website you didn't trust with your documents? That's why I made this. Master PDF is a small
-Windows app that edits your PDFs right on your own PC. No accounts, no ads, and your files never
-leave your computer.
+A fast PDF editor with a Windows 98 look, for Windows, macOS and Linux. Version 2 is a C++ rewrite of the
+Python app: built on **Qt 6** (the windows), **MuPDF** (reading and drawing PDFs) and **Tesseract** (reading
+scanned text, Arabic and English).
 
-It looks and feels like Windows 98, because why not.
+## Download
 
-## What it can do
+Get the newest version from [Releases](https://github.com/bocchhii/master-pdf/releases/latest):
 
-- **Edit the text:** click any text in the PDF and retype it, move it, resize it, or change its
-  font, size, colour and style, like in Word. Pictures can be moved, resized and replaced too.
-- **Mark it up:** highlight, underline and strike out text, draw with a pen or marker, add notes,
-  shapes, links and your signature, and rub things out with the eraser.
-- **Pictures and text together:** wrap the text round a picture (square, tight, top and bottom),
-  or put it behind or in front of the text, like Word's Layout Options.
-- **Pages:** add, delete, rotate and drag pages into a new order, add blank pages, or split,
-  extract, compress and export pages as pictures.
-- **Make PDFs:** put PDFs, pictures and Word documents together into one PDF.
-- **Find:** search the whole PDF as you type, with every result listed and highlighted.
+| System | File |
+|---|---|
+| Windows | `MasterPDF-Windows-Setup.exe` |
+| macOS (Apple chips, M1 and newer) | `MasterPDF-Mac-AppleChip-M1-and-newer.dmg` |
+| macOS (Intel) | `MasterPDF-Mac-Intel-chip.dmg` |
+| Linux | `MasterPDF-Linux.AppImage` |
 
-Just open a PDF (or drag one in), make your changes and hit Save. You can also switch between a
-few themes from the Theme menu.
+The app checks for a newer version when it starts (Help > Check for updates, or Settings > Updates). On
+Windows it downloads and installs the update itself; on macOS and Linux it opens the new file in the browser.
 
-<img width="1917" height="1079" alt="masterpdf" src="https://github.com/user-attachments/assets/105dca45-f7bb-4684-afea-f87d375dc057" />
+macOS: the app isn't signed with an Apple developer account, so the first time, right-click it and choose
+**Open**. Linux: make the AppImage executable (`chmod +x MasterPDF-Linux.AppImage`), then run it.
 
-## Install
+## Building
 
-Everything is on the [Releases](../../releases/latest) page.
+### Windows
 
-**Windows**
+1. Install [MSYS2](https://www.msys2.org/), then in its UCRT64 terminal:
+   ```
+   pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja \
+     mingw-w64-ucrt-x86_64-qt6-base mingw-w64-ucrt-x86_64-qt6-svg mingw-w64-ucrt-x86_64-tesseract-ocr \
+     mingw-w64-ucrt-x86_64-leptonica mingw-w64-ucrt-x86_64-potrace mingw-w64-ucrt-x86_64-gumbo-parser
+   pacman -U https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-libmupdf-1.24.3-2-any.pkg.tar.zst
+   ```
+2. Run `build.bat` (the program is built to `build\MasterPDF.exe`), then `run.bat` to start it.
+3. For the installer: `bash packaging/build_windows.sh` puts the app with everything it needs in `dist\`;
+   [Inno Setup](https://jrsoftware.org/isinfo.php) then makes `installer_output\MasterPDF-Windows-Setup.exe`
+   from `installer.iss`.
 
-1. Download **MasterPDF-Windows-Setup.exe**.
-2. Run it. If Windows says **"Windows protected your PC"**, click **More info → Run anyway**.
-   That warning shows up for any app that isn't signed with a paid certificate. It doesn't mean
-   the app is unsafe.
-3. Click through the installer and open Master PDF from the Start menu.
+### macOS and Linux
 
-**macOS**
-
-1. Download **MasterPDF-Mac-AppleChip-M1-and-newer.dmg** if your Mac has an Apple chip (M1, M2,
-   M3, M4...), or **MasterPDF-Mac-Intel-chip.dmg** if it's an older Mac with an Intel chip. (Not
-   sure? Apple menu → About This Mac: it says "Chip: Apple M..." or "Processor: Intel".)
-2. Open it and drag **Master PDF** into **Applications**.
-3. The first time, macOS says it can't check the app. Open **System Settings → Privacy &
-   Security**, scroll down and click **Open Anyway**. Like the Windows warning, it shows up for
-   any app that isn't signed with a paid Apple certificate.
-
-**Linux**
-
-1. Download **MasterPDF-Linux.AppImage**.
-2. Make it runnable (right-click → Properties → Allow executing as program, or
-   `chmod +x MasterPDF-Linux.AppImage`) and double-click it.
-
-The app tells you when there's a new version. On Windows it updates itself; on macOS and Linux it
-downloads the new version for you to install the same way. Checking for updates is the only time
-it goes online.
-
-Turning Word documents into PDFs needs Microsoft Word or LibreOffice on Windows, and
-[LibreOffice](https://www.libreoffice.org/) on macOS and Linux. Everything else works on its own.
-
-## Run it from the code
-
-You'll need [Python](https://www.python.org/downloads/) 3.10 or newer (on Linux, with Tk: the
-`python3-tk` package).
+Qt 6, the libraries in `.github/workflows/release.yml`, then:
 
 ```
-pip install -r requirements.txt
-python master_pdf.py
+bash packaging/build_mupdf.sh build-deps/mupdf      # MuPDF 1.24.3, once
+bash packaging/build_mac.sh                          # macOS: installer_output/*.dmg
+bash packaging/build_linux.sh                        # Linux: installer_output/MasterPDF-Linux.AppImage
 ```
 
-To build it yourself: on Windows install [Inno Setup](https://jrsoftware.org/isdl.php) and run
-`build.bat`; on a Mac run `bash packaging/build_mac.sh`; on Linux run
-`bash packaging/build_linux.sh`. New releases for all three are built automatically on GitHub when
-a version tag (like `v1.2.0`) is pushed.
+### Checking a build
 
-## Thanks to
+`MasterPDF --self-test packaging/selftest.pdf shot.png` opens the PDF, reads its page with the text reader,
+checks that the fonts and languages are found, saves a picture of the window and exits (0 = all went well).
 
-- [PyMuPDF](https://pymupdf.readthedocs.io/) (built on [MuPDF](https://mupdf.com/)) for reading, drawing and writing the PDFs
-- [Pillow](https://python-pillow.org/) for pictures
-- [NumPy](https://numpy.org/) for the sounds
-- [tkinterdnd2](https://github.com/Eliav2/tkinterdnd2) for drag and drop
-- [PyInstaller](https://pyinstaller.org/) and [Inno Setup](https://jrsoftware.org/isinfo.php) for the app and installer
+## Releasing
 
-- The free fonts the app comes with (in `fonts/`), so text keeps its look on any computer:
-  [Carlito](https://fonts.google.com/specimen/Carlito), [Caladea](https://fonts.google.com/specimen/Caladea),
-  [Liberation](https://github.com/liberationfonts/liberation-fonts), [DejaVu](https://dejavu-fonts.github.io/),
-  [Selawik](https://github.com/microsoft/Selawik), [Amiri](https://fonts.google.com/specimen/Amiri),
-  [Tajawal](https://fonts.google.com/specimen/Tajawal), [Comic Neue](https://fonts.google.com/specimen/Comic+Neue),
-  [Courier Prime](https://fonts.google.com/specimen/Courier+Prime), [Lato](https://fonts.google.com/specimen/Lato),
-  [Poppins](https://fonts.google.com/specimen/Poppins), [PT Sans](https://fonts.google.com/specimen/PT+Sans),
-  [PT Serif](https://fonts.google.com/specimen/PT+Serif) and [Ubuntu](https://design.ubuntu.com/font)
+Push a tag such as `v2.0.0`. GitHub Actions builds the four files above on Windows, macOS and Linux, runs the
+self-test on each, and publishes them as a release. The version shown in the app comes from the tag.
 
-Each of these has its own license. PyMuPDF and MuPDF are under the AGPL, which applies if you
-share the built app. The fonts are under the SIL Open Font License, the Ubuntu Font Licence, or
-their own free licenses; each font's license file is next to it in `fonts/`.
+## How it's built
 
-Made by **bocchi the old**. For more tools, check out [my GitHub profile](https://github.com/bocchhii).
+| Folder | What's in it |
+|---|---|
+| `src/core` | The document: MuPDF, safe to draw from several threads; the text reader |
+| `src/view` | The pages on screen: drawn in tiles on background threads |
+| `src/app` | The main window, menus, tools, updates |
+| `src/ui` | The Windows 98 look: title bars, buttons, dialogs, sounds |
+| `packaging` | The build scripts for each system, the installer's pieces |
+
+## Licence
+
+MuPDF is used under the GNU AGPL v3, so this program is AGPL v3 as well.

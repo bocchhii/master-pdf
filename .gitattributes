@@ -1,3 +1,16 @@
-# the build scripts run on macOS and Linux: always with Unix line endings
+* text=auto
+# (scripts run on macOS and Linux: Unix line ends)
 *.sh text eol=lf
 *.desktop text eol=lf
+*.yml text eol=lf
+*.plist.in text eol=lf
+# (Windows' own)
+*.bat text eol=crlf
+*.iss text eol=crlf
+# (not text)
+*.pdf binary
+*.png binary
+*.ico binary
+*.ttf binary
+*.otf binary
+*.traineddata binary
