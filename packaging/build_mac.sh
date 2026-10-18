@@ -13,7 +13,7 @@ BREW="$(brew --prefix)"
 
 cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DMASTERPDF_VERSION="$VERSION" \
     -DCMAKE_PREFIX_PATH="$MUPDF;$QT;$BREW;$(brew --prefix jpeg-turbo)"
-cmake --build build-mac
+cmake --build build-mac -- -k 0  # (every error at once, not just the first)
 APP=build-mac/MasterPDF.app
 
 # the app's icon, from the same picture as Windows'

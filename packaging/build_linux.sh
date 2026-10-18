@@ -12,7 +12,7 @@ QT="$(dirname "$(dirname "$QMAKE")")"
 
 cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DMASTERPDF_VERSION="$VERSION" \
     -DCMAKE_PREFIX_PATH="$MUPDF;$QT"
-cmake --build build-linux
+cmake --build build-linux -- -k 0  # (every error at once, not just the first)
 
 # the AppImage's folder: the app with its fonts and the text reader's languages beside it, its menu entry, its icon
 APPDIR=build-linux/AppDir

@@ -1494,7 +1494,7 @@ void arabicForLatin(std::vector<ocr::Line> &lines, const QImage &grey, const QSt
             else if (c.isLetter() && c.unicode() < 0x250)
                 ++*latin;
     };
-    static const QRegularExpression marks(QStringLiteral("[\x{200E}\x{200F}\x{202A}-\x{202E}\x{2066}-\x{2069}\x{061C}]"));
+    static const QRegularExpression marks(QStringLiteral("[\\x{200E}\\x{200F}\\x{202A}-\\x{202E}\\x{2066}-\\x{2069}\\x{061C}]"));
     ocr::Engine engine;
     bool started = false, tried = false;
     auto engineFor = [&](int) -> ocr::Engine * {

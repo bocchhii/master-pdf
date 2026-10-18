@@ -10,6 +10,9 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # (for VS Code: where Qt and MuPDF are)
 
+if(APPLE)
+    set(CMAKE_FIND_FRAMEWORK LAST)  # (headers from frameworks - Mono's FreeType... - only if nothing else has them)
+endif()
 find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 
 # MuPDF (static) and the libraries it is built against
