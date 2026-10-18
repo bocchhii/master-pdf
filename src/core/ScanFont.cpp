@@ -1368,6 +1368,7 @@ QByteArray Builder::build(const QString &name, bool bold, int *tracedCount, QStr
         // (pieces the font keeps apart - an "i"'s dot and its stem - run together by the scan's blur: parted again,
         // the ink kept to the font's glyph grown as much as the scan's strokes are heavier)
         {
+            const int gw = g.w, gh = g.h;  // (the lambda's own copies: Apple's older compilers can't capture a binding)
             auto pieces = [&](auto inside) {
                 std::vector<char> seenP(size, 0);
                 int count = 0;
@@ -1381,11 +1382,11 @@ QByteArray Builder::build(const QString &name, bool bold, int *tracedCount, QStr
                         const size_t i = todo.front();
                         todo.pop_front();
                         ++n;
-                        const int u = int(i % size_t(g.w)), v = int(i / size_t(g.w));
+                        const int u = int(i % size_t(gw)), v = int(i / size_t(gw));
                         const int nu[4] = {u - 1, u + 1, u, u}, nv[4] = {v, v, v - 1, v + 1};
                         for (int q = 0; q < 4; ++q)
-                            if (nu[q] >= 0 && nv[q] >= 0 && nu[q] < g.w && nv[q] < g.h) {
-                                const size_t j = size_t(nv[q]) * size_t(g.w) + size_t(nu[q]);
+                            if (nu[q] >= 0 && nv[q] >= 0 && nu[q] < gw && nv[q] < gh) {
+                                const size_t j = size_t(nv[q]) * size_t(gw) + size_t(nu[q]);
                                 if (inside(j) && !seenP[j])
                                     seenP[j] = 1, todo.push_back(j);
                             }

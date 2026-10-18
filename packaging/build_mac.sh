@@ -28,6 +28,32 @@ iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/MasterPDF.icns"
 
 # Qt and the other libraries copied into the app, then signed for this Mac (ad hoc: no developer account)
 macdeployqt "$APP" -always-overwrite
+# (macdeployqt misses libraries Homebrew's own ones load by @rpath - libwebp's libsharpyuv...: copied in too, and every
+# library's Homebrew path pointed at its copy in the app - until nothing's left to copy)
+FW="$APP/Contents/Frameworks"
+while true; do
+    added=0
+    for bin in "$APP/Contents/MacOS/MasterPDF" "$FW"/*.dylib; do
+        for dep in $(otool -L "$bin" | tail -n +2 | awk '{print $1}'); do
+            name="$(basename "$dep")"
+            case "$dep" in
+                @rpath/*|@loader_path/*)
+                    src="$(ls "$BREW"/opt/*/lib/"$name" "$BREW"/lib/"$name" 2>/dev/null | head -n 1)" ;;
+                "$BREW"/*|/usr/local/*)
+                    src="$dep"
+                    install_name_tool -change "$dep" "@executable_path/../Frameworks/$name" "$bin" 2>/dev/null || true ;;
+                *) continue ;;
+            esac
+            if [ -n "$src" ] && [ ! -f "$FW/$name" ]; then
+                cp -L "$src" "$FW/$name"
+                chmod u+w "$FW/$name"
+                install_name_tool -id "@executable_path/../Frameworks/$name" "$FW/$name"
+                added=1
+            fi
+        done
+    done
+    [ $added = 1 ] || break
+done
 codesign --force --deep --sign - "$APP"
 
 # the disk image: the app, and a shortcut to Applications to drag it onto
