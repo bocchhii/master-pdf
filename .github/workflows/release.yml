@@ -39,13 +39,13 @@ jobs:
             mingw-w64-ucrt-x86_64-openjpeg2
             mingw-w64-ucrt-x86_64-libjpeg-turbo
             mingw-w64-ucrt-x86_64-gumbo-parser
-      - name: The libraries at the versions the app is made with (MuPDF 1.24.3, Qt 6.9.1, Tesseract 5.5.1...)
+      - name: The compiler and libraries at the versions the app is made with (GCC 15.2, Qt 6.9.1, Tesseract 5.5.1, MuPDF 1.24.3...)
         # (the newest ones read scans differently - the installed app's scans weren't run.bat's: these are packaging/
         # windows-packages.txt's, all at once)
         run: |
-          urls=$(grep -v '^#' packaging/windows-packages.txt | sed 's|^|https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-|; s|$|-any.pkg.tar.zst|')
+          urls=$(tr -d '\r' < packaging/windows-packages.txt | grep -v '^#' | sed 's|^|https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-|; s|$|-any.pkg.tar.zst|')
           pacman -U --noconfirm --overwrite '*' $urls
-          pacman -Q mingw-w64-ucrt-x86_64-qt6-base mingw-w64-ucrt-x86_64-tesseract-ocr mingw-w64-ucrt-x86_64-leptonica mingw-w64-ucrt-x86_64-libmupdf
+          pacman -Q mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-qt6-base mingw-w64-ucrt-x86_64-tesseract-ocr mingw-w64-ucrt-x86_64-leptonica mingw-w64-ucrt-x86_64-libmupdf
       - name: Build the app
         # the version comes from the tag: v2.0.0 -> "2.0.0" (it compares it with the newest release to offer updates);
         # a run started by hand, with no tag, is "dev"
