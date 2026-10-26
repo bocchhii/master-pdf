@@ -176,6 +176,30 @@ QImage scanIcon()
                colors);
 }
 
+QImage convertIcon()
+{
+    // (Scan's sheet - a green arrow out of it: made something else)
+    std::map<char, QColor> colors = kColors;
+    colors['G'] = QColor(0, 168, 0);
+    return art({"..kkkkkkkk......",
+                "..kWWWWWWkk.....",
+                "..kWWWWWWksk....",
+                "..kWWWWWWkssk...",
+                "..kWWWWWWkkkkk..",
+                "..kWWWWWWWWWWk..",
+                "..kWggggggggWk..",
+                "..kWWWWWWWWkkk..",
+                "..kWgggggggkGk..",
+                "..kWggkkkkkkGGk.",
+                "..kWWkGGGGGGGGGk",
+                "..kWgkGGGGGGGGGk",
+                "..kWWWkkkkkkGGk.",
+                "..kWggggggWkGk..",
+                "..kWWWWWWWWkkk..",
+                "..kkkkkkkkkkkk.."},
+               colors);
+}
+
 QImage clearIcon()
 {
     std::map<char, QColor> colors = kColors;
@@ -704,6 +728,10 @@ HomePage::HomePage(QWidget *parent) : QWidget(parent)
     auto *scan = button(scanIcon(), tr("Scan"),
                         tr("Opens a scanned PDF or a picture from the computer and reads its text (OCR) straight away."));
     scan->clicked = [this] { emit scanRequested(); };
+    auto *conv = button(convertIcon(), tr("Convert"),
+                        tr("Saves a PDF from the computer as another kind of file: Word, Excel, PowerPoint, pictures, a web page, "
+                           "Rich Text, PostScript, text or XML."));
+    conv->clicked = [this] { emit convertRequested(); };
     bar->addWidget(new BandPart(false, this));
     starButton_ = button(starIcon(), tr("Star"), tr("Stars the PDFs selected (or takes their star off): starred PDFs are listed under Starred."));
     starButton_->clicked = [this] { starPicked(); };

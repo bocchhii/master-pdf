@@ -13,6 +13,7 @@
     <file>icons/align_right.png</file>
     <file>icons/annots.png</file>
     <file>icons/app.png</file>
+    <file>icons/app16.png</file>
     <file>icons/brush.png</file>
     <file>icons/copy.png</file>
     <file>icons/dir_ltr.png</file>
@@ -82,5 +83,8 @@
     <file>icons/rotate_cw.png</file>
     <file>icons/arrange.png</file>
     <file>icons/scan.png</file>
+    <file>icons/convert.png</file>
+    <file>icons/headerfooter.png</file>
+    <file>icons/gear.png</file>
   </qresource>
 </RCC>

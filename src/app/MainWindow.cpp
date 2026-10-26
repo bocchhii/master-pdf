@@ -242,6 +242,7 @@ MainWindow::MainWindow(QWidget *parent) : ClassicWindow(true, parent)
     connect(home_, &HomePage::openDialogRequested, this, &MainWindow::openDialog);
     connect(home_, &HomePage::createRequested, this, [this] { createFromFiles({}); });
     connect(home_, &HomePage::scanRequested, this, &MainWindow::scanFile);
+    connect(home_, &HomePage::convertRequested, this, [this] { convertDialog(); });
     connect(home_, &HomePage::message, this, [this](const QString &text) {
         if (current_ < 0) {
             say(text);
@@ -395,7 +396,14 @@ MainWindow::MainWindow(QWidget *parent) : ClassicWindow(true, parent)
             deletePages(organize_->selection());
             return;
         }
-        if (view_->pickedId())
+        if (!view_->group().empty() && view_->groupPage() >= 0) {  // (things picked together: all of them)
+            std::vector<int> lines, pictures;
+            for (const PageView::GroupItem &g : view_->group())
+                (g.picture ? pictures : lines).push_back(g.index);
+            const int page = view_->groupPage();
+            view_->clearGroup();
+            groupDeleted(page, lines, pictures);
+        } else if (view_->pickedId())
             deletePicked();
         else if (view_->pickedPicture() >= 0)
             deletePicture();
@@ -531,6 +539,15 @@ void MainWindow::buildToolbars(QVBoxLayout *box)
             &ToolButton::clicked, this, [this] { zoomStep(1); });
     row->addStretch(1);
     {
+        auto *hf = new ToolButton(QStringLiteral("headerfooter"), tr("Header & Footer"),
+                                  tr("Header & Footer: the text at the top and the bottom of the pages - the PDF's own found and "
+                                     "changed, or new put on (page numbers, the date, the file's name), or taken off."),
+                                  false, tr("Header & Footer"), body());
+        buttons_.insert(QStringLiteral("headerfooter"), hf);
+        connect(hf, &ToolButton::clicked, this, [this] { headerFooterDialog(); });
+        row->addWidget(hf);
+    }
+    {
         auto *b = new ToolButton(QStringLiteral("arrange"), tr("Organize pages"),
                                  tr("Organize Pages: every page in a grid - pick them, drag them to a new place, turn, delete, "
                                     "extract, insert or replace them."),
@@ -550,6 +567,13 @@ void MainWindow::buildToolbars(QVBoxLayout *box)
         buttons_.insert(QStringLiteral("scan"), scan);
         connect(scan, &ToolButton::clicked, this, [this] { scanDialog(); });
         row->addWidget(scan);
+        auto *conv = new ToolButton(QStringLiteral("convert"), tr("Convert"),
+                                    tr("Convert: this PDF saved as another kind of file - Word, Excel, PowerPoint, pictures, a web page, "
+                                       "Rich Text, PostScript, text or XML."),
+                                    false, tr("Convert"), body());
+        buttons_.insert(QStringLiteral("convert"), conv);
+        connect(conv, &ToolButton::clicked, this, [this] { convertDialog(); });
+        row->addWidget(conv);
     }
     row->addSpacing(8);
     row->addWidget(label(tr("Find:"), body()));
@@ -694,7 +718,14 @@ void MainWindow::fillEditMenu(QMenu *m)
     m->addAction(tr("Redo"), this, &MainWindow::redo)->setEnabled(has && view_->document()->canRedo());
     m->addSeparator();
     m->addAction(tr("Delete"), this, [this] {
-        if (view_->pickedId())
+        if (!view_->group().empty() && view_->groupPage() >= 0) {  // (things picked together: all of them)
+            std::vector<int> lines, pictures;
+            for (const PageView::GroupItem &g : view_->group())
+                (g.picture ? pictures : lines).push_back(g.index);
+            const int page = view_->groupPage();
+            view_->clearGroup();
+            groupDeleted(page, lines, pictures);
+        } else if (view_->pickedId())
             deletePicked();
         else if (view_->pickedPicture() >= 0)
             deletePicture();
@@ -750,6 +781,8 @@ void MainWindow::fillPagesMenu(QMenu *m)
     m->addAction(tr("Insert pages from file..."), this, [this] { insertFromFile(-1); })->setEnabled(can);
     m->addAction(tr("Insert blank page"), this, [this] { insertBlank(-1); })->setEnabled(can);
     m->addAction(tr("Extract pages..."), this, [this] { extractPages(thumbs_->selection()); })->setEnabled(can);
+    m->addSeparator();
+    m->addAction(tr("Header && Footer..."), this, [this] { headerFooterDialog(); })->setEnabled(can);
     m->addSeparator();
     m->addAction(tr("Delete pages"), this, [this] { deletePages(thumbs_->selection()); })->setEnabled(can);
 }
@@ -1287,7 +1320,9 @@ void MainWindow::updateUi()
     if (readButton_) {
         readButton_->setEnabled(has || readMode_);
         buttons_["organize"]->setEnabled(has && doc->editable());
+        buttons_["headerfooter"]->setEnabled(has && doc->editable());
         buttons_["scan"]->setEnabled(has && doc->editable());
+        buttons_["convert"]->setEnabled(has);
         if (readPage_)
             readPage_->setText(has ? tr("%1 / %2").arg(page + 1).arg(n) : QString());
         if (readMode_ && !has)

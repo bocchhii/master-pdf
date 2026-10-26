@@ -3,7 +3,9 @@
 #include "ui/Classic.h"
 #include "ui/Theme.h"
 
+#include <QAbstractItemView>
 #include <QComboBox>
+#include <QEvent>
 #include <QFrame>
 #include <QMenu>
 #include <QPainter>
@@ -40,6 +42,20 @@ void Win98Style::polish(QWidget *w)
     QProxyStyle::polish(w);
     if (qobject_cast<QMenu *>(w))  // (Windows 98's menus had no shadow)
         w->setWindowFlag(Qt::NoDropShadowWindowHint);
+    if (w->inherits("QComboBoxPrivateContainer"))  // (a drop-down's list: see eventFilter)
+        w->installEventFilter(this);
+}
+
+bool Win98Style::eventFilter(QObject *o, QEvent *e)
+{
+    // a drop-down's list opened: what's chosen lit - not the line the mouse last passed over (the list
+    // closed without choosing kept that one lit, the chosen one not)
+    if (e->type() == QEvent::Show)
+        if (auto *combo = qobject_cast<QComboBox *>(static_cast<QWidget *>(o)->parentWidget()); combo && combo->currentIndex() >= 0) {
+            const QModelIndex at = combo->model()->index(combo->currentIndex(), combo->modelColumn(), combo->rootModelIndex());
+            combo->view()->selectionModel()->setCurrentIndex(at, QItemSelectionModel::ClearAndSelect);
+        }
+    return QProxyStyle::eventFilter(o, e);
 }
 
 void Win98Style::drawTriangle(QPainter *p, QPoint c, Qt::ArrowType dir, const QColor &color) const
@@ -388,6 +404,12 @@ void Win98Style::drawComplexControl(ComplexControl cc, const QStyleOptionComplex
         if (down)
             c += QPoint(1, 1);
         drawTriangle(p, c, Qt::DownArrow, enabled ? theme::ink() : theme::engraved().second);
+        // (focused, not typed in: its choice in the selection's blue, as Windows 98 shows it - the label is drawn in the
+        // selection's text colour then: on the box's white it was gone)
+        if (enabled && (opt->state & State_HasFocus) && !cb->editable) {
+            const QRect field = subControlRect(cc, opt, SC_ComboBoxEditField, w).adjusted(0, 1, 0, -1);
+            p->fillRect(field, opt->palette.brush(QPalette::Highlight));
+        }
         return;
     }
     QProxyStyle::drawComplexControl(cc, opt, p, w);

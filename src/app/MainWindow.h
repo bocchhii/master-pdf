@@ -93,6 +93,7 @@ public:
     void undo();
     void redo();
     void rotatePages(const std::vector<int> &pages, int degrees);
+    void headerFooterDialog();  // (Pages > Header & Footer: found, changed, put on, taken off)
     void deletePages(const std::vector<int> &pages);  // (asks first)
     void movePages(const std::vector<int> &pages, int to);
     void insertBlank(int at);      // -1: after the page you're on
@@ -113,6 +114,9 @@ public:
     void addLayoutItems(class QMenu *menu);  // (the picture picked up's Layout Options)
     void retypeBlock(int page, int index, const QString &text, const Document::LineLook &look);
     void lineMovedBy(int page, int index, QPointF by);  // (the Edit tool's line - or block - dragged)
+    // (things picked together - blocks of text by a line of each, pictures - dragged: all moved, one Undo step)
+    void groupMovedBy(int page, const std::vector<int> &lines, const std::vector<int> &pictures, QPointF by);
+    void groupDeleted(int page, const std::vector<int> &lines, const std::vector<int> &pictures);  // (... Delete: all of them)
     // a block's paragraphs from .. to (not including to) written again - in styled's runs, or as they read
     // with look over them - those after them moved up or down as much as they grew or shrank
     bool retypeSome(int page, const pagetext::TextFrame &frame, int from, int to,
@@ -120,7 +124,7 @@ public:
     void setLayout(const QString &mode);
     // the Sign and Link tools
     void connectSignLink();
-    QImage signatureDialog();
+    QImage signatureDialog(QString *saved = nullptr);
     bool newSignature();
     void placeSignature(int page, QPointF at);
     void followLink(int page, int index);
@@ -207,6 +211,8 @@ private:
     void startScan(const std::vector<int> &pages, const QRectF &area = QRectF());  // (ScanTools.cpp: the scan of the PDF shown, these pages - area: just that part of the page, its points)
     void scanPages();  // (Scan > Pages...: which, typed - "1-3, 6")
     void scanDialog();  // (Scan - ScanTools.cpp: a scanned page's text read, written over it unseen)
+    // (Convert - ConvertTools.cpp: the PDF shown - or path, or one picked (Home) - as Word, Excel, pictures, web pages...)
+    void convertDialog(const QString &path = QString());
     // (the scan read on a thread of its own - the app still used meanwhile, the scanned PDF's tab alone locked;
     // finished here, on the window's thread)
     std::shared_ptr<struct ScanJob> scan_;

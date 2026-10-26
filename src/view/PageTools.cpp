@@ -7,6 +7,7 @@
 #include "core/Document.h"
 #include "ui/Classic.h"
 #include "ui/Icons.h"
+#include "ui/Keyboard.h"
 #include "ui/Theme.h"
 
 #include <memory>
@@ -20,6 +21,7 @@
 #include <QPlainTextEdit>
 #include <QScrollBar>
 #include <QFontDatabase>
+#include <QFontInfo>
 #include <QTimer>
 #include <QTextBlockFormat>
 #include <QTextLayout>
@@ -42,6 +44,10 @@
 #include <cmath>
 
 namespace {
+
+// (a letter's width as the page has it, % of its font's own - set with its look; the editor's drawing makes it so: Qt's
+// font stretch is the font's own width times it - a condensed font asked for at 100 was made a third wider by Qt)
+constexpr int kShownScaleProp = QTextFormat::UserProperty + 21;
 
 // A stroke drawn with the mouse made smooth, like drawing programs do (the Python app's
 // smooth_stroke): points closer than a pixel and a half dropped, the wobble straightened out
@@ -113,9 +119,11 @@ QCursor drawingCursor(const QImage &picture)
 
 void PageView::setTool(const ToolLook &look)
 {
+    flushNudge();
     const bool changed = look.tool != look_.tool || look.variant != look_.variant;
     look_ = look;
     if (changed) {
+        clearGroup();
         closeTextBox(true);
         clearSelection();
         if (look.tool != Tool::Select && look.tool != Tool::Move)
@@ -243,6 +251,7 @@ void PageView::updateCursor(QPoint pos)
 
 void PageView::mousePressEvent(QMouseEvent *e)
 {
+    flushNudge();  // (the arrow keys' move put in first - to what it was for)
     if (!doc_ || e->button() != Qt::LeftButton) {
         QAbstractScrollArea::mousePressEvent(e);
         return;
@@ -414,6 +423,7 @@ void PageView::mouseMoveEvent(QMouseEvent *e)
     case Press::MovePic:
     case Press::SizePic:
     case Press::TurnPic:
+    case Press::MoveGroup:
         moveTo_ = pos;
         viewport()->update();
         return;
@@ -524,6 +534,15 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
                                  : p == Press::SizePic ? QStringLiteral("resize picture") : QStringLiteral("turn picture");
             emit pictureChanged(picPage_, picIndex_, t, what);
         }
+        break;
+    case Press::MoveGroup:
+        if ((moveTo_ - moveFrom_).manhattanLength() >= 3 && groupPage_ >= 0) {
+            std::vector<int> lines, pictures;
+            for (const GroupItem &g : group_)
+                (g.picture ? pictures : lines).push_back(g.index);
+            emit groupMoved(groupPage_, lines, pictures, toPage(groupPage_, moveTo_) - toPage(groupPage_, moveFrom_));
+        }
+        viewport()->update();
         break;
     case Press::Rub: {
         std::vector<QPointF> path = std::move(stroke_);
@@ -831,6 +850,51 @@ void PageView::paintTool(QPainter &p)
         auto screen = [&](int page, const QRectF &r) {
             return QRectF(origin(page) + r.topLeft() * ppp, r.size() * ppp).adjusted(-2, -2, 2, 2);
         };
+        if (!nudge_.isNull()) {  // (the arrow keys moving what's picked: where it's going)
+            QPen ghost(Qt::black, 1, Qt::CustomDashLine);
+            ghost.setCosmetic(true);
+            ghost.setDashPattern({1, 1});
+            p.setPen(ghost);
+            p.setBrush(Qt::NoBrush);
+            const QPointF off = nudge_ * ppp;
+            if (!group_.empty() && groupPage_ >= 0) {
+                for (const GroupItem &g : group_) {
+                    const QRectF b = groupBox(groupPage_, g);
+                    if (!b.isNull())
+                        p.drawRect(screen(groupPage_, b).translated(off));
+                }
+            } else if (lineIndex_ >= 0 && linePage_ >= 0 && lineIndex_ < int(linesOf(linePage_).size())) {
+                p.drawPolygon(pickedTextOutline().translated(off));
+            } else if (picIndex_ >= 0 && picPage_ >= 0 && picIndex_ < int(picturesOf(picPage_).size())) {
+                QPolygonF poly;
+                for (const QPointF &c : picturesOf(picPage_)[size_t(picIndex_)].corners)
+                    poly << origin(picPage_) + c * ppp + off;
+                p.drawPolygon(poly);
+            }
+        }
+        if (groupPage_ >= 0 && !group_.empty()) {  // (things picked together: each one's box - dragged: where they go)
+            QPen solid(sel, 2);
+            solid.setCosmetic(true);
+            p.setPen(solid);
+            p.setBrush(Qt::NoBrush);
+            const bool dragged = press_ == Press::MoveGroup && (moveTo_ - moveFrom_).manhattanLength() >= 3;
+            std::vector<QRectF> shown;
+            for (const GroupItem &g : group_) {
+                const QRectF b = groupBox(groupPage_, g);
+                if (!b.isNull())
+                    shown.push_back(screen(groupPage_, b));
+            }
+            for (const QRectF &r : shown)
+                p.drawRect(r);
+            if (dragged) {
+                QPen ghost(Qt::black, 1, Qt::CustomDashLine);
+                ghost.setCosmetic(true);
+                ghost.setDashPattern({1, 1});
+                p.setPen(ghost);
+                for (const QRectF &r : shown)
+                    p.drawRect(r.translated(moveTo_ - moveFrom_));
+            }
+        }
         if (!showBoxes_ && hoverIndex_ >= 100000 && hoverPage_ >= 0 && !(hoverPage_ == picPage_ && hoverIndex_ - 100000 == picIndex_) &&
             hoverIndex_ - 100000 < int(picturesOf(hoverPage_).size())) {
             QPen dots(sel, 1, Qt::CustomDashLine);
@@ -1063,6 +1127,10 @@ protected:
         if ((e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter) && (e->modifiers() & Qt::ControlModifier)) {
             if (done)
                 done(true);
+            return;
+        }
+        if (const auto ar = keyboard::arabicDigit(e)) {  // (an Arabic keyboard's digits: Arabic's own)
+            QPlainTextEdit::keyPressEvent(ar.get());
             return;
         }
         QPlainTextEdit::keyPressEvent(e);
@@ -1352,7 +1420,7 @@ std::vector<int> PageView::frameLines(int page, int line)
     return f < 0 ? std::vector<int>{line} : fs[size_t(f)].lines;
 }
 
-int PageView::lineAt(int page, QPointF at)
+int PageView::lineAt(int page, QPointF at, bool inBox)
 {
     const std::vector<TextLine> &lines = linesOf(page);
     const double slack = 2 / pixelsPerPoint();
@@ -1368,6 +1436,43 @@ int PageView::lineAt(int page, QPointF at)
         }
         if (l.rect.adjusted(-slack, -slack, slack, slack).contains(p))
             return n;
+    }
+    // (not on a line, but inside a block's box as shown - beside its short lines, between them: the block's nearest
+    // line, as Acrobat picks; a picture there first)
+    if (!inBox)
+        return -1;
+    if (const int pic = pictureAt(page, at); pic >= 0) {  // (not a page's background)
+        const QRectF r = picturesOf(page)[size_t(pic)].rect;
+        const QSizeF s = doc_->pageSize(page);
+        if (r.width() * r.height() < 0.5 * s.width() * s.height())
+            return -1;
+    }
+    const std::vector<pagetext::TextFrame> &fs = framesOf(page);
+    const double pad = 2 / pixelsPerPoint();
+    for (const pagetext::TextFrame &f : fs) {
+        if (f.hidden || f.lines.empty())
+            continue;
+        QPolygonF box;
+        if (std::abs(lines[size_t(f.lines.front())].angle) > 0.01) {
+            box = frameOutline(page, f);
+        } else {
+            const QRectF sized = sizedBox(page, f.rect);
+            const QRectF r = (sized == f.rect && !f.shown.isNull() ? f.shown : sized).adjusted(-pad, -pad, pad, pad);
+            box = QPolygonF({r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()});
+        }
+        if (!box.containsPoint(at, Qt::OddEvenFill))
+            continue;
+        int best = -1;
+        double bestFar = 0;
+        for (int k : f.lines) {
+            const QRectF r = lines[size_t(k)].rect;
+            const double dy = std::max({0.0, r.top() - at.y(), at.y() - r.bottom()});
+            const double dx = std::max({0.0, r.left() - at.x(), at.x() - r.right()});
+            const double far = dy * 1000 + dx;  // (the line beside it, then the nearest across)
+            if (best < 0 || far < bestFar)
+                best = k, bestFar = far;
+        }
+        return best;
     }
     return -1;
 }
@@ -1577,9 +1682,169 @@ void PageView::pickLine(int page, int index)
     emit linePicked(linePage_, lineIndex_);
 }
 
+// ---- several things picked at once ----
+
+QRectF PageView::groupBox(int page, const GroupItem &g)
+{
+    if (g.picture) {
+        const std::vector<Picture> &pics = picturesOf(page);
+        if (g.index < 0 || g.index >= int(pics.size()))
+            return {};
+        QPolygonF corners;
+        for (const QPointF &c : pics[size_t(g.index)].corners)
+            corners << c;
+        return corners.isEmpty() ? pics[size_t(g.index)].rect : corners.boundingRect();
+    }
+    if (g.index < 0 || g.index >= int(linesOf(page).size()))
+        return {};
+    if (frameLines(page, g.index).size() > 1)  // (a block of paragraphs: all of it)
+        return framesOf(page)[size_t(pagetext::frameOf(framesOf(page), g.index))].rect;
+    return linesOf(page)[size_t(g.index)].shown().boundingRect();
+}
+
+int PageView::groupAt(int page, QPointF at)
+{
+    if (page != groupPage_)
+        return -1;
+    for (int k = 0; k < int(group_.size()); ++k)
+        if (groupBox(page, group_[size_t(k)]).adjusted(-2, -2, 2, 2).contains(at))
+            return k;
+    return -1;
+}
+
+void PageView::clearGroup()
+{
+    if (group_.empty() && groupPage_ < 0)
+        return;
+    group_.clear();
+    groupPage_ = -1;
+    viewport()->update();
+    emit groupChanged(0);
+}
+
+bool PageView::groupClick(QPoint pos)
+{
+    QPointF at;
+    const int page = pageAt(pos, &at);
+    if (page < 0)
+        return false;
+    // what's there: a block of text (its first line - the block is one thing), or a picture
+    GroupItem it;
+    int line = lineAt(page, at);
+    if (line >= 0 && overPicture(page, at) >= 0)
+        line = -1;  // (a picture drawn over the text: the picture, as a click picks)
+    if (line >= 0) {
+        it = {false, frameLines(page, line).front()};
+    } else {
+        const int pic = pictureAt(page, at);
+        if (pic < 0)
+            return false;
+        it = {true, pic};
+    }
+    if (groupPage_ != page)
+        group_.clear();
+    if (group_.empty()) {  // (what's picked up already: in it too)
+        if (lineIndex_ >= 0 && linePage_ == page && lineIndex_ < int(linesOf(page).size()))
+            group_.push_back({false, frameLines(page, lineIndex_).front()});
+        else if (picIndex_ >= 0 && picPage_ == page && picIndex_ < int(picturesOf(page).size()))
+            group_.push_back({true, picIndex_});
+    }
+    groupPage_ = page;
+    const auto there = std::find(group_.begin(), group_.end(), it);
+    if (there != group_.end())
+        group_.erase(there);  // (picked already: put down)
+    else
+        group_.push_back(it);
+    pickLine(-1, -1);
+    pickPicture(-1, -1);
+    if (group_.size() == 1) {  // (just one: picked up as a click picks it)
+        const GroupItem one = group_.front();
+        group_.clear();
+        groupPage_ = -1;
+        if (one.picture)
+            pickPicture(page, one.index);
+        else
+            pickLine(page, one.index);
+    } else if (group_.empty()) {
+        groupPage_ = -1;
+    }
+    viewport()->update();
+    emit groupChanged(int(group_.size()));
+    return true;
+}
+
+void PageView::pickGroup(int page, const std::vector<QRectF> &texts, const std::vector<QRectF> &pictures)
+{
+    // (each box: the text or picture nearest it - its middle, its size)
+    auto far = [](const QRectF &a, const QRectF &b) {
+        return std::abs(a.center().x() - b.center().x()) + std::abs(a.center().y() - b.center().y()) +
+               std::abs(a.width() - b.width()) + std::abs(a.height() - b.height());
+    };
+    group_.clear();
+    groupPage_ = page;
+    pickLine(-1, -1);
+    pickPicture(-1, -1);
+    for (const QRectF &r : texts) {
+        GroupItem best;
+        double d = 12;  // (points: further, it's not there)
+        for (int i = 0; i < int(linesOf(page).size()); ++i) {
+            const GroupItem g{false, frameLines(page, i).front()};
+            const double k = far(groupBox(page, g), r);
+            if (k < d && std::find(group_.begin(), group_.end(), g) == group_.end()) {
+                d = k;
+                best = g;
+            }
+        }
+        if (best.index >= 0)
+            group_.push_back(best);
+    }
+    for (const QRectF &r : pictures) {
+        GroupItem best;
+        double d = 12;
+        for (int i = 0; i < int(picturesOf(page).size()); ++i) {
+            const GroupItem g{true, i};
+            const double k = far(groupBox(page, g), r);
+            if (k < d && std::find(group_.begin(), group_.end(), g) == group_.end()) {
+                d = k;
+                best = g;
+            }
+        }
+        if (best.index >= 0)
+            group_.push_back(best);
+    }
+    if (group_.size() < 2) {
+        const std::vector<GroupItem> one = group_;
+        group_.clear();
+        groupPage_ = -1;
+        if (!one.empty()) {
+            if (one.front().picture)
+                pickPicture(page, one.front().index);
+            else
+                pickLine(page, one.front().index);
+        }
+    }
+    viewport()->update();
+    emit groupChanged(int(group_.size()));
+}
+
 void PageView::editPress(QMouseEvent *e)
 {
     const QPoint pos = e->position().toPoint();
+    // Ctrl / Shift + click: one more thing picked with what's picked (or put down again)
+    if (e->modifiers() & (Qt::ControlModifier | Qt::ShiftModifier)) {
+        groupClick(pos);
+        return;
+    }
+    if (!group_.empty()) {  // (a press on one of them: all of them dragged - anywhere else: they're put down)
+        QPointF at;
+        const int page = pageAt(pos, &at);
+        if (page >= 0 && groupAt(page, at) >= 0) {
+            press_ = Press::MoveGroup;
+            moveFrom_ = moveTo_ = pos;
+            return;
+        }
+        clearGroup();
+    }
     const int ph = pictureHandleAt(pos);
     if (ph >= 0) {  // the picture's corner (resize) or its rotate handle (turn)
         picHandle_ = ph;
@@ -1767,9 +2032,10 @@ protected:
             for (QTextBlock b = document()->begin(); b.isValid(); b = b.next())
                 for (QTextBlock::iterator it = b.begin(); !it.atEnd(); ++it) {
                     const QTextCharFormat f = it.fragment().charFormat();
-                    if (f.fontStretch() > 0 && f.fontStretch() != 100) {
+                    const double shownScale = f.hasProperty(kShownScaleProp) ? f.property(kShownScaleProp).toDouble() : 100;
+                    if (std::abs(shownScale - 100) > 0.01) {
                         const QBrush fg = f.foreground();
-                        stretched.push_back({it.fragment().position(), it.fragment().length(), f.fontStretch() / 100.0,
+                        stretched.push_back({it.fragment().position(), it.fragment().length(), shownScale / 100.0,
                                              fg.style() != Qt::NoBrush ? fg.color() : palette().color(QPalette::Text)});
                         QAbstractTextDocumentLayout::Selection none;
                         none.cursor = QTextCursor(document());
@@ -1854,6 +2120,11 @@ protected:
         }
         if ((e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter) && done) {
             done(true);
+            return;
+        }
+        if (const auto ar = keyboard::arabicDigit(e)) {  // (an Arabic keyboard's digits: Arabic's own)
+            QTextEdit::keyPressEvent(ar.get());
+            follow();
             return;
         }
         QTextEdit::keyPressEvent(e);
@@ -1966,11 +2237,42 @@ constexpr int kFitProp = QTextFormat::UserProperty + 6;
 // (bold by its outline - as the page draws it: the outline's width, part of its size)
 constexpr int kOutlineProp = QTextFormat::UserProperty + 9;
 
+// a font's own width, as Qt measures stretch (100: normal) - read from its face's name: "Condensed", "Narrow",
+// "Expanded"... (asked for at another width, Qt makes its letters that wide itself)
+int ownStretch(const QFont &font)
+{
+    const QFontInfo info(font);
+    const QString name = (info.styleName() + QLatin1Char(' ') + info.family()).toLower().remove(QLatin1Char(' ')).remove(QLatin1Char('-'));
+    if (name.contains(QLatin1String("ultracondensed")) || name.contains(QLatin1String("ultracompressed")))
+        return QFont::UltraCondensed;
+    if (name.contains(QLatin1String("extracondensed")) || name.contains(QLatin1String("extracompressed")))
+        return QFont::ExtraCondensed;
+    if (name.contains(QLatin1String("semicondensed")) || name.contains(QLatin1String("seminarrow")))
+        return QFont::SemiCondensed;
+    if (name.contains(QLatin1String("condensed")) || name.contains(QLatin1String("narrow")) || name.contains(QLatin1String("compressed")) ||
+        name.endsWith(QLatin1String("cond")))
+        return QFont::Condensed;
+    if (name.contains(QLatin1String("ultraexpanded")))
+        return QFont::UltraExpanded;
+    if (name.contains(QLatin1String("extraexpanded")))
+        return QFont::ExtraExpanded;
+    if (name.contains(QLatin1String("semiexpanded")))
+        return QFont::SemiExpanded;
+    if (name.contains(QLatin1String("expanded")) || name.contains(QLatin1String("extended")) || name.endsWith(QLatin1String("wide")))
+        return QFont::Expanded;
+    return QFont::Unstretched;
+}
+
 // how the letters' width, spacing and rise show at the view's zoom
 void shownForm(QTextCharFormat &f, double ppp)
 {
     const double scale = f.hasProperty(kScaleProp) ? f.property(kScaleProp).toDouble() : 100;
-    f.setFontStretch(int(std::lround(std::clamp(scale, 1.0, 4000.0))));
+    // (the font at its own width - a condensed one asked for as condensed: not made wider - the letters' width as the page
+    // has them drawn by the editor)
+    f.setProperty(kShownScaleProp, scale);
+    QFont probe = f.font();
+    probe.setStretch(QFont::AnyStretch);
+    f.setFontStretch(int(std::lround(std::clamp(ownStretch(probe) * scale / 100, 1.0, 4000.0))));
     f.setFontLetterSpacingType(QFont::AbsoluteSpacing);
     f.setFontLetterSpacing((f.property(kTrackProp).toDouble() / 1000 * f.property(kSizeProp).toDouble() + f.property(kFitProp).toDouble()) * ppp);
     const int rise = f.property(kRiseProp).toInt();
@@ -2154,8 +2456,21 @@ QString PageView::shownFamily(const QString &pdfFont, const QString &found)
     base = base.section(QLatin1Char('-'), 0, 0).section(QLatin1Char(','), 0, 0);
     auto squash = [](QString x) { return x.remove(QLatin1Char(' ')).toLower(); };
     if ((squash(found).startsWith(squash(base)) || squash(base).startsWith(squash(found))) &&
-        !fonts::isEmbedded(fonts::findFont(pdfFont, 0)))
-        return found;  // (installed: all its letters - the PDF's own isn't known to Qt by its name)
+        !fonts::isEmbedded(fonts::findFont(pdfFont, 0))) {
+        // (installed: all its letters - the PDF's own isn't known to Qt by its name. One the app found but Windows didn't
+        // register - Office's cloud fonts: Aptos... - its files given to Qt first: asked for by name, Qt drew another)
+        static QSet<QString> given;
+        if (!QFontDatabase::hasFamily(found) && !given.contains(found)) {
+            given.insert(found);
+            for (const auto &[bold, italic] : {std::pair{false, false}, std::pair{true, false}, std::pair{false, true}, std::pair{true, true}}) {
+                const fonts::Found f = fonts::findFamily(found, bold, italic);
+                if (!f.path.isEmpty())
+                    QFontDatabase::addApplicationFont(f.path);
+            }
+        }
+        if (QFontDatabase::hasFamily(found))
+            return found;
+    }
     static QHash<QString, QString> made;
     auto it = made.find(pdfFont);
     if (it == made.end()) {
@@ -3339,6 +3654,7 @@ const std::vector<Picture> &PageView::picturesOf(int page)
 int PageView::pictureAt(int page, QPointF at)
 {
     const std::vector<Picture> &pics = picturesOf(page);
+    int clear = -1;  // (the topmost see-through there: picked if no text's under it - anywhere in its box moves it)
     for (int n = int(pics.size()) - 1; n >= 0; --n) {  // (the topmost: drawn last)
         const Picture &p = pics[size_t(n)];
         if (p.vector) {  // (a drawing: by its lines and boxes themselves - a few pixels round them, a thin rule too)
@@ -3351,10 +3667,14 @@ int PageView::pictureAt(int page, QPointF at)
         QPolygonF poly;
         for (const QPointF &c : p.shape.empty() ? p.corners : p.shape)  // (a shape on a background: picked by its shape)
             poly << c;
-        if (poly.containsPoint(at, Qt::OddEvenFill) && !doc_->seeThroughAt(p, at))  // (see-through there: clicks go through)
-            return n;
+        if (poly.containsPoint(at, Qt::OddEvenFill)) {
+            if (!doc_->seeThroughAt(p, at))
+                return n;
+            if (clear < 0)  // (see-through there: clicks go through - to text under it)
+                clear = n;
+        }
     }
-    return -1;
+    return clear >= 0 && lineAt(page, at, false) < 0 ? clear : -1;
 }
 
 int PageView::pictureHandleAt(QPoint pos)

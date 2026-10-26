@@ -86,7 +86,7 @@ public:
     // the line being typed (open): its selected letters - or all of them - restyled; all: whether
     // every one of them has a look
     double pixelsPerPoint() const;  // on screen (logical pixels)
-    int lineAt(int page, QPointF at);  // (the line there, page points: -1 none)
+    int lineAt(int page, QPointF at, bool inBox = true);  // (the line there, page points: -1 none - inBox: inside its block's box)
     bool lineEditorOpen() const { return lineEditor_ != nullptr; }
     void commitEditor() { closeLineEditor(true); }
     QRectF pickedBox() { return pickedTextOutline().boundingRect(); }
@@ -109,6 +109,19 @@ public:
     int pickedPicture() const { return picIndex_; }
     int pickedPicturePage() const { return picPage_; }
     void pickPicture(int page, int index);
+    // several things picked at once (the Edit tool, Ctrl / Shift + click): blocks of text (a line of each) and pictures,
+    // on one page - dragged together
+    struct GroupItem {
+        bool picture = false;
+        int index = -1;
+        bool operator==(const GroupItem &o) const { return picture == o.picture && index == o.index; }
+    };
+    const std::vector<GroupItem> &group() const { return group_; }
+    int groupPage() const { return groupPage_; }
+    void clearGroup();
+    // (picked again after a change: the text and pictures at these places - their boxes, page points)
+    void pickGroup(int page, const std::vector<QRectF> &texts, const std::vector<QRectF> &pictures);
+    QRectF groupBox(int page, const GroupItem &g);  // (one of them: its box, page points)
     // Crop: the picked picture's crop box, its edges and corners dragged; Enter / a click outside
     // puts it in, Esc leaves it as it was
     bool startCrop();
@@ -184,6 +197,10 @@ signals:
     void lineDelete(int page, int index);
     void editorCaretMoved();  // (the caret moved in the text being typed: the text bar shows its look)
     void picturePicked(int page, int index);  // (index -1: put down)
+    void groupChanged(int count);             // (things picked together: how many - 0: none)
+    // (the things picked together dragged: their texts' lines and their pictures, by how far - page points)
+    void groupMoved(int page, const std::vector<int> &lines, const std::vector<int> &pictures, QPointF by);
+    void groupDelete(int page, const std::vector<int> &lines, const std::vector<int> &pictures);
     void pictureChanged(int page, int index, const QTransform &move, const QString &what);
     void pictureDelete(int page, int index);
     void editMenu(int page, QPointF at, QPoint globalPos);  // right-click with the Edit tool
@@ -311,7 +328,7 @@ private:
     ToolLook look_;
     bool readOnly_ = false;
     int pickPage_ = -1, pickId_ = 0;
-    enum class Press { None, Select, Pan, Move, Ink, Box, Rub, MoveLine, ScaleLine, SizeText, TurnLine, MovePic, SizePic, TurnPic } press_ = Press::None;
+    enum class Press { None, Select, Pan, Move, Ink, Box, Rub, MoveLine, ScaleLine, SizeText, TurnLine, MovePic, SizePic, TurnPic, MoveGroup } press_ = Press::None;
     int toolPage_ = -1;              // the page the tool is used on
     std::vector<QPointF> stroke_;    // (page points)
     QPointF boxFrom_, boxTo_;        // (page points)
@@ -393,6 +410,16 @@ private:
     int hoverLinkPage_ = -1, hoverLink_ = -1;
     int picPage_ = -1, picIndex_ = -1;
     int picHandle_ = -1;
+    std::vector<GroupItem> group_;
+    int groupPage_ = -1;
+    bool groupClick(QPoint pos);  // (Ctrl / Shift + click: one more picked - or put down)
+    // the arrow keys: what's picked moved a point at a press (Shift: ten) - shown at once, put in when the keys stop
+    // (one step to Undo, however many presses)
+    QPointF nudge_;
+    class QTimer *nudgeTimer_ = nullptr;
+    bool nudge(QPointF by);  // (false: nothing picked to move)
+    void flushNudge();
+    int groupAt(int page, QPointF at);  // (which of them is there: -1 none)
     int editorPage_ = -1, editorIndex_ = -1;
     QString editorWas_;
     std::function<bool(QWidget *)> editorKeeper_;

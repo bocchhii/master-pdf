@@ -1,5 +1,7 @@
 #include "view/PageView.h"
 
+#include <QTimer>
+
 #include "core/Document.h"
 #include "ui/Classic.h"
 #include "ui/Theme.h"
@@ -75,6 +77,7 @@ QRect PageView::pageRect(int page) const
 
 void PageView::setDocument(std::shared_ptr<Document> doc)
 {
+    clearGroup();
     {
         std::lock_guard guard(wanted_->mutex);
         wanted_->keys.clear();
@@ -114,6 +117,7 @@ void PageView::documentChanged(bool keep)
 {
     if (!doc_)
         return;
+    clearGroup();  // (what's picked together: found again by whoever changed it - the page's things may be others now)
     {
         std::lock_guard guard(wanted_->mutex);
         wanted_->keys.clear();
@@ -864,8 +868,65 @@ void PageView::contextMenuEvent(QContextMenuEvent *e)
     emit selectionMenu(e->globalPos());
 }
 
+bool PageView::nudge(QPointF by)
+{
+    if (lineEditor_ || cropping_ || readOnly_ || !doc_ || !doc_->editable())
+        return false;
+    const bool any = (!group_.empty() && groupPage_ >= 0) || (lineIndex_ >= 0 && linePage_ >= 0) || (picIndex_ >= 0 && picPage_ >= 0) ||
+                     (pickId_ && pickPage_ >= 0);
+    if (!any)
+        return false;
+    if (!nudgeTimer_) {
+        nudgeTimer_ = new QTimer(this);
+        nudgeTimer_->setSingleShot(true);
+        nudgeTimer_->setInterval(450);
+        connect(nudgeTimer_, &QTimer::timeout, this, &PageView::flushNudge);
+    }
+    nudge_ += by;
+    nudgeTimer_->start();
+    viewport()->update();
+    return true;
+}
+
+void PageView::flushNudge()
+{
+    if (nudgeTimer_)
+        nudgeTimer_->stop();
+    const QPointF by = nudge_;
+    nudge_ = QPointF();
+    if (by.isNull())
+        return;
+    viewport()->update();
+    if (!group_.empty() && groupPage_ >= 0) {
+        std::vector<int> lines, pictures;
+        for (const GroupItem &g : group_)
+            (g.picture ? pictures : lines).push_back(g.index);
+        emit groupMoved(groupPage_, lines, pictures, by);
+    } else if (lineIndex_ >= 0 && linePage_ >= 0) {
+        emit lineMoved(linePage_, lineIndex_, by);
+    } else if (picIndex_ >= 0 && picPage_ >= 0) {
+        emit pictureChanged(picPage_, picIndex_, QTransform::fromTranslate(by.x(), by.y()), QStringLiteral("move picture"));
+    } else if (pickId_ && pickPage_ >= 0) {
+        emit annotMoved(pickPage_, pickId_, by);
+    }
+}
+
 void PageView::keyPressEvent(QKeyEvent *e)
 {
+    // the arrow keys: what's picked moved - a point a press, ten with Shift (nothing picked: the page scrolled, as ever)
+    const Qt::KeyboardModifiers mods = e->modifiers() & ~Qt::KeypadModifier;
+    if (doc_ && (mods == Qt::NoModifier || mods == Qt::ShiftModifier) &&
+        (e->key() == Qt::Key_Left || e->key() == Qt::Key_Right || e->key() == Qt::Key_Up || e->key() == Qt::Key_Down)) {
+        const double step = mods == Qt::ShiftModifier ? 10 : 1;
+        const QPointF by = e->key() == Qt::Key_Left    ? QPointF(-step, 0)
+                           : e->key() == Qt::Key_Right ? QPointF(step, 0)
+                           : e->key() == Qt::Key_Up    ? QPointF(0, -step)
+                                                       : QPointF(0, step);
+        if (nudge(by))
+            return;
+    } else {
+        flushNudge();  // (another key: the move put in first)
+    }
     if (doc_ && e->modifiers() == Qt::NoModifier) {
         if (e->key() == Qt::Key_Home) {
             goToPage(0);
@@ -884,7 +945,9 @@ void PageView::keyPressEvent(QKeyEvent *e)
             return;
         }
         if (e->key() == Qt::Key_Escape) {  // (what's picked up put down, the selection let go,
-            if (pickId_)                     // or else the tool put down)
+            if (!group_.empty())             // or else the tool put down)
+                clearGroup();
+            else if (pickId_)
                 pick(-1, 0);
             else if (lineIndex_ >= 0)
                 pickLine(-1, -1);
@@ -894,6 +957,15 @@ void PageView::keyPressEvent(QKeyEvent *e)
                 clearSelection();
             else
                 emit escaped();
+            return;
+        }
+        if (e->key() == Qt::Key_Delete && !group_.empty() && groupPage_ >= 0) {  // (picked together: all of them)
+            std::vector<int> lines, pictures;
+            for (const GroupItem &g : group_)
+                (g.picture ? pictures : lines).push_back(g.index);
+            const int page = groupPage_;
+            clearGroup();
+            emit groupDelete(page, lines, pictures);
             return;
         }
         if (e->key() == Qt::Key_Delete && pickId_) {

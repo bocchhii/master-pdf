@@ -96,6 +96,8 @@ add_executable(MasterPDF WIN32 MACOSX_BUNDLE
     src/app/SettingsDialog.cpp
     src/app/FileTools.cpp
     src/app/SignLink.cpp
+    src/app/HeaderFooter.cpp
+    src/app/ConvertTools.cpp
     src/ui/Theme.h
     src/ui/Theme.cpp
     src/ui/Classic.h
@@ -111,6 +113,8 @@ add_executable(MasterPDF WIN32 MACOSX_BUNDLE
     src/ui/ScrollBox.h
     src/ui/ScrollBox.cpp
     src/ui/Sounds.h
+    src/ui/Keyboard.h
+    src/ui/Keyboard.cpp
     src/ui/Sounds.cpp
     src/ui/TrackBar.h
     src/ui/TrackBar.cpp
@@ -123,6 +127,8 @@ add_executable(MasterPDF WIN32 MACOSX_BUNDLE
     src/app/ImageEditor.cpp
     src/core/Ocr.cpp
     src/core/Ocr.h
+    src/core/Export.h
+    src/core/Export.cpp
     src/app/ImageEditor.h
     src/ui/FlowLayout.h
     resources/resources.qrc

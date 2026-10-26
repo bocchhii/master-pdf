@@ -561,11 +561,15 @@ void MainWindow::showTextBar()
     bar->separator();
     bar->add(QString(), icons::tinted(icons::get(QStringLiteral("mark_highlight")), QColor(255, 214, 0), colors_.value("highlight")),
              tr("Highlight"), {}, [this] { markText(QStringLiteral("Highlight")); });
-    bar->add(QStringLiteral("mark_strike"), {}, tr("Strike out"), {}, [this] { markText(QStringLiteral("StrikeOut")); });
-    bar->add(QStringLiteral("mark_underline"), {}, tr("Underline"), {}, [this] { markText(QStringLiteral("Underline")); });
-    bar->add(QStringLiteral("mark_squiggly"), {}, tr("Squiggly underline"), {}, [this] { markText(QStringLiteral("Squiggly")); });
+    // (their black T: white in the dark themes, as the toolbar's Add text)
+    bar->add(QStringLiteral("mark_strike"), {}, tr("Strike out"), {}, [this] { markText(QStringLiteral("StrikeOut")); })->setWhiten(16);
+    bar->add(QStringLiteral("mark_underline"), {}, tr("Underline"), {}, [this] { markText(QStringLiteral("Underline")); })
+        ->setGreyBlues(true);  // (its blue U: grey, as Edit text's I)
+    bar->add(QStringLiteral("mark_squiggly"), {}, tr("Squiggly underline"), {}, [this] { markText(QStringLiteral("Squiggly")); })
+        ->setWhiten(16);
     bar->separator();
-    bar->add(QStringLiteral("edit"), {}, tr("Edit text"), tr("Edit text"), [this] { notYet(tr("Edit text")); });
+    bar->add(QStringLiteral("edit"), {}, tr("Edit text"), tr("Edit text"), [this] { notYet(tr("Edit text")); })
+        ->setGreyBlues(true);  // (its I grey, as the toolbar's Edit button)
     if (marksOver(page, boxes)) {  // (marked already: the mark can be taken off these letters)
         bar->separator();
         bar->add(QStringLiteral("eraser"), {}, tr("Remove the highlight (or other mark) from the selected letters"),

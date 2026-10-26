@@ -307,8 +307,15 @@ void TitleBar::paintEvent(QPaintEvent *)
     p.fillRect(rect(), g);
     int x = 6;
     if (!icon_.isNull()) {
-        p.setRenderHint(QPainter::SmoothPixmapTransform);
-        p.drawImage(QRectF(x, (H - 16) / 2.0, 16, 16), icon_);
+        if (icon_.width() <= 16 && icon_.height() <= 16) {  // (a picture drawn for 16 pixels: as it is, pixel for pixel - scaled
+                                                           // to 125% it blurred)
+            classic::Px d(p);
+            const QRect box = d.dev(QRectF(x, (H - 16) / 2.0, 16, 16));
+            p.drawImage(QPoint(box.left() + (box.width() - icon_.width()) / 2, box.top() + (box.height() - icon_.height()) / 2), icon_);
+        } else {
+            p.setRenderHint(QPainter::SmoothPixmapTransform);
+            p.drawImage(QRectF(x, (H - 16) / 2.0, 16, 16), icon_);
+        }
         x += 16 + 5;
     }
     p.setFont(theme::font(10, true));  // (bold, as Windows 98's title bars - active or not)

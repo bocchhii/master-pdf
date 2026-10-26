@@ -28,6 +28,7 @@ public:
                       QPalette::ColorRole textRole = QPalette::NoRole) const override;
     void polish(QPalette &pal) override;
     void polish(QWidget *w) override;
+    bool eventFilter(QObject *o, QEvent *e) override;
 
     // a menu's text starts this far in (the menu bar's lists: 8, right-click menus: 22)
     static constexpr const char *kIndent = "classicIndent";

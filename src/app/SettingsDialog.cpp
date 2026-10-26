@@ -90,9 +90,14 @@ QImage MainWindow::appIcon() const
 
 void MainWindow::applyIcon()
 {
-    const QImage icon = appIcon();
-    QApplication::setWindowIcon(QIcon(QPixmap::fromImage(icon)));
-    setTitleIcon(theme::settings().value("no_icon").toBool() ? QImage() : icon);
+    // (the app's own: its 16-pixel picture where it's small - the title bar, Windows' small icons - drawn for that size)
+    const bool own = QImage(customIconPath()).isNull();
+    const QImage icon = appIcon(), small = own ? icons::get(QStringLiteral("app16")) : icon;
+    QIcon both(QPixmap::fromImage(icon));
+    if (own)
+        both.addPixmap(QPixmap::fromImage(small));
+    QApplication::setWindowIcon(both);
+    setTitleIcon(theme::settings().value("no_icon").toBool() ? QImage() : small);
 }
 
 namespace {

@@ -516,8 +516,8 @@ bool Document::setPictureLayout(int page, const Picture &pic, const QString &mod
     const bool behind = mode == QLatin1String("behind"), front = pictureLayout(page, pic) == QLatin1String("behind");
     std::lock_guard guard(docMutex_);
     return onPage(page, "picture layout", [&](pdf_page *pg) {
-        if (behind)  // (behind the text: drawn first, under everything)
-            layerIn(pg, pic, false);
+        if (behind)  // (behind the text: drawn just under it - over the page's background)
+            behindText(pg, pic);
         else if (front && mode == QLatin1String("front"))
             layerIn(pg, pic, true);
         applyFlow(pg, page, plan);

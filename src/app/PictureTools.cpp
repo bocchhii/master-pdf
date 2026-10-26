@@ -162,8 +162,12 @@ void MainWindow::stepPicture(bool forward)
     const int page = view_->pickedPicturePage();
     const Picture p = *pic;
     QString error;
-    pictureChangedDone(doc->stepPicture(page, p, forward, &error), page, p.rect, error);
-    say(forward ? tr("Brought forward: drawn over the next picture.") : tr("Sent backward: drawn under the picture before it."));
+    const bool ok = doc->stepPicture(page, p, forward, &error);
+    pictureChangedDone(ok, page, p.rect, error);
+    if (ok)
+        say(forward ? tr("Brought forward: over the next thing it covers.") : tr("Sent backward: under the next thing it covers."));
+    else if (error.isEmpty())
+        say(forward ? tr("It's in front of everything it covers already.") : tr("It's behind everything it covers already."));
 }
 
 void MainWindow::cropPicture()
@@ -1102,7 +1106,8 @@ void MainWindow::layerPicture(bool front)
     const Picture p = *pic;
     QString error;
     pictureChangedDone(doc->layerPicture(page, p, front, &error), page, p.rect, error);
-    say(front ? tr("Brought to front: drawn over everything on the page.") : tr("Sent to back: drawn under everything on the page."));
+    say(front ? tr("Brought to front: drawn over everything on the page.")
+              : tr("Sent to back: drawn under everything on the page (but its background)."));
 }
 
 void MainWindow::replacePicture()

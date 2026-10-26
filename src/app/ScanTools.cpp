@@ -1403,6 +1403,8 @@ void rereadUnsure(std::vector<ocr::Line> &lines, const QImage &grey, const QStri
         }
         const bool arabicHere = arab + latin >= 4 ? arab > latin : pageArabic;
         for (ocr::Word &w : l.words) {
+            if (scanCancel)
+                throw ScanCancelled();  // (each word read again takes a while: the X answered between them)
             if (w.confidence >= 65 || w.confidence < 0 || w.box.width() < 8 || w.box.height() < 8)
                 continue;
             ocr::Engine *e = engine(arabicHere ? 0 : 1);
@@ -1511,6 +1513,8 @@ void arabicForLatin(std::vector<ocr::Line> &lines, const QImage &grey, const QSt
     if (langs.startsWith(QLatin1String("ara")) && !arabicWords.isEmpty())
         for (ocr::Line &l : lines)
             for (ocr::Word &w : l.words) {
+                if (scanCancel)
+                    throw ScanCancelled();
                 int a = 0, b = 0;
                 script(w.text, &a, &b);
                 // (not a number read as letters - the digits are told by their shapes first: "VEEV/E/Y)" a date)
@@ -3471,7 +3475,7 @@ std::vector<Document::OcrLine> readPage(Document *doc, int page, QString &langs,
 namespace {
 
 // the scan's box: in the window's bottom right while it reads - what it's doing (and which page of how many, at
-// its right), how far (its close button does nothing: like the update's box, it goes when the scan's done)
+// its right), how far. Its X stops the scan (nothing of it kept): it goes once the reading has stopped
 class ScanBox : public ClassicWindow {
 public:
     ScanBox(QWidget *owner, QWidget *corner) : ClassicWindow(false, owner), corner_(corner)
@@ -3522,7 +3526,14 @@ public:
     }
 
 protected:
-    void closeEvent(QCloseEvent *e) override { e->ignore(); }
+    void closeEvent(QCloseEvent *e) override
+    {
+        e->ignore();  // (closed by the scan's end)
+        if (scanCancel)
+            return;
+        scanCancel = true;  // (the reading stops at its next step - the scan's end takes the box away)
+        label_->setText(QObject::tr("Stopping..."));
+    }
 
 private:
     QWidget *corner_;
@@ -3939,7 +3950,7 @@ void MainWindow::scanFinished()
     job->box.reset();
     // (its tab closed meanwhile, or called off: what was read, dropped)
     const auto open = std::find_if(docs_.begin(), docs_.end(), [&](const DocTab &t) { return t.doc == job->doc; });
-    if (job->cancelled || open == docs_.end()) {
+    if (job->cancelled || scanCancel || open == docs_.end()) {  // (stopped with the X as it was finishing: still stopped)
         scanCancel = false;
         say(tr("The scan was called off."));
         return;

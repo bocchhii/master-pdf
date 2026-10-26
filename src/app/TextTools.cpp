@@ -817,6 +817,13 @@ void MainWindow::connectTextTools()
     connect(view_, &PageView::lineMoved, this, [this](int page, int index, QPointF by) {
         lineMovedBy(page, index, by);
     });
+    connect(view_, &PageView::groupMoved, this, &MainWindow::groupMovedBy);
+    connect(view_, &PageView::groupDelete, this, &MainWindow::groupDeleted);
+    connect(view_, &PageView::groupChanged, this, [this](int count) {
+        if (count > 1)
+            say(tr("%1 picked together: drag one of them to move them all. Ctrl or Shift + click picks more - or puts one "
+                   "down; Esc puts them all down.").arg(count));
+    });
     connect(view_, &PageView::textResized, this, [this](int page, int index, double left, double right, double k) {
         // its box resized (as Acrobat's): its sides - the text wrapped in them again; its top /
         // bottom - the text bigger or smaller
@@ -964,6 +971,109 @@ void MainWindow::lineMovedBy(int page, int index, QPointF by)
         const bool ok = doc->moveLine(page, lines[size_t(index)], by, &error);
         lineChanged(ok, page, lines[size_t(index)].rect.translated(by), error);
     }
+}
+
+void MainWindow::groupMovedBy(int page, const std::vector<int> &lineIndexes, const std::vector<int> &picIndexes, QPointF by)
+{
+    auto doc = view_->document();
+    if (!doc)
+        return;
+    const std::vector<TextLine> lines = view_->linesOf(page);
+    const std::vector<Picture> pics = view_->picturesOf(page);
+    // what moves, as it is now - and where each will be (to pick them together again there)
+    std::vector<TextLine> texts;
+    std::vector<QRectF> textsThere, picsThere;
+    for (int i : lineIndexes) {
+        if (i < 0 || i >= int(lines.size()))
+            continue;
+        for (int k : view_->frameLines(page, i))  // (a block of paragraphs: all of it)
+            texts.push_back(lines[size_t(k)]);
+        textsThere.push_back(view_->groupBox(page, {false, i}).translated(by));
+    }
+    std::vector<Picture> moving;
+    for (int i : picIndexes)
+        if (i >= 0 && i < int(pics.size())) {
+            moving.push_back(pics[size_t(i)]);
+            picsThere.push_back(view_->groupBox(page, {true, i}).translated(by));
+        }
+    QString error;
+    bool ok = true;
+    doc->beginChanges("move objects");
+    if (!texts.empty())
+        ok = doc->moveLines(page, texts, by, &error);
+    for (const Picture &was : moving) {
+        if (!ok)
+            break;
+        // (found again: the page's drawing has changed since - the text moved, the pictures before it)
+        const std::vector<Picture> now = doc->pictures(page);
+        const Picture *same = nullptr;
+        double far = 2;  // (points)
+        for (const Picture &p : now) {
+            const double d = std::abs(p.rect.left() - was.rect.left()) + std::abs(p.rect.top() - was.rect.top()) +
+                             std::abs(p.rect.width() - was.rect.width()) + std::abs(p.rect.height() - was.rect.height());
+            if (p.vector == was.vector && p.xref == was.xref && d < far) {
+                far = d;
+                same = &p;
+            }
+        }
+        if (!same) {
+            ok = false;
+            error = tr("A picture wasn't where it was.");
+            break;
+        }
+        ok = doc->transformPicture(page, *same, QTransform::fromTranslate(by.x(), by.y()), "move objects", &error);
+    }
+    doc->endChanges();
+    annotChanged(ok, tr("move them"), error);
+    if (ok) {
+        view_->pickGroup(page, textsThere, picsThere);
+        say(tr("Moved together. Drag one of them to move them again; Esc puts them down."));
+    }
+}
+
+void MainWindow::groupDeleted(int page, const std::vector<int> &lineIndexes, const std::vector<int> &picIndexes)
+{
+    auto doc = view_->document();
+    if (!doc || !doc->editable())
+        return;
+    const std::vector<TextLine> lines = view_->linesOf(page);
+    const std::vector<Picture> pics = view_->picturesOf(page);
+    std::vector<TextLine> texts;
+    for (int i : lineIndexes)
+        if (i >= 0 && i < int(lines.size()))
+            for (int k : view_->frameLines(page, i))  // (a block of paragraphs: all of it)
+                texts.push_back(lines[size_t(k)]);
+    std::vector<Picture> going;
+    for (int i : picIndexes)
+        if (i >= 0 && i < int(pics.size()))
+            going.push_back(pics[size_t(i)]);
+    QString error;
+    bool ok = true;
+    doc->beginChanges("delete objects");
+    if (!texts.empty())
+        ok = doc->deleteLines(page, texts, &error);
+    for (const Picture &was : going) {
+        if (!ok)
+            break;
+        // (found again: the page's drawing has changed since - the text taken out, the pictures before it)
+        const std::vector<Picture> now = doc->pictures(page);
+        const Picture *same = nullptr;
+        double far = 2;  // (points)
+        for (const Picture &p : now) {
+            const double d = std::abs(p.rect.left() - was.rect.left()) + std::abs(p.rect.top() - was.rect.top()) +
+                             std::abs(p.rect.width() - was.rect.width()) + std::abs(p.rect.height() - was.rect.height());
+            if (p.vector == was.vector && p.xref == was.xref && d < far) {
+                far = d;
+                same = &p;
+            }
+        }
+        if (same)
+            ok = doc->deletePicture(page, *same, &error);
+    }
+    doc->endChanges();
+    annotChanged(ok, tr("delete them"), error);
+    if (ok)
+        say(tr("Deleted %1 things. Ctrl+Z puts them back.").arg(lineIndexes.size() + picIndexes.size()));
 }
 
 // Add text: written into the page itself (and marked, if underline / strikethrough are on)

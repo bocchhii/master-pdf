@@ -432,6 +432,8 @@ private:
     std::map<int, std::vector<QPointF>> outlines_;  // (each picture's shape found in its pixels - its own, so kept: turned, clipped, it's the same frame)
     std::vector<Picture> picturesLocked(int page);
     void layerIn(struct pdf_page *pg, const Picture &pic, bool front);  // (inside an operation)
+    void behindText(struct pdf_page *pg, const Picture &pic);                            // (inside an operation)
+    void drawPictureAt(struct pdf_page *pg, const Picture &pic, int stream, qint64 at);  // (inside an operation)
     // text wrapping round pictures (Wrap.cpp): what's kept in the page, the plan worked out
     // before a change (outside the lock), written in it
     struct WrapPic {

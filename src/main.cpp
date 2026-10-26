@@ -89,7 +89,9 @@ int main(int argc, char *argv[])
     theme::apply(theme::choice(), false);
     QApplication::setPalette(theme::palette());
     QApplication::setFont(theme::font());
-    QApplication::setWindowIcon(QIcon(QStringLiteral(":/icons/app.png")));
+    QIcon icon(QStringLiteral(":/icons/app.png"));
+    icon.addFile(QStringLiteral(":/icons/app16.png"));  // (where it's small: the picture drawn for 16 pixels)
+    QApplication::setWindowIcon(icon);
 
     fonts::startScan();  // (the installed fonts looked up in the background)
     for (const QString &folder : {fonts::bundledFolder(), fonts::myFolder()}) {

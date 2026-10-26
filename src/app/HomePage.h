@@ -40,6 +40,7 @@ signals:
     void openDialogRequested();  // (Open, the panel's "Open a PDF..." link)
     void createRequested();      // (Create: a PDF made from files)
     void scanRequested();        // (Scan: a file opened and scanned)
+    void convertRequested();     // (Convert: a PDF picked and saved as another kind of file)
     void message(const QString &text);  // (for the status bar: "5 object(s)")
 
 protected:

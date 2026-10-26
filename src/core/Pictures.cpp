@@ -16,6 +16,7 @@
 #include <QImage>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <tuple>
@@ -820,6 +821,390 @@ bool Document::transformPicture(int page, const Picture &pic, const QTransform &
     return ok;
 }
 
+namespace {
+
+// what the page draws, in its order - to arrange a picture among: each piece of text (BT ... ET, or a drawing of its own
+// with text in it), each thing painted (a filled or stroked shape, a picture, a shading) and where it shows (PDF space).
+// "cover": painted over most of the page - its background (a white sheet, a slide's backdrop), never put over a picture
+struct Layer {
+    int stream = 0;
+    qint64 start = 0, end = 0;
+    bool text = false, cover = false;
+    fz_rect box = fz_empty_rect;
+};
+
+bool before(int s1, qint64 at1, int s2, qint64 at2)
+{
+    return s1 < s2 || (s1 == s2 && at1 < at2);
+}
+
+// a path's points (m l c v y re), in the page's PDF space
+void pathPoints(fz_rect &path, const Op &op, const fz_matrix &ctm)
+{
+    const QByteArray &o = op.op;
+    const std::vector<double> &n = op.numbers;
+    auto point = [&](double x, double y) { path = fz_include_point_in_rect(path, fz_transform_point(fz_make_point(float(x), float(y)), ctm)); };
+    const size_t want = o == "c" ? 6 : (o == "v" || o == "y" || o == "re") ? 4 : 2;
+    if (n.size() < want)
+        return;
+    const size_t k = n.size() - want;
+    if (o == "re") {
+        point(n[k], n[k + 1]);
+        point(n[k] + n[k + 2], n[k + 1] + n[k + 3]);
+        point(n[k] + n[k + 2], n[k + 1]);
+        point(n[k], n[k + 1] + n[k + 3]);
+    } else {
+        for (size_t i = k; i + 1 < n.size(); i += 2)
+            point(n[i], n[i + 1]);
+    }
+}
+
+bool isPath(const QByteArray &o)
+{
+    return o == "m" || o == "l" || o == "c" || o == "v" || o == "y" || o == "re";
+}
+
+bool isPaint(const QByteArray &o)
+{
+    return o == "f" || o == "F" || o == "f*" || o == "B" || o == "B*" || o == "b" || o == "b*" || o == "S" || o == "s" || o == "n";
+}
+
+fz_matrix opMatrix(const std::vector<double> &n)
+{
+    const size_t k = n.size() - 6;
+    return {float(n[k]), float(n[k + 1]), float(n[k + 2]), float(n[k + 3]), float(n[k + 4]), float(n[k + 5])};
+}
+
+// the bytes a text operator writes ((...) and <...> strings): its letters, one or two bytes each
+int textBytes(const QByteArray &raw)
+{
+    int n = 0;
+    for (qsizetype i = 0; i < raw.size(); ++i) {
+        if (raw[i] == '(') {
+            int depth = 1;
+            for (++i; i < raw.size(); ++i) {
+                const char d = raw[i];
+                if (d == '\\') {
+                    ++i;
+                    if (i < raw.size() && raw[i] >= '0' && raw[i] <= '7')
+                        for (int k = 1; k < 3 && i + 1 < raw.size() && raw[i + 1] >= '0' && raw[i + 1] <= '7'; ++k)
+                            ++i;
+                } else if (d == '(') {
+                    ++depth;
+                } else if (d == ')' && --depth == 0) {
+                    break;
+                }
+                ++n;
+            }
+        } else if (raw[i] == '<') {
+            int digits = 0;
+            for (++i; i < raw.size() && raw[i] != '>'; ++i)
+                digits += std::isxdigit(static_cast<unsigned char>(raw[i])) ? 1 : 0;
+            n += (digits + 1) / 2;
+        }
+    }
+    return n;
+}
+
+std::vector<Layer> pageLayers(fz_context *ctx, pdf_obj *pageobj, const std::vector<QByteArray> &streams, const fz_rect &page)
+{
+    pdf_obj *res = pdf_dict_get_inheritable(ctx, pageobj, PDF_NAME(Resources));
+    pdf_obj *xobjs = pdf_dict_get(ctx, res, PDF_NAME(XObject));
+    pdf_obj *fonts = pdf_dict_get(ctx, res, PDF_NAME(Font));
+    const float area = (page.x1 - page.x0) * (page.y1 - page.y0);
+    auto covers = [&](const fz_rect &r) {
+        const fz_rect in = fz_intersect_rect(r, page);
+        return !fz_is_empty_rect(in) && (in.x1 - in.x0) * (in.y1 - in.y0) >= 0.85f * area;
+    };
+    static const QRegularExpression textOp(QStringLiteral("(^|\\s)BT(\\s|$)"));
+    std::vector<Layer> out;
+    std::vector<std::pair<fz_matrix, fz_rect>> stack;
+    fz_matrix ctm = fz_identity;
+    fz_rect clip = fz_infinite_rect;  // (where what's drawn can show: text clipped to its table cell shows only there)
+    bool clipping = false;
+    size_t shown = 0;  // (the layers cut to the clip they're drawn in, so far)
+    // (the text's state: where it's written - its box worked out without the font's widths, half its size a letter)
+    fz_matrix tm = fz_identity, tlm = fz_identity;
+    double size = 0, leading = 0, hscale = 1, rise = 0;
+    bool twoByte = false;
+    for (int s = 0; s < int(streams.size()); ++s) {
+        qint64 textStart = -1, pathStart = -1;
+        fz_rect path = fz_empty_rect, written = fz_empty_rect;
+        for (const Op &op : readOps(streams[size_t(s)])) {
+            const QByteArray &o = op.op;
+            const std::vector<double> &n = op.numbers;
+            for (; shown < out.size(); ++shown)  // (what was just drawn: only where it can show)
+                out[shown].box = fz_intersect_rect(out[shown].box, clip);
+            if (o == "q") {
+                stack.emplace_back(ctm, clip);
+            } else if (o == "Q") {
+                if (!stack.empty()) {
+                    ctm = stack.back().first;
+                    clip = stack.back().second;
+                    stack.pop_back();
+                }
+            } else if (o == "cm" && n.size() >= 6) {
+                ctm = concat(opMatrix(n), ctm);
+            } else if (o == "W" || o == "W*") {
+                clipping = true;
+            } else if (o == "Tf" && !n.empty()) {
+                size = n.back();
+                pdf_obj *font = pdf_dict_gets(ctx, fonts, op.name.constData());
+                twoByte = pdf_name_eq(ctx, pdf_dict_get(ctx, font, PDF_NAME(Subtype)), PDF_NAME(Type0));
+            } else if (o == "TL" && !n.empty()) {
+                leading = n.back();
+            } else if (o == "Tz" && !n.empty()) {
+                hscale = n.back() / 100;
+            } else if (o == "Ts" && !n.empty()) {
+                rise = n.back();
+            } else if (o == "BT") {
+                textStart = op.start;
+                tm = tlm = fz_identity;
+                written = fz_empty_rect;
+            } else if (o == "ET") {
+                if (textStart >= 0) {
+                    Layer l;
+                    l.stream = s;
+                    l.start = textStart;
+                    l.end = op.end;
+                    l.text = true;
+                    l.box = fz_is_empty_rect(written) ? page : written;  // (not worked out: anywhere)
+                    out.push_back(l);
+                }
+                textStart = -1;
+            } else if (textStart >= 0) {  // (inside the text: where its letters go)
+                if ((o == "Td" || o == "TD") && n.size() >= 2) {
+                    if (o == "TD")
+                        leading = -n.back();
+                    tlm = concat(fz_translate(float(n[n.size() - 2]), float(n.back())), tlm);
+                    tm = tlm;
+                } else if (o == "Tm" && n.size() >= 6) {
+                    tm = tlm = opMatrix(n);
+                } else if (o == "T*" || o == "'" || o == "\"") {
+                    tlm = concat(fz_translate(0, float(-leading)), tlm);
+                    tm = tlm;
+                }
+                if (o == "Tj" || o == "TJ" || o == "'" || o == "\"") {
+                    const int bytes = textBytes(streams[size_t(s)].mid(op.start, op.end - op.start));
+                    const double w = (twoByte ? bytes / 2.0 : bytes) * 0.5 * size * hscale;
+                    const fz_rect r = {0, float(rise - 0.25 * size), float(w), float(rise + 0.9 * size)};
+                    written = fz_union_rect(written, fz_transform_rect(r, concat(tm, ctm)));
+                    tm = concat(fz_translate(float(w), 0), tm);
+                }
+            } else if (isPath(o)) {
+                if (pathStart < 0)
+                    pathStart = op.start;
+                pathPoints(path, op, ctm);
+            } else if (o == "n") {
+                if (clipping)
+                    clip = fz_intersect_rect(clip, path);
+                clipping = false;
+                pathStart = -1;
+                path = fz_empty_rect;
+            } else if (isPaint(o)) {
+                if (clipping)
+                    clip = fz_intersect_rect(clip, path);
+                clipping = false;
+                if (pathStart >= 0 && !fz_is_empty_rect(path)) {
+                    Layer l;
+                    l.stream = s;
+                    l.start = pathStart;
+                    l.end = op.end;
+                    l.box = path;
+                    l.cover = o != "S" && o != "s" && covers(path);
+                    out.push_back(l);
+                }
+                pathStart = -1;
+                path = fz_empty_rect;
+            } else if (o == "sh") {
+                Layer l;
+                l.stream = s;
+                l.start = op.start;
+                l.end = op.end;
+                l.box = page;
+                l.cover = true;
+                out.push_back(l);
+            } else if (o == "BI" || (o == "Do" && !op.name.isEmpty())) {
+                Layer l;
+                l.stream = s;
+                l.start = op.start;
+                l.end = op.end;
+                pdf_obj *x = o == "Do" ? pdf_dict_gets(ctx, xobjs, op.name.constData()) : nullptr;
+                if (x && pdf_name_eq(ctx, pdf_dict_get(ctx, x, PDF_NAME(Subtype)), PDF_NAME(Form))) {
+                    fz_buffer *buf = pdf_load_stream(ctx, x);
+                    unsigned char *bytes = nullptr;
+                    const size_t len = fz_buffer_storage(ctx, buf, &bytes);
+                    l.text = QString::fromLatin1(reinterpret_cast<const char *>(bytes), qsizetype(len)).contains(textOp);
+                    fz_drop_buffer(ctx, buf);
+                    l.box = fz_transform_rect(pdf_dict_get_rect(ctx, x, PDF_NAME(BBox)),
+                                              concat(pdf_dict_get_matrix(ctx, x, PDF_NAME(Matrix)), ctm));
+                } else {
+                    l.box = fz_transform_rect(fz_unit_rect, ctm);
+                }
+                l.cover = !l.text && covers(l.box);
+                out.push_back(l);
+            }
+        }
+    }
+    for (; shown < out.size(); ++shown)
+        out[shown].box = fz_intersect_rect(out[shown].box, clip);
+    return out;
+}
+
+// where a picture goes, among the page's layers: (stream, byte) - none: stream < 0
+struct Spot {
+    int stream = -1;
+    qint64 at = 0;
+};
+
+// a place moved out of the clips round it that would cut the picture away (a table cell's text is drawn clipped to its
+// cell: a picture put in there showed only inside the cell - or not at all): before the first of them (after: past it)
+Spot unclipped(const std::vector<QByteArray> &streams, Spot spot, const fz_rect &pic, bool after)
+{
+    struct Frame {
+        int stream;
+        qint64 start;
+        fz_rect clip;  // (the clip before its q)
+        fz_matrix ctm;
+    };
+    std::vector<Frame> frames;
+    fz_matrix ctm = fz_identity;
+    fz_rect clip = fz_infinite_rect, path = fz_empty_rect;
+    bool clipping = false;
+    bool reached = false;
+    for (int s = 0; s < int(streams.size()) && !reached; ++s)
+        for (const Op &op : readOps(streams[size_t(s)])) {
+            if (s == spot.stream && op.start >= spot.at) {
+                reached = true;
+                break;
+            }
+            const QByteArray &o = op.op;
+            if (o == "q") {
+                frames.push_back({s, op.start, clip, ctm});
+            } else if (o == "Q") {
+                if (!frames.empty()) {
+                    clip = frames.back().clip;
+                    ctm = frames.back().ctm;
+                    frames.pop_back();
+                }
+            } else if (o == "cm" && op.numbers.size() >= 6) {
+                ctm = concat(opMatrix(op.numbers), ctm);
+            } else if (isPath(o)) {
+                pathPoints(path, op, ctm);
+            } else if (o == "W" || o == "W*") {
+                clipping = true;
+            } else if (isPaint(o)) {
+                if (clipping)
+                    clip = fz_intersect_rect(clip, path);
+                clipping = false;
+                path = fz_empty_rect;
+            }
+        }
+    const float a = (pic.x1 - pic.x0) * (pic.y1 - pic.y0);
+    auto holds = [&](const fz_rect &c) {
+        const fz_rect in = fz_intersect_rect(c, pic);
+        return a <= 0 || (!fz_is_empty_rect(in) && (in.x1 - in.x0) * (in.y1 - in.y0) >= 0.98f * a);
+    };
+    int bad = -1;
+    for (int i = 0; i < int(frames.size()) && bad < 0; ++i)
+        if (!holds(i + 1 < int(frames.size()) ? frames[size_t(i) + 1].clip : clip))
+            bad = i;
+    if (bad < 0)
+        return spot;
+    if (!after)
+        return {frames[size_t(bad)].stream, frames[size_t(bad)].start};
+    int depth = int(frames.size());  // (past the Q that ends it)
+    for (int s = spot.stream; s < int(streams.size()); ++s)
+        for (const Op &op : readOps(streams[size_t(s)])) {
+            if (s == spot.stream && op.start < spot.at)
+                continue;
+            if (op.op == "q") {
+                ++depth;
+            } else if (op.op == "Q") {
+                if (depth == bad + 1)
+                    return {s, op.end};
+                --depth;
+            }
+        }
+    return spot;
+}
+
+struct Arrangement {
+    std::vector<Layer> layers;  // (the picture's own drawing not among them)
+    std::vector<QByteArray> streams;
+    fz_rect box = fz_empty_rect;  // (the picture's, PDF space)
+    int firstText = -1;           // (the first piece of text)
+    int firstOver = -1;           // (the first piece of text it covers)
+    int background = -1;          // (the last of the backgrounds: the covers drawn before any text)
+    int own = 0;                  // (where the picture is: how many layers are drawn before it)
+    // (what covers just a bit of it - a table's line across it, its edge - passed by, not a step)
+    bool over(const Layer &l) const
+    {
+        const fz_rect in = fz_intersect_rect(l.box, box);
+        return !fz_is_empty_rect(in) && in.x1 - in.x0 >= 1.5f && in.y1 - in.y0 >= 1.5f &&
+               (in.x1 - in.x0) * (in.y1 - in.y0) >= 0.02f * (box.x1 - box.x0) * (box.y1 - box.y0);
+    }
+};
+
+Arrangement arrange(fz_context *ctx, pdf_page *pg, const Picture &pic)
+{
+    fz_rect mediabox;
+    fz_matrix pagectm;
+    pdf_page_transform(ctx, pg, &mediabox, &pagectm);
+    Arrangement a;
+    for (pdf_obj *o : contentStreams(ctx, pg->obj))
+        a.streams.push_back(streamData(ctx, o));
+    a.box = fz_transform_rect(fz_unit_rect, pictureCtm(pic));
+    for (const Layer &l : pageLayers(ctx, pg->obj, a.streams, mediabox))
+        if (!(l.stream == pic.stream && l.start >= pic.start && l.end <= pic.end))
+            a.layers.push_back(l);
+    for (int i = 0; i < int(a.layers.size()); ++i) {
+        const Layer &l = a.layers[size_t(i)];
+        if (a.firstText < 0 && l.text)
+            a.firstText = i;
+        if (a.firstOver < 0 && l.text && a.over(l))
+            a.firstOver = i;
+        if (a.firstText < 0 && l.cover)
+            a.background = i;
+        if (before(l.stream, l.start, pic.stream, pic.start))
+            a.own = i + 1;
+    }
+    return a;
+}
+
+}  // namespace
+
+void Document::drawPictureAt(pdf_page *pg, const Picture &pic, int stream, qint64 at)
+{
+    // its drawing taken from where it is and put there, in the page's matrix at that place
+    const std::vector<pdf_obj *> objs = contentStreams(ctx_, pg->obj);
+    std::vector<QByteArray> streams;
+    for (pdf_obj *o : objs)
+        streams.push_back(streamData(ctx_, o));
+    const QByteArray from = streams.at(size_t(pic.stream));
+    if (pic.end > from.size() || at > streams.at(size_t(stream)).size())
+        fz_throw(ctx_, FZ_ERROR_GENERIC, "the picture isn't where it was");
+    const fz_matrix here = ctmAt(streams, stream, at);
+    const QByteArray draw = " q " + matrixOp(concat(pictureCtm(pic), fz_invert_matrix(here))) + from.mid(pic.start, pic.end - pic.start) + " Q ";
+    const QByteArray without = from.left(pic.start) + " " + from.mid(pic.end);
+    if (stream == pic.stream) {  // (the later place changed first: the earlier one stays where it is)
+        QByteArray data = from;
+        if (at >= pic.end) {
+            data.insert(at, draw);
+            data = data.left(pic.start) + " " + data.mid(pic.end);
+        } else {
+            data = without;
+            data.insert(at, draw);
+        }
+        setStreamData(ctx_, pdf_, objs.at(size_t(stream)), data);
+    } else {
+        QByteArray to = streams.at(size_t(stream));
+        to.insert(at, draw);
+        setStreamData(ctx_, pdf_, objs.at(size_t(stream)), to);
+        setStreamData(ctx_, pdf_, objs.at(size_t(pic.stream)), without);
+    }
+}
+
 bool Document::stepPicture(int page, const Picture &pic, bool forward, QString *error)
 {
     if (pic.vector) {
@@ -827,39 +1212,63 @@ bool Document::stepPicture(int page, const Picture &pic, bool forward, QString *
             *error = QStringLiteral("only pictures can be arranged");
         return false;
     }
-    // the next picture after it in its stream (forward) / the one before it: its drawing put
-    // just after / before that one's, in the page's matrix there (none: to the front / back)
+    // one step under / over what it covers: the next thing painted over it - or all the text over it drawn before that,
+    // as one step. What doesn't touch it is passed by, and the page's
+    // background stays under it. Nothing to pass: false, no error (it's at the back / front already)
     std::lock_guard guard(docMutex_);
-    const std::vector<Picture> pics = picturesLocked(page);
-    const Picture *other = nullptr;
-    for (const Picture &q : pics)
-        if (q.stream == pic.stream && q.index != pic.index && (forward ? q.start >= pic.end : q.end <= pic.start))
-            if (!other || (forward ? q.start < other->start : q.end > other->end))
-                other = &q;
-    if (!other)
-        return onPage(page, forward ? "bring to front" : "send to back", [&](pdf_page *pg) { layerIn(pg, pic, forward); }, error);
-    const Picture there = *other;
-    return onPage(page, forward ? "bring forward" : "send backward", [&](pdf_page *pg) {
-        const std::vector<pdf_obj *> objs = contentStreams(ctx_, pg->obj);
-        std::vector<QByteArray> streams;
-        for (pdf_obj *o : objs)
-            streams.push_back(streamData(ctx_, o));
-        QByteArray data = streams.at(size_t(pic.stream));
-        if (pic.end > data.size() || there.end > data.size())
-            fz_throw(ctx_, FZ_ERROR_GENERIC, "the picture isn't where it was");
-        const qint64 at = forward ? there.end : there.start;
-        const fz_matrix here = ctmAt(streams, pic.stream, at);
-        const QByteArray draw = " q " + matrixOp(concat(pictureCtm(pic), fz_invert_matrix(here))) +
-                                data.mid(pic.start, pic.end - pic.start) + " Q ";
-        if (forward) {  // (the later place first: the earlier one stays where it is)
-            data.insert(at, draw);
-            data = data.left(pic.start) + " " + data.mid(pic.end);
+    Spot spot;
+    pdf_page *pg = nullptr;
+    fz_var(pg);
+    fz_try(ctx_) {
+        pg = pdf_load_page(ctx_, pdf_, page);
+        const Arrangement a = arrange(ctx_, pg, pic);
+        bool text = false;  // (the text over it: one step, however many pieces it's written in)
+        if (forward) {
+            for (int i = a.own; i < int(a.layers.size()); ++i) {
+                const Layer &l = a.layers[size_t(i)];
+                if (!a.over(l))
+                    continue;
+                if (l.text) {
+                    text = true;
+                    spot = {l.stream, l.end};
+                    continue;
+                }
+                if (!text)
+                    spot = {l.stream, l.end};
+                break;
+            }
         } else {
-            data = data.left(pic.start) + " " + data.mid(pic.end);
-            data.insert(at, draw);
+            for (int i = a.own - 1; i >= 0; --i) {
+                const Layer &l = a.layers[size_t(i)];
+                if (i <= a.background && l.cover)
+                    break;  // (the page's background: not under it)
+                if (!a.over(l))
+                    continue;
+                if (l.text) {
+                    text = true;
+                    spot = {l.stream, l.start};
+                    continue;
+                }
+                if (!text)
+                    spot = {l.stream, l.start};
+                break;
+            }
         }
-        setStreamData(ctx_, pdf_, objs.at(size_t(pic.stream)), data);
-    }, error);
+        if (spot.stream >= 0)
+            spot = unclipped(a.streams, spot, a.box, forward);
+    }
+    fz_always(ctx_) {
+        fz_drop_page(ctx_, reinterpret_cast<fz_page *>(pg));
+    }
+    fz_catch(ctx_) {
+        if (error)
+            *error = QString::fromUtf8(fz_caught_message(ctx_));
+        return false;
+    }
+    if (spot.stream < 0)
+        return false;
+    return onPage(page, forward ? "bring forward" : "send backward", [&](pdf_page *p) { drawPictureAt(p, pic, spot.stream, spot.at); },
+                  error);
 }
 
 bool Document::cropPicture(int page, const Picture &pic, const QRectF &unitIn, QString *error)
@@ -911,13 +1320,41 @@ bool Document::layerPicture(int page, const Picture &pic, bool front, QString *e
             *error = QStringLiteral("only pictures can be arranged");
         return false;
     }
-    // Bring to Front: drawn last, over everything; Send to Back: first, under everything
+    // Bring to Front: drawn last, over everything; Send to Back: under everything but the page's background (a white
+    // sheet, a slide's backdrop - under that it would be hidden)
     std::lock_guard guard(docMutex_);
     return onPage(page, front ? "bring to front" : "send to back", [&](pdf_page *pg) { layerIn(pg, pic, front); }, error);
 }
 
+void Document::behindText(pdf_page *pg, const Picture &pic)
+{
+    // just under the text it covers: still over the page's background and what's drawn before that text (a picture
+    // under it already stays - unless it's under the background, where it's hidden: put over that)
+    const Arrangement a = arrange(ctx_, pg, pic);
+    const int under = a.firstOver >= 0 ? a.firstOver : a.firstText;  // (the text it covers - none: the page's text)
+    Spot spot;
+    if (under >= 0 && a.own > under) {
+        const Layer &l = a.layers[size_t(under)];
+        spot = unclipped(a.streams, {l.stream, l.start}, a.box, false);
+    } else if (a.background >= 0 && a.own <= a.background) {
+        const Layer &l = a.layers[size_t(a.background)];
+        spot = unclipped(a.streams, {l.stream, l.end}, a.box, true);
+    }
+    if (spot.stream >= 0)
+        drawPictureAt(pg, pic, spot.stream, spot.at);
+}
+
 void Document::layerIn(pdf_page *pg, const Picture &pic, bool front)
 {
+    if (!front) {  // (to the back: just over the page's background, if it has one)
+        const Arrangement a = arrange(ctx_, pg, pic);
+        if (a.background >= 0) {
+            const Layer &l = a.layers[size_t(a.background)];
+            const Spot spot = unclipped(a.streams, {l.stream, l.end}, a.box, true);
+            drawPictureAt(pg, pic, spot.stream, spot.at);
+            return;
+        }
+    }
     pdf_obj *stm = contentStreams(ctx_, pg->obj).at(size_t(pic.stream));
     const QByteArray data = streamData(ctx_, stm);
     setStreamData(ctx_, pdf_, stm, data.left(pic.start) + " " + data.mid(pic.end));

@@ -383,9 +383,20 @@ void ClassicProgress::setValue(double f)
         update();
 }
 
+// (its blocks and the gaps between in whole screen pixels, each the same: scaled one by one - 125% - some gaps were a
+// pixel wider than others)
+static void progressSizes(double dpr, int blockIn, int gapIn, int *block, int *gap)
+{
+    *block = std::max(blockIn, int(std::lround(blockIn * dpr)));
+    *gap = std::max(gapIn, int(std::lround(gapIn * dpr)));
+}
+
 int ClassicProgress::room() const
 {
-    return std::max(1, (width() - 4 + kGap) / (kBlock + kGap));  // (the blocks it holds)
+    int block, gap;
+    progressSizes(devicePixelRatioF(), kBlock, kGap, &block, &gap);
+    const int inside = int(std::lround((width() - 6) * devicePixelRatioF()));
+    return std::max(1, (inside + gap) / (block + gap));  // (the blocks it holds)
 }
 
 int ClassicProgress::blocks(double f) const
@@ -403,7 +414,10 @@ void ClassicProgress::paintEvent(QPaintEvent *)
     const auto [left, right] = theme::caption(true);
     const QColor color = !theme::dark() ? left
                                         : QColor((left.red() + right.red()) / 2, (left.green() + right.green()) / 2, (left.blue() + right.blue()) / 2);
-    const int H = height();
+    classic::Px x(p);
+    const QRect inside = x.dev(QRectF(3, 3, width() - 6, height() - 6));
+    int block, gap;
+    progressSizes(x.dpr, kBlock, kGap, &block, &gap);
     for (int i = 0, n = blocks(value_); i < n; ++i)
-        classic::block(p, QPointF(3 + i * (kBlock + kGap), 3), 0, 0, kBlock, H - 6, color);
+        x.fill(QRect(inside.left() + i * (block + gap), inside.top(), block, inside.height()), color);
 }
