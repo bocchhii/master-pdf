@@ -24,24 +24,10 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: >-
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-qt6-base
-            mingw-w64-ucrt-x86_64-qt6-svg
-            mingw-w64-ucrt-x86_64-tesseract-ocr
-            mingw-w64-ucrt-x86_64-leptonica
-            mingw-w64-ucrt-x86_64-potrace
-            mingw-w64-ucrt-x86_64-harfbuzz
-            mingw-w64-ucrt-x86_64-freetype
-            mingw-w64-ucrt-x86_64-jbig2dec
-            mingw-w64-ucrt-x86_64-openjpeg2
-            mingw-w64-ucrt-x86_64-libjpeg-turbo
-            mingw-w64-ucrt-x86_64-gumbo-parser
       - name: The compiler and libraries at the versions the app is made with (GCC 15.2, Qt 6.9.1, Tesseract 5.5.1, MuPDF 1.24.3...)
         # (the newest ones read scans differently - the installed app's scans weren't run.bat's: these are packaging/
-        # windows-packages.txt's, all at once)
+        # windows-packages.txt's - GCC, CMake, Qt, the text reader and all they use - put in all at once, nothing newer
+        # there first: downgraded, the newest GCC's split-up libraries clashed with the older one's)
         run: |
           urls=$(tr -d '\r' < packaging/windows-packages.txt | grep -v '^#' | sed 's|^|https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-|; s|$|-any.pkg.tar.zst|')
           pacman -U --noconfirm --overwrite '*' $urls
@@ -187,7 +173,7 @@ jobs:
 
   release:
     needs: [windows, macos, linux]
-    if: always() && startsWith(github.ref, 'refs/tags/')   # (what was made goes out)
+    if: startsWith(github.ref, 'refs/tags/')   # (only when every system's build went: none of them left out of it)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
