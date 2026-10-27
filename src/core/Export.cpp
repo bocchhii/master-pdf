@@ -9,16 +9,19 @@
 #include <leptonica/allheaders.h>
 
 #include <QBuffer>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QImage>
 #include <QImageWriter>
 #include <QLocale>
 #include <QPainter>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QSet>
 #include <QStandardPaths>
 #include <QStringEncoder>
 #include <QTemporaryDir>
@@ -50,6 +53,8 @@ struct Para {
     int heading = 0;  // (1..3: a heading - by its size; 0: body text)
     QString align = QStringLiteral("left");  // left, right, center, justify
     QRectF box;       // (page points)
+    int lines = 1;
+    double pitch = 0;  // (its lines' step down - one line: 0)
     QString text() const
     {
         QString t;
@@ -62,6 +67,7 @@ struct Para {
 struct Pic {
     QImage image;
     QRectF box;
+    bool under = false;  // (the page's text drawn after it - over it)
 };
 
 struct Item {
@@ -69,11 +75,40 @@ struct Item {
     Para para;
     Pic pic;
     double y = 0;
+    int grid = -1;  // (a table: which of the page's)
 };
 
 struct Note {
     QString text;
     QRectF box;
+};
+
+// a table the page draws - its rules round its cells: where its columns and rows are, and each cell (one across
+// several columns or rows: merged) with its borders, its colour, what's in it
+struct Edge {
+    bool on = false;
+    double width = 0.5;  // (points)
+    QColor color = Qt::black;
+    int lines = 1;  // (a double line: 2, a triple: 3)
+};
+struct TableCell {
+    int row = 0, col = 0, rows = 1, cols = 1;
+    QRectF box;
+    QColor shade;  // (invalid: none)
+    Edge top, left, bottom, right;
+    std::vector<Item> items;
+};
+struct Grid {
+    QRectF box;
+    std::vector<double> xs, ys;
+    std::vector<TableCell> cells;
+    int cellAt(QPointF at) const
+    {
+        for (size_t i = 0; i < cells.size(); ++i)
+            if (cells[i].box.contains(at))
+                return int(i);
+        return -1;
+    }
 };
 
 struct Page {
@@ -83,6 +118,8 @@ struct Page {
     std::vector<Note> notes;
     std::vector<TextLine> lines;
     bool read = false;  // (its text read from its picture: a scanned page)
+    std::vector<Grid> grids;
+    std::vector<LineArt> art;  // (its other lines and boxes - not a table's)
 };
 
 QString familyOf(const QString &pdfFont)
@@ -108,6 +145,23 @@ Span spanOf(const TextRun &r)
     Span s;
     s.text = r.text;
     s.family = familyOf(r.font);
+    // (Symbol's and Wingdings' own letters - a list's bullet, a tick - as everyone's: other fonts show boxes for them)
+    static const std::pair<char16_t, char16_t> marks[] = {{0xF0B7, 0x2022}, {0xF0A7, 0x25AA}, {0xF06C, 0x25CF}, {0xF06E, 0x25A0},
+                                                          {0xF0D8, 0x27A2}, {0xF0FC, 0x2713}, {0xF076, 0x2756}, {0xF0A8, 0x25A1},
+                                                          {0xF0E0, 0x27A2}, {0xF0B2, 0x25CB}, {0xF0FB, 0x2717}, {0xF0F0, 0x21D2}};
+    bool marked = false, own = false;
+    for (QChar &c : s.text) {
+        for (const auto &[from, to] : marks)
+            if (c.unicode() == from) {
+                c = QChar(to);
+                marked = true;
+            }
+        own = own || (c.unicode() >= 0xF000 && c.unicode() <= 0xF0FF);
+    }
+    // (... and a symbol font's letter read as everyone's - "•": in a font that has it)
+    static const QRegularExpression symbolFonts(QStringLiteral("^(Symbol|Wingdings.*|Webdings|Zapf ?Dingbats|MT ?Extra)$"), QRegularExpression::CaseInsensitiveOption);
+    if (marked || (!own && symbolFonts.match(s.family).hasMatch()))
+        s.family = QStringLiteral("Arial");
     s.size = r.size > 0 ? r.size : 11;
     s.bold = (r.flags & 1) || r.font.contains(QLatin1String("Bold"), Qt::CaseInsensitive) || (r.flags & 16);
     s.italic = (r.flags & 2) || r.font.contains(QLatin1String("Italic"), Qt::CaseInsensitive) ||
@@ -167,7 +221,398 @@ std::vector<TextLine> readLines(Document *doc, int page, const Options &o)
     return out;
 }
 
-Page readPage(Document *doc, int page, const Options &o, bool pictures, bool notes)
+// lines as paragraphs - in the area they're in (the page, a table's cell): how each is aligned there. Its lines kept
+// (keepLines - Word as the page is): a line that ends before the paragraph's side - a title's, a cell's label - is a
+// paragraph of its own (the things beside it then on its line); the lines of its text that's wrapped flow on
+std::vector<Item> paragraphsOf(const std::vector<TextLine> &lines, const QRectF &area, bool keepLines = false, bool inCell = false)
+{
+    static const QRegularExpression leaders(QStringLiteral("^[\\s_\\-\\x{2013}\\x{2014}.\\x{00B7}\\x{2026}=*]{3,}$"));
+    auto leader = [](const QString &text) { return leaders.match(text).hasMatch(); };
+    std::vector<Item> out;
+    // (turned lines: written straight - their text kept)
+    const std::vector<pagetext::TextFrame> frames = pagetext::frames(lines);
+    for (const pagetext::TextFrame &f : frames)
+        for (const std::vector<int> &paraLines : f.paras) {
+            int rtl = 0;
+            QRectF box;
+            // (how it's aligned: its lines' sides)
+            double minL = 1e9, maxL = -1e9, minR = 1e9, maxR = -1e9;
+            for (int k : paraLines) {
+                const TextLine &l = lines[size_t(k)];
+                rtl += l.rtl ? 1 : -1;
+                box |= l.rect;
+                minL = std::min(minL, l.rect.left()), maxL = std::max(maxL, l.rect.left());
+                minR = std::min(minR, l.rect.right()), maxR = std::max(maxR, l.rect.right());
+            }
+            // (justified: its lines but the last from side to side)
+            double fullL = 1e9, fullL2 = -1e9, fullR = 1e9, fullR2 = -1e9;
+            for (size_t n = 0; n + 1 < paraLines.size(); ++n) {
+                const QRectF &r = lines[size_t(paraLines[n])].rect;
+                fullL = std::min(fullL, r.left()), fullL2 = std::max(fullL2, r.left());
+                fullR = std::min(fullR, r.right()), fullR2 = std::max(fullR2, r.right());
+            }
+            const bool even = paraLines.size() > 2 && fullL2 - fullL < 3 && fullR2 - fullR < 3;
+            const bool middle = std::abs(box.center().x() - area.center().x()) < std::max(3.0, area.width() * 0.04) &&
+                                box.width() < area.width() * 0.75;
+            const QString align = even ? QStringLiteral("justify") : middle && (maxL - minL > 3 || paraLines.size() == 1) ? QStringLiteral("center")
+                                  : rtl > 0 ? QStringLiteral("right") : QStringLiteral("left");
+            // (where it's parted: a line of its own - ending before the side, a line to write on "_____", a title over
+            // smaller letters, a cell's line, a centred one)
+            auto beside = [&](size_t n) { return lines[size_t(paraLines[n + 1])].rect.top() < lines[size_t(paraLines[n])].rect.center().y(); };
+            std::vector<std::vector<int>> parts{{}};
+            for (size_t n = 0; n < paraLines.size(); ++n) {
+                parts.back().push_back(paraLines[n]);
+                if (n + 1 == paraLines.size() || !keepLines || beside(n))
+                    continue;
+                const TextLine &l = lines[size_t(paraLines[n])], &next = lines[size_t(paraLines[n + 1])];
+                const double room = std::max(20.0, 0.12 * box.width());
+                const bool short_ = rtl > 0 ? l.rect.left() > minL + room : l.rect.right() < maxR - room;
+                if (inCell || align == QLatin1String("center") || short_ || leader(l.text) || leader(next.text) ||
+                    std::abs(l.mainRun().size - next.mainRun().size) > 0.15 * std::max(l.mainRun().size, next.mainRun().size))
+                    parts.push_back({});
+            }
+            for (const std::vector<int> &part : parts) {
+                Para para;
+                para.rtl = rtl > 0;
+                QRectF partBox;
+                for (size_t n = 0; n < part.size(); ++n) {
+                    const TextLine &l = lines[size_t(part[n])];
+                    partBox |= l.rect;
+                    for (const TextRun &r : l.runs)
+                        addSpan(para.spans, spanOf(r));
+                    if (n + 1 == part.size() || para.spans.empty())
+                        continue;
+                    QString &end = para.spans.back().text;
+                    const TextLine &next = lines[size_t(part[n + 1])];
+                    if (next.rect.top() < l.rect.center().y()) {  // (the next piece beside it, on its line: a space - far off, a tab)
+                        const double gap = para.rtl ? l.rect.left() - next.rect.right() : next.rect.left() - l.rect.right();
+                        if (keepLines && gap > 1.5 * std::max(4.0, l.rect.height()))
+                            end += QLatin1Char('\t');
+                        else if (!end.endsWith(QLatin1Char(' ')))
+                            end += QLatin1Char(' ');
+                    } else if (!end.endsWith(QLatin1Char(' ')) && !(end.endsWith(QLatin1Char('-')) && !l.rtl)) {
+                        end += QLatin1Char(' ');  // (a line's end: a space - a word broken across it, "self-" "directed": put together, its hyphen kept)
+                    }
+                }
+                if (para.text().trimmed().isEmpty())
+                    continue;
+                para.box = partBox;
+                // (its rows: pieces side by side on one are one)
+                para.lines = 1;
+                for (size_t n = 1; n < part.size(); ++n)
+                    para.lines += lines[size_t(part[n])].rect.top() >= lines[size_t(part[n - 1])].rect.center().y() ? 1 : 0;
+                if (para.lines > 1)
+                    para.pitch = (lines[size_t(part.back())].rect.top() - lines[size_t(part.front())].rect.top()) / double(para.lines - 1);
+                // (a justified paragraph's piece of a line or two: as the paragraph's last line - not stretched)
+                para.align = align == QLatin1String("justify") && para.lines < 3 ? (para.rtl ? QStringLiteral("right") : QStringLiteral("left")) : align;
+                Item it;
+                it.para = para;
+                it.y = partBox.top();
+                out.push_back(it);
+            }
+        }
+    return out;
+}
+
+// ---- the tables a page draws: its rules - lines across and down, touching - round cells ----
+
+struct Rule {
+    bool across;
+    double at, from, to, thick;
+    QColor color;
+};
+
+// (rules along the same line, touching: one)
+std::vector<Rule> joined(std::vector<Rule> rules)
+{
+    std::sort(rules.begin(), rules.end(), [](const Rule &a, const Rule &b) { return std::abs(a.at - b.at) > 0.8 ? a.at < b.at : a.from < b.from; });
+    std::vector<Rule> out;
+    for (const Rule &r : rules) {
+        if (!out.empty() && std::abs(out.back().at - r.at) < 0.8 && r.from <= out.back().to + 1.5) {
+            Rule &b = out.back();
+            if (r.to - r.from > b.to - b.from)
+                b.color = r.color;
+            b.to = std::max(b.to, r.to);
+            b.thick = std::max(b.thick, r.thick);
+            continue;
+        }
+        out.push_back(r);
+    }
+    return out;
+}
+
+// a column's or row's line: the rules as good as on it (a double line: both)
+struct GridLine {
+    double at;
+    std::vector<const Rule *> rules;
+};
+
+std::vector<GridLine> gridLinesOf(std::vector<const Rule *> rs)
+{
+    std::sort(rs.begin(), rs.end(), [](const Rule *a, const Rule *b) { return a->at < b->at; });
+    std::vector<GridLine> ls;
+    for (const Rule *r : rs) {
+        if (!ls.empty() && r->at - ls.back().rules.back()->at <= 4.5)
+            ls.back().rules.push_back(r);
+        else
+            ls.push_back({r->at, {r}});
+    }
+    for (GridLine &l : ls) {
+        double sum = 0;
+        for (const Rule *r : l.rules)
+            sum += r->at;
+        l.at = sum / double(l.rules.size());
+    }
+    return ls;
+}
+
+// (a line's rules along a stretch of it: drawn there - most of it - and how)
+Edge edgeOf(const GridLine &l, double from, double to)
+{
+    Edge e;
+    std::vector<std::pair<double, double>> spans;
+    for (const Rule *r : l.rules)
+        if (r->to > from && r->from < to)
+            spans.push_back({std::max(r->from, from), std::min(r->to, to)});
+    std::sort(spans.begin(), spans.end());
+    double covered = 0, reach = from;
+    for (const auto &[a, b] : spans) {
+        covered += std::max(0.0, b - std::max(a, reach));
+        reach = std::max(reach, b);
+    }
+    e.on = covered >= 0.6 * (to - from);
+    if (!e.on)
+        return e;
+    // (its lines side by side - a frame of two or three: as thin as the thinnest)
+    std::vector<double> ats;
+    double thick = 0, thin = 1e9;
+    for (const Rule *r : l.rules) {
+        if (r->to <= from || r->from >= to)
+            continue;
+        thick = std::max(thick, r->thick), thin = std::min(thin, r->thick);
+        e.color = r->color;
+        if (std::none_of(ats.begin(), ats.end(), [&](double a) { return std::abs(a - r->at) <= 1; }))
+            ats.push_back(r->at);
+    }
+    e.lines = int(std::min<size_t>(3, ats.size()));
+    e.width = std::max(0.25, e.lines > 1 ? thin : thick);
+    return e;
+}
+
+std::vector<Grid> gridsOf(const std::vector<LineArt> &art, const QSizeF &page, std::vector<LineArt> *rest)
+{
+    std::vector<Rule> across, down;
+    std::vector<size_t> fills;  // (boxes filled with a colour: a cell's)
+    std::vector<size_t> whites;  // (and white - over a coloured one: a frame drawn as a box in a box)
+    for (size_t i = 0; i < art.size(); ++i) {
+        const LineArt &a = art[i];
+        const QRectF &r = a.rect;
+        if (r.width() > page.width() * 0.98 && r.height() > page.height() * 0.98)
+            continue;  // (the page's own background)
+        const bool thin = std::min(r.width(), r.height()) <= 2.5 && std::max(r.width(), r.height()) >= 3;
+        if (!a.filled || thin) {
+            if (a.color.lightness() > 245)
+                continue;  // (white: not seen)
+            if (r.width() >= r.height())
+                across.push_back({true, r.center().y(), r.left(), r.right(), r.height(), a.color});
+            else
+                down.push_back({false, r.center().x(), r.top(), r.bottom(), r.width(), a.color});
+        } else if (a.color.lightness() <= 250) {
+            fills.push_back(i);
+        } else {
+            whites.push_back(i);
+        }
+    }
+    across = joined(across);
+    down = joined(down);
+    // (the rules that touch: one table's)
+    const size_t na = across.size(), n = na + down.size();
+    std::vector<size_t> root(n);
+    for (size_t i = 0; i < n; ++i)
+        root[i] = i;
+    auto top = [&](size_t i) {
+        while (root[i] != i)
+            i = root[i] = root[root[i]];
+        return i;
+    };
+    for (size_t i = 0; i < na; ++i)
+        for (size_t j = 0; j < down.size(); ++j) {
+            const Rule &a = across[i], &d = down[j];
+            if (d.at >= a.from - 2 && d.at <= a.to + 2 && a.at >= d.from - 2 && a.at <= d.to + 2)
+                root[top(i)] = top(na + j);
+        }
+    std::map<size_t, std::vector<size_t>> groups;
+    for (size_t i = 0; i < n; ++i)
+        groups[top(i)].push_back(i);
+    std::vector<bool> usedRule(n), usedFill(fills.size());
+    std::vector<Grid> out;
+    for (const auto &[g, members] : groups) {
+        std::vector<const Rule *> as, ds;
+        for (size_t i : members)
+            (i < na ? as : ds).push_back(i < na ? &across[i] : &down[i - na]);
+        if (as.size() < 2 || ds.size() < 2)
+            continue;
+        const std::vector<GridLine> cols = gridLinesOf(ds), rows = gridLinesOf(as);
+        if (cols.size() < 2 || rows.size() < 2)
+            continue;
+        Grid grid;
+        for (const GridLine &l : cols)
+            grid.xs.push_back(l.at);
+        for (const GridLine &l : rows)
+            grid.ys.push_back(l.at);
+        grid.box = QRectF(QPointF(grid.xs.front(), grid.ys.front()), QPointF(grid.xs.back(), grid.ys.back()));
+        if (grid.box.width() < 10 || grid.box.height() < 6)
+            continue;
+        // the cells: across the columns where no rule parts them (merged), down the rows the same
+        const int nr = int(rows.size()) - 1, nc = int(cols.size()) - 1;
+        std::vector<int> owner(size_t(nr * nc), -1);
+        for (int r = 0; r < nr; ++r)
+            for (int c = 0; c < nc; ++c) {
+                if (owner[size_t(r * nc + c)] >= 0)
+                    continue;
+                TableCell cell;
+                cell.row = r, cell.col = c;
+                while (c + cell.cols < nc && owner[size_t(r * nc + c + cell.cols)] < 0 &&
+                       !edgeOf(cols[size_t(c + cell.cols)], rows[size_t(r)].at, rows[size_t(r + 1)].at).on)
+                    ++cell.cols;
+                while (r + cell.rows < nr && !edgeOf(rows[size_t(r + cell.rows)], cols[size_t(c)].at, cols[size_t(c + cell.cols)].at).on) {
+                    bool free = true;
+                    for (int k = 0; k < cell.cols; ++k)
+                        free = free && owner[size_t((r + cell.rows) * nc + c + k)] < 0;
+                    if (!free)
+                        break;
+                    ++cell.rows;
+                }
+                for (int rr = r; rr < r + cell.rows; ++rr)
+                    for (int cc = c; cc < c + cell.cols; ++cc)
+                        owner[size_t(rr * nc + cc)] = int(grid.cells.size());
+                cell.box = QRectF(QPointF(cols[size_t(c)].at, rows[size_t(r)].at), QPointF(cols[size_t(c + cell.cols)].at, rows[size_t(r + cell.rows)].at));
+                cell.top = edgeOf(rows[size_t(r)], cell.box.left(), cell.box.right());
+                cell.bottom = edgeOf(rows[size_t(r + cell.rows)], cell.box.left(), cell.box.right());
+                cell.left = edgeOf(cols[size_t(c)], cell.box.top(), cell.box.bottom());
+                cell.right = edgeOf(cols[size_t(c + cell.cols)], cell.box.top(), cell.box.bottom());
+                // (its colour: a box filled over most of it)
+                for (size_t f = 0; f < fills.size(); ++f) {
+                    const QRectF &fr = art[fills[f]].rect;
+                    const QRectF both = fr & cell.box;
+                    if (both.width() * both.height() >= 0.6 * cell.box.width() * cell.box.height() &&
+                        fr.width() * fr.height() <= 4 * cell.box.width() * cell.box.height()) {
+                        cell.shade = art[fills[f]].color;
+                        usedFill[f] = true;
+                    }
+                }
+                grid.cells.push_back(cell);
+            }
+        for (size_t i : members)
+            usedRule[i] = true;
+        out.push_back(grid);
+    }
+    // what's left: the other lines and boxes (a frame round nothing, a line to sign on, a coloured band)
+    if (rest) {
+        for (size_t i = 0; i < n; ++i)
+            if (!usedRule[i]) {
+                const Rule &r = i < na ? across[i] : down[i - na];
+                const double h = std::max(0.25, r.thick) / 2;
+                rest->push_back({r.across ? QRectF(QPointF(r.from, r.at - h), QPointF(r.to, r.at + h))
+                                          : QRectF(QPointF(r.at - h, r.from), QPointF(r.at + h, r.to)),
+                                 true, r.color});
+            }
+        // (the boxes in the order the page paints them - a white one over the coloured one it's in: what shows is
+        // the frame round it)
+        std::vector<size_t> boxes;
+        for (size_t f = 0; f < fills.size(); ++f) {
+            // (a speck - where a table's rules meet, its corners squared off: the table has them)
+            const QRectF &r = art[fills[f]].rect;
+            const double most = std::max(r.width(), r.height());
+            bool inTable = false;
+            for (const Grid &g : out)
+                inTable = inTable || g.box.adjusted(-2, -2, 2, 2).contains(r);
+            if (!usedFill[f] && most >= 1.5 && !(inTable && most < 3))
+                boxes.push_back(fills[f]);
+        }
+        for (size_t w : whites)
+            for (size_t f : boxes)
+                if (f < w && art[f].rect.intersects(art[w].rect)) {
+                    boxes.push_back(w);
+                    break;
+                }
+        std::sort(boxes.begin(), boxes.end());
+        std::vector<LineArt> lines = std::move(*rest);
+        rest->clear();
+        for (size_t b : boxes)
+            rest->push_back(art[b]);
+        rest->insert(rest->end(), lines.begin(), lines.end());
+    }
+    return out;
+}
+
+// a line in pieces at these places across it (its letters' pens tell where each is) - straight, left to right lines
+std::vector<TextLine> splitAt(const TextLine &l, std::vector<double> cuts)
+{
+    if (l.pens.empty() || l.rtl || std::abs(l.angle) > 0.01)
+        return {l};
+    std::sort(cuts.begin(), cuts.end());
+    struct Ch {
+        char32_t c;
+        size_t run;
+        double x;
+    };
+    std::vector<Ch> chars;
+    size_t pen = 0;
+    for (size_t r = 0; r < l.runs.size(); ++r)
+        for (const char32_t c : l.runs[r].text.toUcs4()) {
+            if (QChar::isSpace(c)) {
+                chars.push_back({c, r, chars.empty() ? l.rect.left() : chars.back().x});
+                continue;
+            }
+            if (pen >= l.pens.size())
+                return {l};  // (its letters and pens not one to one: as it is)
+            chars.push_back({c, r, l.pens[pen++].first.x()});
+        }
+    auto pieceOf = [&](double x) { return int(std::upper_bound(cuts.begin(), cuts.end(), x) - cuts.begin()); };
+    std::vector<TextLine> out;
+    for (size_t i = 0; i < chars.size();) {
+        const int piece = pieceOf(chars[i].x);
+        size_t j = i;
+        while (j < chars.size() && (QChar::isSpace(chars[j].c) || pieceOf(chars[j].x) == piece))
+            ++j;
+        // (its letters, spaces round them left off)
+        size_t a = i, b = j;
+        while (a < b && QChar::isSpace(chars[a].c))
+            ++a;
+        while (b > a && QChar::isSpace(chars[b - 1].c))
+            --b;
+        if (a < b) {
+            TextLine part = l;
+            part.runs.clear();
+            part.pens.clear();
+            part.text.clear();
+            const double right = j < chars.size() ? std::min(chars[j].x, l.rect.right()) : l.rect.right();
+            for (size_t k = a; k < b; ++k) {
+                if (part.runs.empty() || chars[k - 1].run != chars[k].run || k == a) {
+                    TextRun run = l.runs[chars[k].run];
+                    run.text.clear();
+                    run.origin.setX(chars[k].x);
+                    run.box.setLeft(chars[k].x);
+                    part.runs.push_back(run);
+                }
+                part.runs.back().text += QString::fromUcs4(&chars[k].c, 1);
+                part.text += QString::fromUcs4(&chars[k].c, 1);
+            }
+            for (TextRun &run : part.runs)
+                run.box.setRight(std::min(run.box.right(), right));
+            part.rect = QRectF(QPointF(chars[a].x, l.rect.top()), QPointF(std::max(chars[a].x + 1, std::min(right, l.rect.right())), l.rect.bottom()));
+            // (its right: up to its last letter - the next piece's start, less the gap)
+            const double lastX = chars[b - 1].x;
+            part.rect.setRight(std::max(lastX + 1, std::min(part.rect.right(), lastX + l.mainRun().size * 0.7)));
+            out.push_back(part);
+        }
+        i = j;
+    }
+    return out.empty() ? std::vector<TextLine>{l} : out;
+}
+
+Page readPage(Document *doc, int page, const Options &o, bool pictures, bool notes, bool tables = false)
 {
     Page p;
     p.number = page;
@@ -182,56 +627,138 @@ Page readPage(Document *doc, int page, const Options &o, bool pictures, bool not
             p.read = true;
         }
     }
-    // (turned lines: written straight - their text kept)
-    const std::vector<pagetext::TextFrame> frames = pagetext::frames(p.lines);
-    for (const pagetext::TextFrame &f : frames)
-        for (const std::vector<int> &paraLines : f.paras) {
-            Para para;
-            int rtl = 0;
-            QRectF box;
-            for (size_t n = 0; n < paraLines.size(); ++n) {
-                const TextLine &l = p.lines[size_t(paraLines[n])];
-                rtl += l.rtl ? 1 : -1;
-                box |= l.rect;
-                for (const TextRun &r : l.runs)
-                    addSpan(para.spans, spanOf(r));
-                if (n + 1 < paraLines.size()) {  // (a line's end: a space - or a word broken across it put together)
-                    if (!para.spans.empty() && para.spans.back().text.endsWith(QLatin1Char('-')) && !l.rtl)
-                        para.spans.back().text.chop(1);
-                    else if (!para.spans.empty() && !para.spans.back().text.endsWith(QLatin1Char(' ')))
-                        para.spans.back().text += QLatin1Char(' ');
+    // (its tables: the lines in their cells written there)
+    std::vector<QRectF> drawn;
+    std::vector<QPointF> hidden;
+    if (tables && !p.read)
+        p.grids = gridsOf(doc->lineArt(page, pictures ? &drawn : nullptr, &hidden), p.size, &p.art);
+    // (text the page draws but doesn't show - clipped away: another page placed in it as a picture, only part of it
+    // shown - left out, as Acrobat does)
+    if (!hidden.empty()) {
+        QSet<qint64> at;
+        auto key = [](qint64 x, qint64 y) { return (x << 32) ^ (y & 0xffffffff); };
+        for (const QPointF &h : hidden)
+            at.insert(key(std::llround(h.x() * 2), std::llround(h.y() * 2)));
+        auto unseen = [&](const QPointF &q) {
+            for (int dx = -1; dx <= 1; ++dx)
+                for (int dy = -1; dy <= 1; ++dy)
+                    if (at.contains(key(std::llround(q.x() * 2) + dx, std::llround(q.y() * 2) + dy)))
+                        return true;
+            return false;
+        };
+        p.lines.erase(std::remove_if(p.lines.begin(), p.lines.end(), [&](const TextLine &l) {
+                          size_t n = 0;
+                          for (const auto &pen : l.pens)
+                              n += unseen(pen.first) ? 1 : 0;
+                          return !l.pens.empty() && n * 2 > l.pens.size();
+                      }),
+                      p.lines.end());
+    }
+    // (its drawings - a diagram, a chart, a logo, a picture inside a drawing: as Acrobat does, each a picture of it as
+    // the page shows it, its labels in it - what's drawn near each other one)
+    const std::vector<Picture> pics = pictures ? doc->pictures(page) : std::vector<Picture>{};
+    std::vector<QRectF> figures;
+    auto area = [](const QRectF &r) { return std::max(0.0, r.width()) * std::max(0.0, r.height()); };
+    for (const QRectF &r : drawn) {
+        bool own = false;  // (a picture of its own - written as it is, sharper)
+        for (const Picture &pic : pics)
+            own = own || (!pic.vector && area(pic.rect & r) > 0.8 * area(r));
+        if (own)
+            continue;
+        QRectF f = r;
+        for (bool more = true; more;) {
+            more = false;
+            for (size_t i = 0; i < figures.size(); ++i)
+                if (figures[i].adjusted(-4, -4, 4, 4).intersects(f)) {
+                    f |= figures[i];
+                    figures.erase(figures.begin() + long(i));
+                    more = true;
+                    break;
                 }
-            }
-            if (para.text().trimmed().isEmpty())
-                continue;
-            para.rtl = rtl > 0;
-            para.box = box;
-            // (how it's aligned: its lines' sides)
-            double minL = 1e9, maxL = -1e9, minR = 1e9, maxR = -1e9;
-            for (int k : paraLines) {
-                const QRectF &r = p.lines[size_t(k)].rect;
-                minL = std::min(minL, r.left()), maxL = std::max(maxL, r.left());
-                minR = std::min(minR, r.right()), maxR = std::max(maxR, r.right());
-            }
-            const bool even = paraLines.size() > 2 && maxL - minL < 3 && maxR - minR < 3;
-            const bool middle = std::abs(box.center().x() - p.size.width() / 2) < p.size.width() * 0.04 && box.width() < p.size.width() * 0.75;
-            para.align = even ? QStringLiteral("justify") : middle && (maxL - minL > 3 || paraLines.size() == 1) ? QStringLiteral("center")
-                         : para.rtl ? QStringLiteral("right") : QStringLiteral("left");
-            Item it;
-            it.para = para;
-            it.y = box.top();
-            p.items.push_back(it);
         }
+        figures.push_back(f);
+    }
+    figures.erase(std::remove_if(figures.begin(), figures.end(), [&](const QRectF &f) {
+        if (f.width() < 8 || f.height() < 8 || area(f) > 0.6 * area(QRectF(QPointF(0, 0), p.size)))
+            return true;  // (a speck - the page's background)
+        for (const Picture &pic : pics)  // (a picture of its own: as it is, sharper)
+            if (!pic.vector && area(pic.rect & f) > 0.8 * area(f))
+                return true;
+        for (const Grid &g : p.grids)  // (in a table: the table's)
+            if (area(g.box & f) > 0.3 * area(f))
+                return true;
+        int letters = 0;  // (a box round a paragraph: its text is text)
+        double covered = 0;
+        for (const TextLine &l : p.lines)
+            if (f.contains(l.rect.center()))
+                letters += int(l.text.size()), covered += area(l.rect & f);
+        return letters > 250 && covered > 0.35 * area(f);
+    }), figures.end());
+    auto inFigure = [&](const QRectF &r) {
+        for (const QRectF &f : figures)
+            if (f.adjusted(-1, -1, 1, 1).contains(r.center()) && (f & r).width() * (f & r).height() > 0.6 * r.width() * r.height())
+                return true;
+        return false;
+    };
+    std::vector<TextLine> free;
+    std::vector<std::vector<std::vector<TextLine>>> inCells(p.grids.size());
+    for (size_t g = 0; g < p.grids.size(); ++g)
+        inCells[g].resize(p.grids[g].cells.size());
+    // (a line across a table's column rules - the page's text read "Yes No" as one: each cell's part apart)
+    std::vector<TextLine> pieces;
+    for (const TextLine &l : p.lines) {
+        std::vector<double> cuts;
+        for (const Grid &g : p.grids)
+            if (l.rect.center().y() > g.box.top() && l.rect.center().y() < g.box.bottom())
+                for (double x : g.xs)  // (where two cells meet - not inside one across columns)
+                    if (x > l.rect.left() + 2 && x < l.rect.right() - 2 &&
+                        g.cellAt(QPointF(x - 1, l.rect.center().y())) != g.cellAt(QPointF(x + 1, l.rect.center().y())))
+                        cuts.push_back(x);
+        for (const TextLine &part : cuts.empty() ? std::vector<TextLine>{l} : splitAt(l, cuts))
+            pieces.push_back(part);
+    }
+    for (const TextLine &l : pieces) {
+        if (inFigure(l.rect))
+            continue;  // (in a drawing's picture)
+        bool placed = false;
+        for (size_t g = 0; g < p.grids.size() && !placed && std::abs(l.angle) < 0.01; ++g)
+            if (const int c = p.grids[g].cellAt(l.rect.center()); c >= 0) {
+                inCells[g][size_t(c)].push_back(l);
+                placed = true;
+            }
+        if (!placed)
+            free.push_back(l);
+    }
+    p.items = paragraphsOf(free, QRectF(QPointF(0, 0), p.size), tables && !o.flowing);
+    for (size_t g = 0; g < p.grids.size(); ++g) {
+        for (size_t c = 0; c < p.grids[g].cells.size(); ++c)
+            p.grids[g].cells[c].items = paragraphsOf(inCells[g][c], p.grids[g].cells[c].box, tables && !o.flowing, true);
+        Item it;
+        it.grid = int(g);
+        it.y = p.grids[g].box.top();
+        p.items.push_back(it);
+    }
+    for (const QRectF &f : figures) {  // (drawn as the page shows it, at twice its size)
+        const QRect area(int(std::floor(f.left() * 2)), int(std::floor(f.top() * 2)), int(std::ceil(f.width() * 2)), int(std::ceil(f.height() * 2)));
+        const QImage im = doc->render(page, 2.0, area);
+        if (im.isNull())
+            continue;
+        Item it;
+        it.picture = true;
+        it.pic = {im, f, false};
+        it.y = f.top();
+        p.items.push_back(it);
+    }
     if (pictures)
-        for (const Picture &pic : doc->pictures(page)) {
-            if (pic.vector || pic.rect.width() < 4 || pic.rect.height() < 4)
+        for (const Picture &pic : pics) {
+            if (pic.vector || pic.rect.width() < 4 || pic.rect.height() < 4 || inFigure(pic.rect))
                 continue;
             if (p.read && pic.rect.width() * pic.rect.height() > 0.6 * p.size.width() * p.size.height())
                 continue;  // (a scanned page's scan: its text read is what's written - the scan again would be it twice)
             QImage im = doc->pictureImage(pic);
             if (im.isNull())
                 continue;
-            if (im.hasAlphaChannel()) {  // (see-through parts: on white, as the page shows them)
+            if (im.hasAlphaChannel() && !tables) {  // (see-through parts: on white, as the page shows them - Word keeps them see-through)
                 QImage flat(im.size(), QImage::Format_RGB32);
                 flat.fill(Qt::white);
                 QPainter(&flat).drawImage(0, 0, im);
@@ -239,23 +766,33 @@ Page readPage(Document *doc, int page, const Options &o, bool pictures, bool not
             }
             Item it;
             it.picture = true;
-            it.pic = {im, pic.rect};
+            it.pic = {im, pic.rect, pic.textAfter};
             it.y = pic.rect.top();
-            p.items.push_back(it);
+            bool placed = false;  // (in a table's cell: there)
+            for (Grid &g : p.grids)
+                if (const int c = g.cellAt(pic.rect.center()); c >= 0 && !placed) {
+                    g.cells[size_t(c)].items.push_back(it);
+                    placed = true;
+                }
+            if (!placed)
+                p.items.push_back(it);
         }
+    for (Grid &g : p.grids)
+        for (TableCell &c : g.cells)
+            std::stable_sort(c.items.begin(), c.items.end(), [](const Item &a, const Item &b) { return a.y < b.y; });
     std::stable_sort(p.items.begin(), p.items.end(), [](const Item &a, const Item &b) { return a.y < b.y; });
     // (a list's bullet read as a paragraph of its own - "-", "•": put at the start of the paragraph beside it)
     static const QRegularExpression bullet(QStringLiteral("^\\s*[-\\x{2022}\\x{25E6}\\x{25AA}\\x{25CF}\\x{2013}*o]\\s*$"));
     for (size_t k = 0; k < p.items.size(); ++k) {
         const Item &it = p.items[k];
-        if (it.picture || !bullet.match(it.para.text()).hasMatch())
+        if (it.picture || it.grid >= 0 || !bullet.match(it.para.text()).hasMatch())
             continue;
         // (its paragraph: the one whose first line is level with it - before it or after it in the reading)
         long best = -1;
         double far = it.para.box.height() * 0.8;
         for (long n = std::max(0L, long(k) - 3); n < long(p.items.size()) && n <= long(k) + 3; ++n) {
             const Item &other = p.items[size_t(n)];
-            if (n == long(k) || other.picture || bullet.match(other.para.text()).hasMatch())
+            if (n == long(k) || other.picture || other.grid >= 0 || bullet.match(other.para.text()).hasMatch())
                 continue;
             const double d = std::abs(other.para.box.top() - it.para.box.top());
             if (d < far)
@@ -330,14 +867,14 @@ void check(const Progress &pr)
         throw Cancelled();
 }
 
-std::vector<Page> readAll(Document *doc, const Options &o, const Progress &pr, bool pictures, bool notes, double share = 0.6)
+std::vector<Page> readAll(Document *doc, const Options &o, const Progress &pr, bool pictures, bool notes, double share = 0.6, bool tables = false)
 {
     std::vector<Page> pages;
     const std::vector<int> which = pagesOf(doc, o);
     for (size_t k = 0; k < which.size(); ++k) {
         check(pr);
         pr.step(share * double(k) / double(which.size()), QObject::tr("Reading page %1 of %2").arg(k + 1).arg(which.size()));
-        pages.push_back(readPage(doc, which[k], o, pictures, notes));
+        pages.push_back(readPage(doc, which[k], o, pictures, notes, tables));
     }
     findHeadings(pages);
     return pages;
@@ -505,60 +1042,93 @@ QImage pagePicture(Document *doc, int page, int dpi)
     return im;
 }
 
-// a zip file (Office's .docx, .xlsx, .pptx are): its parts
+// a zip file (Office's .docx, .xlsx, .pptx are): its parts, squeezed (MuPDF's zip writer only stores them - a
+// document came out three times Acrobat's size)
 class Zip {
 public:
-    explicit Zip(const QString &path)
+    explicit Zip(const QString &path) : file_(path)
     {
-        ctx_ = fz_new_context(nullptr, nullptr, FZ_STORE_UNLIMITED);
-        fz_try(ctx_) {
-            zip_ = fz_new_zip_writer(ctx_, path.toUtf8().constData());
-        }
-        fz_catch(ctx_) {
-            error_ = QString::fromUtf8(fz_caught_message(ctx_));
-        }
+        if (!file_.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            error_ = QObject::tr("%1 couldn't be written: %2").arg(QDir::toNativeSeparators(path), file_.errorString());
     }
-    ~Zip()
-    {
-        if (zip_)
-            fz_drop_zip_writer(ctx_, zip_);
-        fz_drop_context(ctx_);
-    }
-    bool ok() const { return zip_ != nullptr && error_.isEmpty(); }
+    bool ok() const { return file_.isOpen() && error_.isEmpty(); }
     QString error() const { return error_; }
     void add(const QString &name, const QByteArray &data, bool compress = true)
     {
         if (!ok())
             return;
-        fz_buffer *b = nullptr;
-        fz_var(b);
-        fz_try(ctx_) {
-            b = fz_new_buffer_from_copied_data(ctx_, reinterpret_cast<const unsigned char *>(data.constData()), size_t(data.size()));
-            fz_write_zip_entry(ctx_, zip_, name.toUtf8().constData(), b, compress ? 1 : 0);
+        // (deflated: zlib's stream from Qt, its 4-byte length, 2-byte header and 4-byte check cut off)
+        QByteArray packed;
+        if (compress && data.size() > 64) {
+            const QByteArray z = qCompress(data, 6);
+            if (z.size() > 10)
+                packed = z.mid(6, z.size() - 10);
+            if (packed.size() >= data.size())
+                packed.clear();
         }
-        fz_always(ctx_) {
-            fz_drop_buffer(ctx_, b);
-        }
-        fz_catch(ctx_) {
-            error_ = QString::fromUtf8(fz_caught_message(ctx_));
-        }
+        const bool deflated = !packed.isEmpty();
+        const QByteArray &stored = deflated ? packed : data;
+        Entry e{name.toUtf8(), crc32(data), quint32(stored.size()), quint32(data.size()), quint32(file_.pos()), deflated};
+        QByteArray h;
+        put32(h, 0x04034b50);
+        put16(h, 20), put16(h, 0x0800), put16(h, e.deflated ? 8 : 0), put16(h, 0), put16(h, 0x21);  // (UTF-8 names; 1980-01-01)
+        put32(h, e.crc), put32(h, e.packed), put32(h, e.size);
+        put16(h, quint16(e.name.size())), put16(h, 0);
+        file_.write(h + e.name);
+        file_.write(stored);
+        entries_.push_back(e);
     }
     bool close()
     {
-        if (!zip_)
+        if (!ok())
             return false;
-        fz_try(ctx_) {
-            fz_close_zip_writer(ctx_, zip_);
+        const quint32 at = quint32(file_.pos());
+        QByteArray dir;
+        for (const Entry &e : entries_) {
+            put32(dir, 0x02014b50);
+            put16(dir, 20), put16(dir, 20), put16(dir, 0x0800), put16(dir, e.deflated ? 8 : 0), put16(dir, 0), put16(dir, 0x21);
+            put32(dir, e.crc), put32(dir, e.packed), put32(dir, e.size);
+            put16(dir, quint16(e.name.size())), put16(dir, 0), put16(dir, 0), put16(dir, 0), put16(dir, 0);
+            put32(dir, 0), put32(dir, e.offset);
+            dir += e.name;
         }
-        fz_catch(ctx_) {
-            error_ = QString::fromUtf8(fz_caught_message(ctx_));
-        }
+        QByteArray end;
+        put32(end, 0x06054b50);
+        put16(end, 0), put16(end, 0), put16(end, quint16(entries_.size())), put16(end, quint16(entries_.size()));
+        put32(end, quint32(dir.size())), put32(end, at), put16(end, 0);
+        if (file_.write(dir + end) != dir.size() + end.size())
+            error_ = file_.errorString();
+        file_.close();
         return error_.isEmpty();
     }
 
 private:
-    fz_context *ctx_ = nullptr;
-    fz_zip_writer *zip_ = nullptr;
+    struct Entry {
+        QByteArray name;
+        quint32 crc, packed, size, offset;
+        bool deflated;
+    };
+    static void put16(QByteArray &b, quint16 v) { b.append(char(v & 0xff)).append(char(v >> 8)); }
+    static void put32(QByteArray &b, quint32 v) { put16(b, quint16(v & 0xffff)), put16(b, quint16(v >> 16)); }
+    static quint32 crc32(const QByteArray &data)
+    {
+        static const std::vector<quint32> table = [] {
+            std::vector<quint32> t(256);
+            for (quint32 i = 0; i < 256; ++i) {
+                quint32 c = i;
+                for (int k = 0; k < 8; ++k)
+                    c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+                t[i] = c;
+            }
+            return t;
+        }();
+        quint32 c = 0xFFFFFFFFu;
+        for (const char ch : data)
+            c = table[(c ^ quint8(ch)) & 0xff] ^ (c >> 8);
+        return c ^ 0xFFFFFFFFu;
+    }
+    QFile file_;
+    std::vector<Entry> entries_;
     QString error_;
 };
 
@@ -590,7 +1160,27 @@ QString docxRun(const Span &s, bool rtlPara)
     pr += QStringLiteral("<w:sz w:val=\"%1\"/><w:szCs w:val=\"%1\"/>").arg(half);
     if (rtl)
         pr += QLatin1String("<w:rtl/>");
-    return QStringLiteral("<w:r><w:rPr>%1</w:rPr><w:t xml:space=\"preserve\">%2</w:t></w:r>").arg(pr, esc(s.text));
+    // (a line ended where the page ends it: a break)
+    return QStringLiteral("<w:r><w:rPr>%1</w:rPr><w:t xml:space=\"preserve\">%2</w:t></w:r>")
+        .arg(pr, esc(s.text)
+                     .replace(QLatin1Char('\n'), QLatin1String("</w:t><w:br/><w:t xml:space=\"preserve\">"))
+                     .replace(QLatin1Char('\t'), QLatin1String("</w:t><w:tab/><w:t xml:space=\"preserve\">")));
+}
+
+// (a table's border, as Word has it: single or double, eighths of a point - none: nil)
+QString borderXml(const char *side, const Edge &e)
+{
+    if (!e.on)
+        return QStringLiteral("<w:%1 w:val=\"nil\"/>").arg(QLatin1String(side));
+    return QStringLiteral("<w:%1 w:val=\"%2\" w:sz=\"%3\" w:space=\"0\" w:color=\"%4\"/>")
+        .arg(QLatin1String(side), e.lines >= 3 ? QStringLiteral("triple") : e.lines == 2 ? QStringLiteral("double") : QStringLiteral("single"))
+        .arg(std::clamp(int(std::lround(e.width * 8)), 2, 96))
+        .arg(hexColor(e.color));
+}
+
+int twips(double points)
+{
+    return int(std::lround(points * 20));
 }
 
 QStringList docxWrite(const std::vector<Page> &pages, const QString &path, const Options &o, QString *error)
@@ -602,11 +1192,275 @@ QStringList docxWrite(const std::vector<Page> &pages, const QString &path, const
         return {};
     }
     QString body, rels, comments;
-    int images = 0, notes = 0, shapes = 0;
-    const double pageW = pages.empty() ? 612 : pages.front().size.width(), pageH = pages.empty() ? 792 : pages.front().size.height();
-    const double margin = o.flowing ? 72 : 36, room = pageW - 2 * margin;
+    int notes = 0, shapes = 0;
+    // (as the pages are: their own size, each thing where it is - the margins small, so what's near the edges fits;
+    // flowing: Word's usual inch round the text)
+    const bool layout = !o.flowing;
+    const double top = layout ? 14 : 72, side = layout ? 18 : 72, bottom = layout ? 0 : 72;
+    // each picture once, however often it's shown (a signature on every page)
+    QHash<QByteArray, int> mediaOf;
+    int media = 0;
+    auto mediaFor = [&](const QImage &im) {
+        const QByteArray png = pngOf(im);
+        const QByteArray key = QCryptographicHash::hash(png, QCryptographicHash::Md5);
+        if (const auto it = mediaOf.constFind(key); it != mediaOf.constEnd())
+            return it.value();
+        const int n = ++media;
+        // (a photo: as a JPEG - a fraction of its PNG's size, as Acrobat keeps them)
+        QByteArray bytes = png;
+        QString ext = QStringLiteral("png");
+        if (png.size() > 60000 && !im.hasAlphaChannel()) {
+            const QByteArray jpeg = jpegOf(im, 88);
+            if (!jpeg.isEmpty() && jpeg.size() < png.size() / 2)
+                bytes = jpeg, ext = QStringLiteral("jpeg");
+        }
+        zip.add(QStringLiteral("word/media/image%1.%2").arg(n).arg(ext), bytes, false);
+        rels += QStringLiteral("<Relationship Id=\"rIdImg%1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/image%1.%2\"/>").arg(n).arg(ext);
+        mediaOf.insert(key, n);
+        return n;
+    };
+    auto picXml = [&](int n, long long cx, long long cy, int id) {
+        return QStringLiteral("<a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">"
+                              "<a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"><pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
+                              "<pic:nvPicPr><pic:cNvPr id=\"%4\" name=\"image%1.png\"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed=\"rIdImg%1\"/>"
+                              "<a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"%2\" cy=\"%3\"/></a:xfrm>"
+                              "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>")
+            .arg(n)
+            .arg(cx)
+            .arg(cy)
+            .arg(id);
+    };
+    // a picture in the text's line
+    auto inlinePic = [&](const QImage &im, double w, double h) {
+        const int n = mediaFor(im), id = ++shapes;
+        return QStringLiteral("<w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\"><wp:extent cx=\"%1\" cy=\"%2\"/>"
+                              "<wp:docPr id=\"%3\" name=\"Picture %3\"/>%4</wp:inline></w:drawing></w:r>")
+            .arg(emu(w))
+            .arg(emu(h))
+            .arg(id)
+            .arg(picXml(n, emu(w), emu(h), id));
+    };
+    // put where it is on the page - a picture over the text, a line or a box behind it
+    auto anchored = [&](const QRectF &r, const QString &graphic, bool behind, int id) {
+        return QStringLiteral("<w:r><w:drawing><wp:anchor distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" simplePos=\"0\" relativeHeight=\"%1\" behindDoc=\"%2\" "
+                              "locked=\"0\" layoutInCell=\"1\" allowOverlap=\"1\"><wp:simplePos x=\"0\" y=\"0\"/>"
+                              "<wp:positionH relativeFrom=\"page\"><wp:posOffset>%3</wp:posOffset></wp:positionH>"
+                              "<wp:positionV relativeFrom=\"page\"><wp:posOffset>%4</wp:posOffset></wp:positionV>"
+                              "<wp:extent cx=\"%5\" cy=\"%6\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/><wp:wrapNone/>"
+                              "<wp:docPr id=\"%7\" name=\"Shape %7\"/><wp:cNvGraphicFramePr/>%8</wp:anchor></w:drawing></w:r>")
+            .arg(1000 + id)
+            .arg(behind ? 1 : 0)
+            .arg(emu(r.left()))
+            .arg(emu(r.top()))
+            .arg(std::max(1LL, emu(r.width())))
+            .arg(std::max(1LL, emu(r.height())))
+            .arg(id)
+            .arg(graphic);
+    };
+    auto anchoredPic = [&](const Pic &pic) {
+        const int n = mediaFor(pic.image), id = ++shapes;
+        return anchored(pic.box, picXml(n, emu(pic.box.width()), emu(pic.box.height()), id), pic.under, id);
+    };
+    auto anchoredBox = [&](const LineArt &a) {
+        const int id = ++shapes;
+        const QString g = QStringLiteral("<a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">"
+                                         "<a:graphicData uri=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\"><wps:wsp><wps:cNvSpPr/>"
+                                         "<wps:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"%1\" cy=\"%2\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>"
+                                         "<a:solidFill><a:srgbClr val=\"%3\"/></a:solidFill><a:ln><a:noFill/></a:ln></wps:spPr><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic>")
+                              .arg(std::max(1LL, emu(a.rect.width())))
+                              .arg(std::max(1LL, emu(a.rect.height())))
+                              .arg(hexColor(a.color));
+        return anchored(a.rect, g, true, id);
+    };
+    auto biggest = [](const Para &para) {
+        double size = 0;
+        for (const Span &s : para.spans)
+            size = std::max(size, s.size);
+        return size > 0 ? size : 11;
+    };
+    // (its lines' height in Word: the PDF's step between them - one line: as tall as its letters)
+    auto lineOf = [&](const Para &para) { return para.pitch > 0 ? para.pitch : std::max(para.box.height(), biggest(para) * 1.17); };
+    // a paragraph: the room above it, its sides, its lines exactly as far apart as on the page (so a page's text fits
+    // its page), more in front of its words (a comment's start, a tab...)
+    auto paraXml = [&](const Para &para, double before, double left, double right, const QString &jc, const QString &extraPr, const QString &runs) {
+        QString ppr;
+        if (para.heading)
+            ppr += QStringLiteral("<w:pStyle w:val=\"Heading%1\"/>").arg(para.heading);
+        ppr += extraPr;
+        if (para.rtl)
+            ppr += QLatin1String("<w:bidi/>");
+        if (layout)
+            ppr += QStringLiteral("<w:spacing w:before=\"%1\" w:after=\"0\" w:line=\"%2\" w:lineRule=\"exact\"/>").arg(std::max(0, twips(before))).arg(twips(lineOf(para)));
+        if (left > 0 || right > 0)
+            ppr += QStringLiteral("<w:ind w:left=\"%1\" w:right=\"%2\"/>").arg(std::max(0, twips(left))).arg(std::max(0, twips(right)));
+        if (!jc.isEmpty())
+            ppr += QStringLiteral("<w:jc w:val=\"%1\"/>").arg(jc);
+        return QStringLiteral("<w:p><w:pPr>%1</w:pPr>%2</w:p>").arg(ppr, runs);
+    };
+    auto jcOf = [](const Para &para) {
+        return para.align == QLatin1String("center")    ? QStringLiteral("center")
+               : para.align == QLatin1String("justify") ? QStringLiteral("both")
+               : !para.rtl && para.align == QLatin1String("right") ? QStringLiteral("right")
+                                                                   : QString();
+    };
+    auto runsOf = [](const Para &para) {
+        QString runs;
+        for (const Span &s : para.spans)
+            runs += docxRun(s, para.rtl);
+        return runs;
+    };
+    // a spacer: room down to the next thing (and between two tables - Word would make them one)
+    auto spacer = [&](double room) {
+        return QStringLiteral("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"%1\" w:lineRule=\"exact\"/><w:rPr><w:sz w:val=\"2\"/></w:rPr></w:pPr></w:p>")
+            .arg(std::max(20, twips(room)));
+    };
+    // what's in a table's cell: its paragraphs and pictures, where they are in it
+    // (a cell with nothing in it: a paragraph a point high - Word's own would make the row taller than the page's)
+    const QString emptyPara = QStringLiteral("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"20\" w:lineRule=\"exact\"/><w:rPr><w:sz w:val=\"2\"/></w:rPr></w:pPr></w:p>");
+    auto cellContent = [&](const TableCell &cell, double *need) {
+        QString out;
+        double used = cell.box.top() + 1;
+        size_t skip = 0;  // (put on a line with the one before it)
+        for (const Item &it : cell.items) {
+            if (skip > 0) {
+                --skip;
+                continue;
+            }
+            if (it.picture) {
+                if (!o.images)
+                    continue;
+                double w = std::min(it.pic.box.width(), cell.box.width() - 4), h = it.pic.box.height() * w / std::max(1.0, it.pic.box.width());
+                if (h > cell.box.height() - 2)
+                    w *= (cell.box.height() - 2) / h, h = cell.box.height() - 2;
+                const double left = std::max(0.0, it.pic.box.left() - cell.box.left() - 2);
+                out += QStringLiteral("<w:p><w:pPr><w:spacing w:before=\"%1\" w:after=\"0\"/><w:ind w:left=\"%2\"/></w:pPr>%3</w:p>")
+                           .arg(layout ? std::max(0, twips(it.pic.box.top() - used)) : 0)
+                           .arg(twips(left))
+                           .arg(inlinePic(it.pic.image, std::max(1.0, w), std::max(1.0, h)));
+                used = std::max(used, it.pic.box.top()) + h;
+                continue;
+            }
+            // (one-line pieces side by side in it - "☒One ☐Two ☐More than two times": on one line, at tabs)
+            std::vector<const Para *> row{&it.para};
+            QRectF rowBox = it.para.box;
+            for (size_t j = size_t(&it - cell.items.data()) + 1; j < cell.items.size() && it.para.lines == 1; ++j) {
+                const Item &n = cell.items[j];
+                const double over = std::min(rowBox.bottom(), n.para.box.bottom()) - std::max(rowBox.top(), n.para.box.top());
+                if (n.picture || n.para.lines != 1 || over < 0.3 * std::min(rowBox.height(), n.para.box.height()))
+                    break;
+                row.push_back(&n.para);
+                rowBox |= n.para.box;
+            }
+            if (row.size() > 1) {
+                std::sort(row.begin(), row.end(), [](const Para *a, const Para *b) { return a->box.left() < b->box.left(); });
+                Para line;
+                line.box = rowBox;
+                QString tabs, runs;
+                for (size_t m = 0; m < row.size(); ++m) {
+                    if (m > 0) {
+                        tabs += QStringLiteral("<w:tab w:val=\"left\" w:pos=\"%1\"/>").arg(std::max(0, twips(row[m]->box.left() - cell.box.left() - 2)));
+                        runs += QLatin1String("<w:r><w:tab/></w:r>");
+                    }
+                    runs += runsOf(*row[m]);
+                    line.spans.insert(line.spans.end(), row[m]->spans.begin(), row[m]->spans.end());
+                }
+                out += paraXml(line, rowBox.top() - used, row.front()->box.left() - cell.box.left() - 2, 0, QString(),
+                               QStringLiteral("<w:tabs>%1</w:tabs>").arg(tabs), runs);
+                used = std::max(used, rowBox.top()) + lineOf(line);
+                skip = row.size() - 1;
+                continue;
+            }
+            const Para &para = it.para;
+            const QString jc = jcOf(para);
+            const double left = jc.isEmpty() && !para.rtl ? para.box.left() - cell.box.left() - 2 : 0;
+            const double right = para.rtl && jc.isEmpty() ? cell.box.right() - para.box.right() - 2 : 0;
+            out += paraXml(para, para.box.top() - used, left, right, jc, QString(), runsOf(para));
+            used = std::max(used, para.box.top()) + para.lines * lineOf(para);
+        }
+        *need = used - cell.box.top();
+        return out.isEmpty() ? emptyPara : out;
+    };
+    // a table: its columns, its rows as tall as on the page, its cells - merged, their borders and colours
+    auto gridXml = [&](const Grid &g, double room) {
+        const double k = layout ? 1.0 : std::min(1.0, room / std::max(1.0, g.box.width()));
+        QString cols;
+        for (size_t c = 0; c + 1 < g.xs.size(); ++c)
+            cols += QStringLiteral("<w:gridCol w:w=\"%1\"/>").arg(twips((g.xs[c + 1] - g.xs[c]) * k));
+        QString t = QStringLiteral("<w:tbl><w:tblPr><w:tblW w:w=\"%1\" w:type=\"dxa\"/><w:tblInd w:w=\"%2\" w:type=\"dxa\"/><w:tblLayout w:type=\"fixed\"/>"
+                                   "<w:tblCellMar><w:top w:w=\"0\" w:type=\"dxa\"/><w:left w:w=\"40\" w:type=\"dxa\"/><w:bottom w:w=\"0\" w:type=\"dxa\"/>"
+                                   "<w:right w:w=\"40\" w:type=\"dxa\"/></w:tblCellMar></w:tblPr><w:tblGrid>%3</w:tblGrid>")
+                        .arg(twips(g.box.width() * k))
+                        .arg(layout ? std::max(0, twips(g.box.left() - side)) : 0)
+                        .arg(cols);
+        const int rows = int(g.ys.size()) - 1, ncols = int(g.xs.size()) - 1;
+        for (int r = 0; r < rows; ++r) {
+            // (as tall as on the page - exactly, when what's in it fits: rows a little taller would push the page's
+            // things below them on)
+            const double tall = g.ys[size_t(r + 1)] - g.ys[size_t(r)];
+            bool fits = layout;
+            QString tcs;
+            for (int c = 0; c < ncols;) {
+                const TableCell *cell = nullptr;
+                for (const TableCell &x : g.cells)
+                    if (r >= x.row && r < x.row + x.rows && c >= x.col && c < x.col + x.cols)
+                        cell = &x;
+                if (!cell) {
+                    ++c;
+                    continue;
+                }
+                const bool first = r == cell->row, last = r == cell->row + cell->rows - 1;
+                QString pr = QStringLiteral("<w:tcW w:w=\"%1\" w:type=\"dxa\"/>").arg(twips(cell->box.width() * k));
+                if (cell->cols > 1)
+                    pr += QStringLiteral("<w:gridSpan w:val=\"%1\"/>").arg(cell->cols);
+                if (cell->rows > 1)
+                    pr += first ? QStringLiteral("<w:vMerge w:val=\"restart\"/>") : QStringLiteral("<w:vMerge/>");
+                Edge none;
+                pr += QLatin1String("<w:tcBorders>") + borderXml("top", first ? cell->top : none) + borderXml("left", cell->left) +
+                      borderXml("bottom", last ? cell->bottom : none) + borderXml("right", cell->right) + QLatin1String("</w:tcBorders>");
+                if (cell->shade.isValid())
+                    pr += QStringLiteral("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"%1\"/>").arg(hexColor(cell->shade));
+                // (its words in its middle, top to bottom - else from its top)
+                QRectF content;
+                for (const Item &it : cell->items)
+                    content |= it.picture ? it.pic.box : it.para.box;
+                const bool middle = !content.isNull() && std::abs(content.center().y() - cell->box.center().y()) < 2.5;
+                if (middle)
+                    pr += QLatin1String("<w:vAlign w:val=\"center\"/>");
+                QString inside = emptyPara;
+                if (first) {
+                    double need = 0;
+                    if (middle) {  // (centred: no room above it - Word puts it in the middle)
+                        TableCell shifted = *cell;
+                        shifted.box.moveTop(content.top() - 1);
+                        inside = cellContent(shifted, &need);
+                    } else {
+                        inside = cellContent(*cell, &need);
+                    }
+                    fits = fits && (cell->rows > 1 || need <= tall + 0.5);
+                }
+                tcs += QStringLiteral("<w:tc><w:tcPr>%1</w:tcPr>%2</w:tc>").arg(pr, inside);
+                c += cell->cols;
+            }
+            t += QStringLiteral("<w:tr><w:trPr><w:cantSplit/><w:trHeight w:val=\"%1\" w:hRule=\"%2\"/></w:trPr>%3</w:tr>")
+                     .arg(twips(tall))
+                     .arg(fits ? QStringLiteral("exact") : QStringLiteral("atLeast"), tcs);
+        }
+        return t + QLatin1String("</w:tbl>");
+    };
+    auto sectXml = [&](const QSizeF &size, bool next) {
+        return QStringLiteral("<w:sectPr>%1<w:pgSz w:w=\"%2\" w:h=\"%3\"%4/><w:pgMar w:top=\"%5\" w:right=\"%6\" w:bottom=\"%7\" w:left=\"%6\" w:header=\"0\" w:footer=\"0\" w:gutter=\"0\"/></w:sectPr>")
+            .arg(next ? QStringLiteral("<w:type w:val=\"nextPage\"/>") : QString())
+            .arg(twips(size.width()))
+            .arg(twips(size.height()))
+            .arg(size.width() > size.height() ? QStringLiteral(" w:orient=\"landscape\"") : QString())
+            .arg(twips(top))
+            .arg(twips(side))
+            .arg(twips(bottom));
+    };
+    bool newSection = false;  // (a page of another size: its own section - the break already made)
     for (size_t pi = 0; pi < pages.size(); ++pi) {
         const Page &p = pages[pi];
+        const double room = p.size.width() - 2 * side;
         // (its comments: each on the paragraph nearest it)
         std::map<size_t, std::vector<int>> noteAt;
         for (const Note &n : p.notes) {
@@ -614,7 +1468,7 @@ QStringList docxWrite(const std::vector<Page> &pages, const QString &path, const
             double far = 1e18;
             for (size_t k = 0; k < p.items.size(); ++k) {
                 const double d = std::abs(p.items[k].y - n.box.top());
-                if (!p.items[k].picture && d < far)
+                if (!p.items[k].picture && p.items[k].grid < 0 && d < far)
                     far = d, best = k;
             }
             const int id = notes++;
@@ -623,81 +1477,167 @@ QStringList docxWrite(const std::vector<Page> &pages, const QString &path, const
                             .arg(id)
                             .arg(esc(n.text));
         }
-        double lastBottom = margin;
+        auto withNotes = [&](size_t k, QString runs) {
+            const auto ns = noteAt.find(k);
+            if (ns == noteAt.end())
+                return runs;
+            QString start, end;
+            for (int id : ns->second) {
+                start += QStringLiteral("<w:commentRangeStart w:id=\"%1\"/>").arg(id);
+                end += QStringLiteral("<w:commentRangeEnd w:id=\"%1\"/><w:r><w:commentReference w:id=\"%1\"/></w:r>").arg(id);
+            }
+            return start + runs + end;
+        };
+        double used = top;  // (how far down the page Word has got)
+        if (layout) {
+            // the page's first paragraph, a point high: its pictures and its lines and boxes, where they are on it
+            QString anchors;
+            if (p.art.size() <= 600)
+                for (const LineArt &a : p.art)
+                    anchors += anchoredBox(a);
+            if (o.images)
+                for (const Item &it : p.items)
+                    if (it.picture)
+                        anchors += anchoredPic(it.pic);
+            body += QStringLiteral("<w:p><w:pPr>%1<w:spacing w:before=\"0\" w:after=\"0\" w:line=\"20\" w:lineRule=\"exact\"/><w:rPr><w:sz w:val=\"2\"/></w:rPr></w:pPr>%2</w:p>")
+                        .arg(pi > 0 && !newSection ? QStringLiteral("<w:pageBreakBefore/>") : QString(), anchors);
+            used = top + 1;
+        }
+        newSection = false;
         for (size_t k = 0; k < p.items.size(); ++k) {
             const Item &it = p.items[k];
+            if (it.grid >= 0) {
+                const Grid &g = p.grids[size_t(it.grid)];
+                body += spacer(layout ? g.box.top() - used : 6);
+                body += gridXml(g, room);
+                used = std::max(used, g.box.top()) + g.box.height();
+                continue;
+            }
             if (it.picture) {
-                if (!o.images)
-                    continue;
-                const int n = ++images;
-                zip.add(QStringLiteral("word/media/image%1.png").arg(n), pngOf(it.pic.image), false);
-                rels += QStringLiteral("<Relationship Id=\"rIdImg%1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/image%1.png\"/>").arg(n);
+                if (!o.images || layout)
+                    continue;  // (as the page is: put where it is, above)
                 double w = it.pic.box.width(), h = it.pic.box.height();
                 if (w > room)
                     h *= room / w, w = room;
-                const QString spacing = o.flowing ? QString() : QStringLiteral("<w:spacing w:before=\"%1\" w:after=\"0\"/><w:ind w:left=\"%2\"/>")
-                                                                       .arg(std::max(0, int((it.pic.box.top() - lastBottom) * 20)))
-                                                                       .arg(std::max(0, int((it.pic.box.left() - margin) * 20)));
-                body += QStringLiteral("<w:p><w:pPr>%1</w:pPr><w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\"><wp:extent cx=\"%2\" cy=\"%3\"/>"
-                                       "<wp:docPr id=\"%4\" name=\"Picture %4\"/><a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">"
-                                       "<a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"><pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
-                                       "<pic:nvPicPr><pic:cNvPr id=\"%4\" name=\"image%4.png\"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed=\"rIdImg%4\"/>"
-                                       "<a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"%2\" cy=\"%3\"/></a:xfrm>"
-                                       "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>")
-                            .arg(spacing)
-                            .arg(emu(w))
-                            .arg(emu(h))
-                            .arg(n);
-                ++shapes;
-                lastBottom = it.pic.box.top() + h;
+                body += QStringLiteral("<w:p>%1</w:p>").arg(inlinePic(it.pic.image, w, h));
                 continue;
             }
-            const Para &para = it.para;
-            QString ppr;
-            if (para.heading)
-                ppr += QStringLiteral("<w:pStyle w:val=\"Heading%1\"/>").arg(para.heading);
-            if (para.rtl)
-                ppr += QLatin1String("<w:bidi/>");
-            if (!o.flowing) {  // (where it is on the page: the gap above it, its indent)
-                const int before = std::max(0, int((para.box.top() - lastBottom) * 20));
-                const int ind = para.rtl ? std::max(0, int((pageW - margin - para.box.right()) * 20)) : std::max(0, int((para.box.left() - margin) * 20));
-                ppr += QStringLiteral("<w:spacing w:before=\"%1\" w:after=\"0\" w:line=\"%2\" w:lineRule=\"auto\"/>").arg(before).arg(240);
-                ppr += para.rtl ? QStringLiteral("<w:ind w:right=\"%1\"/>").arg(ind) : QStringLiteral("<w:ind w:left=\"%1\"/>").arg(ind);
+            if (!layout) {
+                body += paraXml(it.para, 0, 0, 0, jcOf(it.para), QString(), withNotes(k, runsOf(it.para)));
+                continue;
             }
-            if (para.align == QLatin1String("center"))
-                ppr += QLatin1String("<w:jc w:val=\"center\"/>");
-            else if (para.align == QLatin1String("justify"))
-                ppr += QLatin1String("<w:jc w:val=\"both\"/>");
-            else if (!para.rtl && para.align == QLatin1String("right"))
-                ppr += QLatin1String("<w:jc w:val=\"right\"/>");
-            QString runs;
-            for (const Span &s : para.spans)
-                runs += docxRun(s, para.rtl);
-            const auto ns = noteAt.find(k);
-            if (ns != noteAt.end()) {
-                QString start, end;
-                for (int id : ns->second) {
-                    start += QStringLiteral("<w:commentRangeStart w:id=\"%1\"/>").arg(id);
-                    end += QStringLiteral("<w:commentRangeEnd w:id=\"%1\"/><w:r><w:commentReference w:id=\"%1\"/></w:r>").arg(id);
+            // a paragraph where it is: the room above it, its sides as on the page (lines that wrap: as wide as there,
+            // so Word wraps them where the page does)
+            auto flow = [&](size_t j) {
+                const Para &para = p.items[j].para;
+                const QString jc = jcOf(para);
+                const bool wraps = para.lines > 1 && jc != QLatin1String("center");
+                const double left = jc == QLatin1String("center") ? 0 : para.rtl ? (wraps ? para.box.left() - side - 1 : 0) : para.box.left() - side;
+                const double right = para.rtl ? (jc == QLatin1String("center") ? 0 : p.size.width() - side - para.box.right())
+                                              : wraps ? p.size.width() - side - para.box.right() - 1 : 0;
+                body += paraXml(para, para.box.top() - used, left, right, jc, QString(), withNotes(j, runsOf(para)));
+                used = std::max(used, para.box.top()) + para.lines * lineOf(para);
+            };
+            // ... or in a frame of its own on the page, exactly there - taking no room from the text beside it
+            auto framed = [&](size_t j) {
+                const Para &para = p.items[j].para;
+                const QString frame = QStringLiteral("<w:framePr w:w=\"%1\" w:hAnchor=\"page\" w:vAnchor=\"page\" w:x=\"%2\" w:y=\"%3\" w:wrap=\"around\"/>")
+                                          .arg(twips(para.box.width() + 3))
+                                          .arg(twips(para.box.left() - 1.5))
+                                          .arg(twips(para.box.top()));
+                body += paraXml(para, 0, 0, 0, jcOf(para), frame, withNotes(j, runsOf(para)));
+            };
+            // side by side with it (as the page is): the paragraphs level with it - one line each: on its line, at
+            // tabs where each starts; else columns - the widest flows, the others (a column beside it) in frames
+            std::vector<size_t> band{k};
+            QRectF bandBox = it.para.box;
+            for (size_t j = k + 1; j < p.items.size(); ++j) {
+                const Item &n = p.items[j];
+                if (n.picture)
+                    continue;  // (put where it is, above)
+                if (n.grid >= 0)
+                    break;
+                const double over = std::min(bandBox.bottom(), n.para.box.bottom()) - std::max(bandBox.top(), n.para.box.top());
+                if (over < 0.3 * std::min(bandBox.height(), n.para.box.height()))
+                    break;
+                band.push_back(j);
+                bandBox |= n.para.box;
+            }
+            int rtl = 0;
+            bool oneLine = true;
+            for (size_t j : band) {
+                rtl += p.items[j].para.rtl ? 1 : -1;
+                oneLine = oneLine && p.items[j].para.lines == 1;
+            }
+            std::sort(band.begin(), band.end(), [&](size_t a, size_t b) {
+                return rtl > 0 ? p.items[a].para.box.right() > p.items[b].para.box.right() : p.items[a].para.box.left() < p.items[b].para.box.left();
+            });
+            bool apart = true;  // (side by side: not over each other)
+            for (size_t m = 1; m < band.size(); ++m) {
+                const QRectF &a = p.items[band[m - 1]].para.box, &b = p.items[band[m]].para.box;
+                apart = apart && (rtl > 0 ? b.right() <= a.left() + 2 : b.left() >= a.right() - 2);
+            }
+            if (band.size() > 1 && !oneLine) {
+                size_t main = band.front();
+                for (size_t j : band)
+                    if (p.items[j].para.box.width() > p.items[main].para.box.width())
+                        main = j;
+                const QRectF &m = p.items[main].para.box;
+                std::sort(band.begin(), band.end(), [&](size_t a, size_t b) { return p.items[a].para.box.top() < p.items[b].para.box.top(); });
+                for (size_t j : band) {
+                    const QRectF &r = p.items[j].para.box;
+                    if (j == main || std::min(r.right(), m.right()) - std::max(r.left(), m.left()) > 0.3 * r.width())
+                        flow(j);
+                    else
+                        framed(j);
                 }
-                runs = start + runs + end;
+                k = *std::max_element(band.begin(), band.end());
+                continue;
             }
-            body += QStringLiteral("<w:p><w:pPr>%1</w:pPr>%2</w:p>").arg(ppr, runs);
-            lastBottom = para.box.bottom();
+            if (band.size() == 1 || !apart) {
+                flow(k);
+                continue;
+            }
+            const Para &first = p.items[band.front()].para;
+            if (oneLine) {
+                QString tabs, runs;
+                Para line;  // (the line they make: as tall as the tallest, its letters all theirs)
+                line.rtl = rtl > 0;
+                line.box = bandBox;
+                for (size_t m = 0; m < band.size(); ++m) {
+                    const Para &part = p.items[band[m]].para;
+                    if (m > 0) {
+                        const double at = rtl > 0 ? p.size.width() - side - part.box.right() : part.box.left() - side;
+                        tabs += QStringLiteral("<w:tab w:val=\"left\" w:pos=\"%1\"/>").arg(std::max(0, twips(at)));
+                        runs += QLatin1String("<w:r><w:tab/></w:r>");
+                    }
+                    runs += withNotes(band[m], runsOf(part));
+                    line.spans.insert(line.spans.end(), part.spans.begin(), part.spans.end());
+                }
+                const double start = rtl > 0 ? p.size.width() - side - first.box.right() : first.box.left() - side;
+                body += paraXml(line, bandBox.top() - used, rtl > 0 ? 0 : start, rtl > 0 ? start : 0, QString(),
+                                QStringLiteral("<w:tabs>%1</w:tabs>").arg(tabs), runs);
+                used = std::max(used, bandBox.top()) + lineOf(line);
+            }
+            k = *std::max_element(band.begin(), band.end());
+            // (the band's paragraphs taken: the ones in it read past - they're next to each other in the list)
         }
-        if (!o.flowing && pi + 1 < pages.size())
-            body += QLatin1String("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
+        // a page of another size next: this one's section ends here (the break with it)
+        if (layout && pi + 1 < pages.size() && pages[pi + 1].size != p.size) {
+            body += QStringLiteral("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"20\" w:lineRule=\"exact\"/>%1<w:rPr><w:sz w:val=\"2\"/></w:rPr></w:pPr></w:p>")
+                        .arg(sectXml(p.size, true));
+            newSection = true;
+        }
     }
-    body += QStringLiteral("<w:sectPr><w:pgSz w:w=\"%1\" w:h=\"%2\"/><w:pgMar w:top=\"%3\" w:right=\"%3\" w:bottom=\"%3\" w:left=\"%3\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/></w:sectPr>")
-                .arg(int(pageW * 20))
-                .arg(int(pageH * 20))
-                .arg(int(margin * 20));
+    const QSizeF lastSize = pages.empty() ? QSizeF(612, 792) : pages.back().size;
+    body += sectXml(lastSize, false);
     const QString doc = QString::fromLatin1(kXml) +
                         QStringLiteral("<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
                                        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" "
                                        "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" "
                                        "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" "
-                                       "xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"><w:body>%1</w:body></w:document>")
+                                       "xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\" "
+                                       "xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\"><w:body>%1</w:body></w:document>")
                             .arg(body);
     QString styles = QString::fromLatin1(kXml) +
                      QLatin1String("<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
@@ -706,14 +1646,15 @@ QStringList docxWrite(const std::vector<Page> &pages, const QString &path, const
                                    "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:qFormat/></w:style>");
     for (int h = 1; h <= 3; ++h)
         styles += QStringLiteral("<w:style w:type=\"paragraph\" w:styleId=\"Heading%1\"><w:name w:val=\"heading %1\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>"
-                                 "<w:pPr><w:keepNext/><w:spacing w:before=\"240\" w:after=\"120\"/><w:outlineLvl w:val=\"%2\"/></w:pPr><w:rPr><w:b/><w:bCs/></w:rPr></w:style>")
+                                 "<w:pPr><w:keepNext/><w:spacing w:before=\"240\" w:after=\"120\"/><w:outlineLvl w:val=\"%2\"/></w:pPr>%3</w:style>")
                       .arg(h)
-                      .arg(h - 1);
+                      .arg(h - 1)
+                      .arg(layout ? QString() : QStringLiteral("<w:rPr><w:b/><w:bCs/></w:rPr>"));  // (as the page is: its own look)
     styles += QLatin1String("</w:styles>");
     QString types = QString::fromLatin1(kXml) +
                     QLatin1String("<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
                                   "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
-                                  "<Default Extension=\"xml\" ContentType=\"application/xml\"/><Default Extension=\"png\" ContentType=\"image/png\"/>"
+                                  "<Default Extension=\"xml\" ContentType=\"application/xml\"/><Default Extension=\"png\" ContentType=\"image/png\"/><Default Extension=\"jpeg\" ContentType=\"image/jpeg\"/>"
                                   "<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
                                   "<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>");
     QString docRels = QString::fromLatin1(kXml) +
@@ -741,7 +1682,6 @@ QStringList docxWrite(const std::vector<Page> &pages, const QString &path, const
             *error = zip.error();
         return {};
     }
-    (void)shapes;
     return {path};
 }
 
@@ -2004,7 +2944,7 @@ QStringList run(Document *doc, Format f, const QString &path, const Options &o, 
         switch (f) {
         case Format::Docx:
         case Format::Doc: {
-            const std::vector<Page> pages = readAll(doc, o, pr, o.images, o.comments);
+            const std::vector<Page> pages = readAll(doc, o, pr, o.images, o.comments, 0.6, true);
             check(pr);
             pr.step(0.7, QObject::tr("Writing the document"));
             if (f == Format::Docx)

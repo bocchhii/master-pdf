@@ -113,6 +113,14 @@ struct Bookmark {
     QPointF at;
 };
 
+// The page's straight lines and boxes as it paints them (for the exports: a table's rules, its cells' colours, frames):
+// a filled box (a thin one: a rule), or a straight line drawn across or down - its rect as wide as it's drawn
+struct LineArt {
+    QRectF rect;  // (page points)
+    bool filled = false;
+    QColor color;
+};
+
 // Letters saved as drawn shapes (step 7: Convert to text): where they are, and their shapes
 struct DrawingPart {
     int stream = 0;
@@ -279,6 +287,8 @@ public:
 
     // ---- pictures (step 6) ----
     std::vector<Picture> pictures(int page);
+    // (drawings: where it draws curves, pictures...; hidden: its letters drawn clipped away - not seen)
+    std::vector<LineArt> lineArt(int page, std::vector<QRectF> *drawings = nullptr, std::vector<QPointF> *hidden = nullptr);
     // moved / resized / turned: move is in the page's space as shown (points from its top
     // left); drawn there in the page's own drawing (what's over it stays over it)
     bool transformPicture(int page, const Picture &pic, const QTransform &move, const char *what, QString *error);

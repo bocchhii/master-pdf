@@ -466,6 +466,11 @@ void MainWindow::openSettings()
     row->addWidget(ok);
     page->addLayout(row);
     settingsNotes(&dlg);
+    // (a pixel of room on each label's left: its first letter's stroke - W's, A's, V's - drawn past where it starts,
+    // cut off at the label's edge on a screen scaled 125%)
+    for (QLabel *l : dlg.findChildren<QLabel *>())
+        if (!l->text().isEmpty())
+            l->setContentsMargins(l->contentsMargins() + QMargins(1, 0, 0, 0));
     dlg.exec();
 }
 

@@ -748,6 +748,7 @@ std::vector<TextLine> joinPieces(std::vector<TextLine> lines)
                     m.runs.insert(m.runs.end(), yy.runs.begin(), yy.runs.end());
                     m.text += yText;
                     m.quads.insert(m.quads.end(), y.quads.begin(), y.quads.end());
+                    m.pens.insert(m.pens.end(), y.pens.begin(), y.pens.end());
                     m.block = std::min(x.block, y.block);
                     lines[a] = m;
                     lines.erase(lines.begin() + long(b));
@@ -768,6 +769,7 @@ std::vector<TextLine> joinPieces(std::vector<TextLine> lines)
                 m.runs.insert(m.runs.end(), y.runs.begin(), y.runs.end());
                 m.text = x.text + (space ? QStringLiteral(" ") : QString()) + y.text;
                 m.quads.insert(m.quads.end(), y.quads.begin(), y.quads.end());
+                m.pens.insert(m.pens.end(), y.pens.begin(), y.pens.end());
                 m.rtl = (x.rtl ? ax : 0) + (y.rtl ? ay : 0) >= (x.rtl ? 0 : ax) + (y.rtl ? 0 : ay);
                 m.block = std::min(x.block, y.block);
                 m.baseline = x.baseline;

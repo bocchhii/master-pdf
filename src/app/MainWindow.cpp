@@ -44,12 +44,29 @@
 #include <QStackedWidget>
 #include <QThreadPool>
 #include <QTimer>
+#include <QAbstractButton>
 #include <QVBoxLayout>
 #include <QWhatsThis>
 
 #include <cmath>
 
 namespace {
+
+// the Custom theme's brush in the Theme list: just the brush, no button round it - pressed, it goes in as a button
+// does, a pixel down and right
+class BrushButton : public QAbstractButton {
+public:
+    using QAbstractButton::QAbstractButton;
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        static const QPixmap brush(QStringLiteral(":/icons/brush.png"));
+        QPainter p(this);
+        const int in = isDown() ? 1 : 0;
+        p.drawPixmap((width() - brush.width()) / 2 + in, (height() - brush.height()) / 2 + in, brush);
+    }
+};
 
 constexpr int kMaxHits = 2000;  // (enough to go through)
 constexpr int kSideWidth = 150;
@@ -803,6 +820,28 @@ void MainWindow::fillThemeMenu(QMenu *m)
     custom->setChecked(now == "custom");
     custom->setEnabled(theme::settings().contains("custom_theme"));
     connect(custom, &QAction::triggered, this, [this] { pickTheme(QStringLiteral("custom")); });
+    // (the Custom theme in use: a brush at its item's right end - Settings, where it's made - as Master Converter has)
+    for (QAbstractButton *old : m->findChildren<QAbstractButton *>(QStringLiteral("customBrush"), Qt::FindDirectChildrenOnly))
+        old->deleteLater();
+    if (now != QLatin1String("custom"))
+        return;
+    auto *brush = new BrushButton(m);
+    brush->setObjectName(QStringLiteral("customBrush"));
+    brush->setFocusPolicy(Qt::NoFocus);
+    brush->setCursor(Qt::PointingHandCursor);
+    brush->setToolTip(tr("Change the Custom theme (Settings)"));
+    brush->setWhatsThis(tr("Opens Settings, where the Custom theme's look and title bar colour are chosen."));
+    connect(brush, &QAbstractButton::clicked, this, [this, m] {
+        m->hide();
+        openSettings();
+    });
+    QTimer::singleShot(0, brush, [m, custom, brush] {  // (where the item is, once the list is laid out)
+        const QRect r = m->actionGeometry(custom);
+        const int side = std::max(18, r.height() - 2);
+        brush->setGeometry(r.right() - side - 2, r.top() + (r.height() - side) / 2, side, side);
+        brush->show();
+        brush->raise();
+    });
 }
 
 void MainWindow::fillHelpMenu(QMenu *m)

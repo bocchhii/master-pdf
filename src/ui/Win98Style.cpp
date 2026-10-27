@@ -9,6 +9,7 @@
 #include <QFrame>
 #include <QMenu>
 #include <QPainter>
+#include <QRubberBand>
 #include <QStyleFactory>
 #include <QStyleOption>
 
@@ -237,6 +238,14 @@ void Win98Style::drawControl(ControlElement ce, const QStyleOption *opt, QPainte
         }
         break;
     case CE_RubberBand:  // the splitter being dragged: a dotted bar, like Windows 98's
+        if (const auto *band = qstyleoption_cast<const QStyleOptionRubberBand *>(opt); band && band->shape == QRubberBand::Rectangle) {
+            // (a box dragged round things to pick them: just its dotted edge, as Windows 98's - what's in it seen)
+            const QRectF r = opt->rect;
+            for (const QRectF &edge : {QRectF(r.left(), r.top(), r.width(), 1), QRectF(r.left(), r.bottom(), r.width(), 1),
+                                       QRectF(r.left(), r.top(), 1, r.height()), QRectF(r.right(), r.top(), 1, r.height())})
+                checkered(*p, edge, Qt::black, Qt::white);
+            return;
+        }
         checkered(*p, opt->rect, Qt::black, Qt::white);
         return;
     case CE_Splitter:

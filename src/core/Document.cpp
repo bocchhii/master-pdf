@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <new>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -1323,4 +1324,242 @@ bool Document::save(const QString &path, QString *error)
     path_ = path;
     savedStep_ = journalStep();
     return true;
+}
+
+// ---- the page's straight lines and boxes (for the exports) ----
+
+namespace {
+
+struct ArtGrab {
+    fz_device super;
+    std::vector<LineArt> *out;
+    std::vector<QRectF> *drawings;  // (where it draws curves, slanted lines, pictures, shading)
+    std::vector<QPointF> *hidden;   // (letters drawn outside what's shown - clipped away)
+    QPointF origin;
+    std::vector<fz_rect> clips;     // (what's shown now: the clips' boxes, one in another)
+    fz_rect mask = fz_infinite_rect;
+    void drew(fz_rect r)
+    {
+        if (drawings && !fz_is_empty_rect(r) && !fz_is_infinite_rect(r))
+            drawings->push_back(QRectF(QPointF(r.x0, r.y0) - origin, QPointF(r.x1, r.y1) - origin));
+    }
+    void clip(fz_rect r) { clips.push_back(clips.empty() ? r : fz_intersect_rect(clips.back(), r)); }
+    void letters(const fz_text *text, fz_matrix m)
+    {
+        if (!hidden || clips.empty())
+            return;
+        const fz_rect shown = clips.back();
+        for (const fz_text_span *sp = text->head; sp; sp = sp->next)
+            for (int i = 0; i < sp->len; ++i) {
+                const fz_point q = fz_transform_point_xy(sp->items[i].x, sp->items[i].y, m);
+                if (q.x < shown.x0 - 1 || q.x > shown.x1 + 1 || q.y < shown.y0 - 1 || q.y > shown.y1 + 1)
+                    hidden->push_back(QPointF(q.x, q.y) - origin);
+            }
+    }
+};
+
+// a path's pieces as its corners (a curve: the piece left out - letters, logos, round corners)
+struct Walked {
+    std::vector<std::vector<fz_point>> pieces;
+    bool curved = false;
+};
+
+Walked walk(fz_context *ctx, const fz_path *path)
+{
+    Walked w;
+    fz_path_walker walker = {};
+    walker.moveto = [](fz_context *, void *a, float x, float y) { static_cast<Walked *>(a)->pieces.push_back({{x, y}}); };
+    walker.lineto = [](fz_context *, void *a, float x, float y) {
+        auto &p = static_cast<Walked *>(a)->pieces;
+        if (p.empty())
+            p.push_back({});
+        p.back().push_back({x, y});
+    };
+    walker.curveto = [](fz_context *, void *a, float, float, float, float, float, float) { static_cast<Walked *>(a)->curved = true; };
+    walker.closepath = [](fz_context *, void *a) {
+        auto &p = static_cast<Walked *>(a)->pieces;
+        if (!p.empty() && p.back().size() > 1)
+            p.back().push_back(p.back().front());
+    };
+    walker.rectto = [](fz_context *, void *a, float x0, float y0, float x1, float y1) {
+        static_cast<Walked *>(a)->pieces.push_back({{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}, {x0, y0}});
+    };
+    fz_walk_path(ctx, path, &walker, &w);
+    return w;
+}
+
+QColor rgbOf(fz_context *ctx, fz_colorspace *cs, const float *color, fz_color_params params)
+{
+    if (!cs || !color)
+        return {};
+    float rgb[3] = {0, 0, 0};
+    fz_convert_color(ctx, cs, color, fz_device_rgb(ctx), rgb, nullptr, params);
+    return QColor::fromRgbF(std::clamp(rgb[0], 0.f, 1.f), std::clamp(rgb[1], 0.f, 1.f), std::clamp(rgb[2], 0.f, 1.f));
+}
+
+}  // namespace
+
+std::vector<LineArt> Document::lineArt(int page, std::vector<QRectF> *drawings, std::vector<QPointF> *hidden)
+{
+    std::vector<LineArt> out;
+    QPointF o;
+    fz_display_list *list = keepDisplayList(page, &o);
+    if (!list)
+        return out;
+    fz_context *ctx = threadContext();
+    fz_device *dev = nullptr;
+    fz_var(dev);
+    fz_try(ctx) {
+        auto *d = fz_new_derived_device(ctx, ArtGrab);
+        d->out = &out;
+        d->drawings = drawings;
+        d->hidden = hidden;
+        d->origin = o;
+        new (&d->clips) std::vector<fz_rect>();  // (the device's memory is MuPDF's: its C++ member made here, undone below)
+        d->mask = fz_infinite_rect;
+        // filled: each piece that's a box, across and down
+        d->super.fill_path = [](fz_context *ctx, fz_device *dv, const fz_path *path, int, fz_matrix m, fz_colorspace *cs, const float *color,
+                                float alpha, fz_color_params params) {
+            auto *g = reinterpret_cast<ArtGrab *>(dv);
+            if (alpha < 0.1f)
+                return;
+            const Walked w = walk(ctx, path);
+            const QColor c = rgbOf(ctx, cs, color, params);
+            if (w.curved) {
+                g->drew(fz_bound_path(ctx, path, nullptr, m));
+                return;
+            }
+            if (!c.isValid())
+                return;
+            std::vector<QRectF> boxes;
+            for (const auto &piece : w.pieces) {
+                if (piece.size() < 4 || piece.size() > 5)
+                    continue;
+                QRectF box;
+                bool square = true;
+                for (size_t i = 0; i < piece.size(); ++i) {
+                    const fz_point a = fz_transform_point(piece[i], m), b = fz_transform_point(piece[(i + 1) % piece.size()], m);
+                    square = square && (std::abs(a.x - b.x) < 0.3f || std::abs(a.y - b.y) < 0.3f);
+                    box |= QRectF(QPointF(a.x, a.y) - g->origin, QSizeF(0.001, 0.001));
+                }
+                if (square && box.width() > 0.05 && box.height() > 0.05)
+                    boxes.push_back(box);
+                else if (!square)  // (an arrow's head, a triangle...)
+                    g->drew(fz_bound_path(ctx, path, nullptr, m));
+            }
+            // (a box with a box inside it: a hole - a frame, drawn as a ring - its four sides; boxes in boxes in boxes:
+            // filled, hole, filled... - rings in rings)
+            std::vector<int> depth(boxes.size());
+            for (size_t i = 0; i < boxes.size(); ++i)
+                for (size_t j = 0; j < boxes.size(); ++j)
+                    if (i != j && boxes[j].contains(boxes[i]) && boxes[j] != boxes[i])
+                        ++depth[i];
+            for (size_t j = 0; j < boxes.size(); ++j) {
+                if (depth[j] % 2)
+                    continue;
+                const QRectF &o = boxes[j];
+                bool ring = false;
+                for (size_t i = 0; i < boxes.size(); ++i) {
+                    if (depth[i] != depth[j] + 1 || !o.contains(boxes[i]))
+                        continue;
+                    const QRectF &h = boxes[i];
+                    for (const QRectF &side : {QRectF(QPointF(o.left(), o.top()), QPointF(o.right(), h.top())),
+                                               QRectF(QPointF(o.left(), h.bottom()), QPointF(o.right(), o.bottom())),
+                                               QRectF(QPointF(o.left(), h.top()), QPointF(h.left(), h.bottom())),
+                                               QRectF(QPointF(h.right(), h.top()), QPointF(o.right(), h.bottom()))})
+                        if (side.width() > 0.05 && side.height() > 0.05)
+                            g->out->push_back({side, true, c});
+                    ring = true;
+                }
+                if (!ring)
+                    g->out->push_back({o, true, c});
+            }
+        };
+        // stroked: each piece's straight lines across and down, as wide as they're drawn
+        d->super.stroke_path = [](fz_context *ctx, fz_device *dv, const fz_path *path, const fz_stroke_state *st, fz_matrix m,
+                                  fz_colorspace *cs, const float *color, float alpha, fz_color_params params) {
+            auto *g = reinterpret_cast<ArtGrab *>(dv);
+            if (alpha < 0.1f)
+                return;
+            const Walked w = walk(ctx, path);
+            const QColor c = rgbOf(ctx, cs, color, params);
+            if (!c.isValid())
+                return;
+            const double half = std::max(0.25, double(st ? st->linewidth : 1) * fz_matrix_expansion(m) / 2);
+            bool slanted = w.curved;
+            for (const auto &piece : w.pieces)
+                for (size_t i = 0; i + 1 < piece.size(); ++i) {
+                    const fz_point a = fz_transform_point(piece[i], m), b = fz_transform_point(piece[i + 1], m);
+                    const QPointF p = QPointF(a.x, a.y) - g->origin, q = QPointF(b.x, b.y) - g->origin;
+                    if (std::abs(p.y() - q.y()) < 0.3)
+                        g->out->push_back({QRectF(QPointF(std::min(p.x(), q.x()) - half, p.y() - half), QPointF(std::max(p.x(), q.x()) + half, p.y() + half)), false, c});
+                    else if (std::abs(p.x() - q.x()) < 0.3)
+                        g->out->push_back({QRectF(QPointF(p.x() - half, std::min(p.y(), q.y()) - half), QPointF(p.x() + half, std::max(p.y(), q.y()) + half)), false, c});
+                    else
+                        slanted = true;
+                }
+            if (slanted)
+                g->drew(fz_bound_path(ctx, path, st, m));
+        };
+        // (the clips: what's drawn after them shows only inside them - text outside, clipped away, isn't seen)
+        d->super.clip_path = [](fz_context *ctx, fz_device *dv, const fz_path *path, int, fz_matrix m, fz_rect) {
+            reinterpret_cast<ArtGrab *>(dv)->clip(fz_bound_path(ctx, path, nullptr, m));
+        };
+        d->super.clip_stroke_path = [](fz_context *ctx, fz_device *dv, const fz_path *path, const fz_stroke_state *st, fz_matrix m, fz_rect) {
+            reinterpret_cast<ArtGrab *>(dv)->clip(fz_bound_path(ctx, path, st, m));
+        };
+        d->super.clip_text = [](fz_context *ctx, fz_device *dv, const fz_text *text, fz_matrix m, fz_rect) {
+            reinterpret_cast<ArtGrab *>(dv)->clip(fz_bound_text(ctx, text, nullptr, m));
+        };
+        d->super.clip_stroke_text = [](fz_context *ctx, fz_device *dv, const fz_text *text, const fz_stroke_state *st, fz_matrix m, fz_rect) {
+            reinterpret_cast<ArtGrab *>(dv)->clip(fz_bound_text(ctx, text, st, m));
+        };
+        d->super.clip_image_mask = [](fz_context *, fz_device *dv, fz_image *, fz_matrix m, fz_rect) {
+            reinterpret_cast<ArtGrab *>(dv)->clip(fz_transform_rect(fz_unit_rect, m));
+        };
+        d->super.begin_mask = [](fz_context *, fz_device *dv, fz_rect area, int, fz_colorspace *, const float *, fz_color_params) {
+            reinterpret_cast<ArtGrab *>(dv)->mask = area;
+        };
+        d->super.end_mask = [](fz_context *, fz_device *dv, fz_function *) {
+            auto *g = reinterpret_cast<ArtGrab *>(dv);
+            g->clip(g->mask);
+        };
+        d->super.pop_clip = [](fz_context *, fz_device *dv) {
+            auto *g = reinterpret_cast<ArtGrab *>(dv);
+            if (!g->clips.empty())
+                g->clips.pop_back();
+        };
+        d->super.fill_text = [](fz_context *, fz_device *dv, const fz_text *t, fz_matrix m, fz_colorspace *, const float *, float, fz_color_params) {
+            reinterpret_cast<ArtGrab *>(dv)->letters(t, m);
+        };
+        d->super.stroke_text = [](fz_context *, fz_device *dv, const fz_text *t, const fz_stroke_state *, fz_matrix m, fz_colorspace *, const float *,
+                                  float, fz_color_params) { reinterpret_cast<ArtGrab *>(dv)->letters(t, m); };
+        // (pictures, shading: where they are)
+        d->super.fill_image = [](fz_context *, fz_device *dv, fz_image *, fz_matrix m, float alpha, fz_color_params) {
+            if (alpha >= 0.1f)
+                reinterpret_cast<ArtGrab *>(dv)->drew(fz_transform_rect(fz_unit_rect, m));
+        };
+        d->super.fill_image_mask = [](fz_context *, fz_device *dv, fz_image *, fz_matrix m, fz_colorspace *, const float *, float alpha,
+                                      fz_color_params) {
+            if (alpha >= 0.1f)
+                reinterpret_cast<ArtGrab *>(dv)->drew(fz_transform_rect(fz_unit_rect, m));
+        };
+        d->super.fill_shade = [](fz_context *ctx, fz_device *dv, fz_shade *shade, fz_matrix m, float alpha, fz_color_params) {
+            if (alpha >= 0.1f)
+                reinterpret_cast<ArtGrab *>(dv)->drew(fz_bound_shade(ctx, shade, m));
+        };
+        dev = &d->super;
+        fz_run_display_list(ctx, list, dev, fz_identity, fz_infinite_rect, nullptr);
+        fz_close_device(ctx, dev);
+    }
+    fz_always(ctx) {
+        if (dev)
+            reinterpret_cast<ArtGrab *>(dev)->clips.~vector();
+        fz_drop_device(ctx, dev);
+        fz_drop_display_list(ctx, list);
+    }
+    fz_catch(ctx) {
+        out.clear();
+    }
+    return out;
 }
