@@ -213,6 +213,8 @@ void PageView::fitPage()
 
 void PageView::setZoom(double zoom, QPoint anchor)
 {
+    if (!gliding_ && glideTimer_)  // (zoomed some other way: the glide given up)
+        glideTimer_->stop();
     fit_ = Fit::None;
     zoom = std::clamp(zoom, kMinZoom, kMaxZoom);
     if (!doc_ || std::abs(zoom - zoom_) < 1e-4) {
@@ -517,7 +519,7 @@ void PageView::scrollContentsBy(int dx, int dy)
 void PageView::wheelEvent(QWheelEvent *e)
 {
     if (e->modifiers() & Qt::ControlModifier) {  // (a touchpad's pinch comes this way too)
-        zoomBy(std::pow(1.0015, e->angleDelta().y()), e->position().toPoint());
+        glideZoom(std::pow(1.0015, e->angleDelta().y()), e->position().toPoint());
         e->accept();
         return;
     }
@@ -535,11 +537,35 @@ bool PageView::viewportEvent(QEvent *e)
     if (e->type() == QEvent::NativeGesture) {
         auto *g = static_cast<QNativeGestureEvent *>(e);
         if (g->gestureType() == Qt::ZoomNativeGesture) {
-            zoomBy(1.0 + g->value(), g->position().toPoint());
+            glideZoom(1.0 + g->value(), g->position().toPoint());
             return true;
         }
     }
     return QAbstractScrollArea::viewportEvent(e);
+}
+
+void PageView::glideZoom(double factor, QPoint anchor)
+{
+    if (!glideTimer_) {
+        glideTimer_ = new QTimer(this);
+        glideTimer_->setInterval(15);
+        connect(glideTimer_, &QTimer::timeout, this, [this] {
+            // (a third of the way there each frame - the last of it in one go)
+            const double left = std::log(glideTo_ / zoom_);
+            const bool there = std::abs(left) < 0.003;
+            gliding_ = true;
+            setZoom(there ? glideTo_ : zoom_ * std::exp(left * 0.35), glideAnchor_);
+            gliding_ = false;
+            if (there)
+                glideTimer_->stop();
+        });
+    }
+    if (!glideTimer_->isActive()) {
+        glideTo_ = zoom_;
+        glideTimer_->start();
+    }
+    glideTo_ = std::clamp(glideTo_ * factor, kMinZoom, kMaxZoom);
+    glideAnchor_ = anchor;
 }
 
 // ---- the text: selected, found ----

@@ -1424,7 +1424,7 @@ int PageView::lineAt(int page, QPointF at, bool inBox)
 {
     const std::vector<TextLine> &lines = linesOf(page);
     const double slack = 2 / pixelsPerPoint();
-    for (int n = 0; n < int(lines.size()); ++n) {
+    for (int n = int(lines.size()); n-- > 0;) {  // (lines over each other: the one written last - on top)
         const TextLine &l = lines[size_t(n)];
         QPointF p = at;
         if (std::abs(l.angle) > 0.01) {  // (turned: the point turned back, as the line is read)
@@ -1449,7 +1449,8 @@ int PageView::lineAt(int page, QPointF at, bool inBox)
     }
     const std::vector<pagetext::TextFrame> &fs = framesOf(page);
     const double pad = 2 / pixelsPerPoint();
-    for (const pagetext::TextFrame &f : fs) {
+    for (auto it = fs.rbegin(); it != fs.rend(); ++it) {
+        const pagetext::TextFrame &f = *it;
         if (f.hidden || f.lines.empty())
             continue;
         QPolygonF box;

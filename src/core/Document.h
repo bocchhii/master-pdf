@@ -387,6 +387,7 @@ private:
     std::unordered_map<std::string, struct fz_font *> fzFonts_;
     // (inside an operation, docMutex_ held; page points from the page's top left)
     void removeText(struct pdf_page *pg, int page, const QRectF &rect);
+    bool takeOutLetters(struct pdf_page *pg, int page, const TextLine &line);
     bool retypeFrame(int page, const std::vector<TextLine> &lines, const std::vector<std::vector<int>> &paras,
                      const QString &text, const LineLook &look, const std::vector<std::vector<StyledRun>> *styled,
                      QString *error);

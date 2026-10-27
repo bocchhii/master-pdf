@@ -294,6 +294,12 @@ private:
 
     std::shared_ptr<Document> doc_;
     double zoom_ = 1.0;
+    // a pinch (or Ctrl + wheel): the zoom glides to where it's going, frame by frame, not in jumps
+    void glideZoom(double factor, QPoint anchor);
+    class QTimer *glideTimer_ = nullptr;
+    double glideTo_ = 1.0;
+    QPoint glideAnchor_;
+    bool gliding_ = false;
     Fit fit_ = Fit::Width;  // (a PDF opens fitted to the width)
     int gen_ = 0;  // which zoom the tiles are for: a new one at each zoom
     int serial_ = 0;  // which document: a new one at each file opened

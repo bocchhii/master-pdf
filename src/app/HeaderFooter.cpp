@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <optional>
 
 namespace {
 
@@ -146,9 +147,50 @@ std::vector<Found> findHeaders(Document *doc)
     // 1", "- 1 -", "صفحة ١")
     static const QRegularExpression pageNumber(QStringLiteral("^\\W*(\\w+\\W*){0,1}#(\\W+(\\w+\\W+)?#)?\\W*$"),
                                                QRegularExpression::UseUnicodePropertiesOption);
+    std::vector<bool> kept(groups.size());
+    for (size_t i = 0; i < groups.size(); ++i)
+        kept[i] = groups[i].lines.size() >= enough && (count > 1 || pageNumber.match(groups[i].key).hasMatch());
+    // (or the page's number, on a few of them: short, its number going up with the page - "Page | 17", "P a g e | 1")
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const Found &g = groups[i];
+        if (kept[i] || count == 1 || g.lines.size() < 2 || g.key.size() > 20)
+            continue;
+        std::optional<int> offset;
+        bool going = true;
+        for (const auto &[p, ls] : g.lines) {
+            const std::vector<Number> n = numbersIn(ls.front().text);
+            going = going && n.size() == 1 && (!offset || n[0].value - p == *offset);
+            if (!n.empty())
+                offset = n[0].value - p;
+        }
+        kept[i] = going;
+    }
+    // (and what's in the same row as one of those, on its pages - a part's own title beside the footer, its page
+    // number: a PDF put together from several, each with its own - as small as they are, and short: not the page's own
+    // text come up to its top)
+    for (bool more = count > 1; more;) {
+        more = false;
+        for (size_t i = 0; i < groups.size(); ++i) {
+            if (kept[i])
+                continue;
+            double wide = 0;
+            for (const auto &pl : groups[i].lines)
+                wide = std::max(wide, pl.second.front().rect.width() / doc->pageSize(pl.first).width());
+            for (size_t j = 0; j < groups.size() && !kept[i] && wide < 0.45; ++j) {
+                if (!kept[j] || groups[j].top != groups[i].top || std::abs(groups[j].y - groups[i].y) >= 6 ||
+                    std::abs(groups[j].size - groups[i].size) > 0.6)
+                    continue;
+                size_t shared = 0;
+                for (const auto &pl : groups[i].lines)
+                    shared += groups[j].lines.count(pl.first);
+                kept[i] = more = shared == groups[i].lines.size();
+            }
+        }
+    }
     std::vector<Found> out;
-    for (Found &f : groups) {
-        if (f.lines.size() < enough || (count == 1 && !pageNumber.match(f.key).hasMatch()))
+    for (size_t i = 0; i < groups.size(); ++i) {
+        Found &f = groups[i];
+        if (!kept[i])
             continue;
         // its numbers: the page's own ({page}), the page count ({pages}) - or as they are
         const std::vector<Number> first = numbersIn(f.lines.begin()->second.front().text);
@@ -179,6 +221,20 @@ std::vector<Found> findHeaders(Document *doc)
         out.push_back(f);
     }
     return out;
+}
+
+// a header's or footer's part on one page, as found (its lines top down; none: empty)
+QString slotText(const std::vector<Found> &found, bool top, int slot, int page)
+{
+    std::vector<const Found *> here;
+    for (const Found &f : found)
+        if (f.top == top && f.slot == slot && f.lines.count(page))
+            here.push_back(&f);
+    std::sort(here.begin(), here.end(), [](const Found *x, const Found *y) { return x->top ? x->y < y->y : x->y > y->y; });
+    QStringList text;
+    for (const Found *f : here)
+        text << f->text;
+    return text.join(QLatin1Char('\n'));
 }
 
 QString digitsAs(const QString &number, bool arabic)
@@ -223,7 +279,9 @@ void MainWindow::headerFooterDialog()
         page->addWidget(said);
     }
     // the header's and the footer's text: left, middle, right (more than one line: Enter)
+    // (not the same on every page - each part of the PDF its own: the one on this page shown, else the most common)
     QPlainTextEdit *fields[2][3];
+    const int shownPage = view_->currentPage();
     for (int band = 0; band < 2; ++band) {
         auto *g = new QGroupBox(band == 0 ? tr(" Header ") : tr(" Footer "), body);
         auto *grid = new QGridLayout(g);
@@ -236,15 +294,16 @@ void MainWindow::headerFooterDialog()
             e->setTabChangesFocus(true);
             e->setFixedHeight(QFontMetrics(theme::font()).lineSpacing() * 2 + 12);
             e->setMinimumWidth(150);
-            std::vector<const Found *> here;  // (its lines top down: a footer's y is from the bottom up)
-            for (const Found &f : found)
-                if (f.top == (band == 0) && f.slot == s)
-                    here.push_back(&f);
-            std::sort(here.begin(), here.end(), [](const Found *x, const Found *y) { return x->top ? x->y < y->y : x->y > y->y; });
-            QStringList text;
-            for (const Found *f : here)
-                text << f->text;
-            e->setPlainText(text.join(QLatin1Char('\n')));
+            std::map<QString, int> seen;  // (each text: on how many pages)
+            for (int p = 0; p < count && !found.empty(); ++p)
+                if (const QString t = slotText(found, band == 0, s, p); !t.isEmpty())
+                    ++seen[t];
+            QString text = slotText(found, band == 0, s, shownPage);
+            if (text.isEmpty())
+                for (const auto &[t, pages] : seen)
+                    if (text.isEmpty() || pages > seen[text])
+                        text = t;
+            e->setPlainText(text);
             if (s > 0)  // (typed where it goes: in the middle, at the right)
                 e->document()->setDefaultTextOption(QTextOption(s == 1 ? Qt::AlignHCenter : Qt::AlignRight));
             grid->addWidget(e, 1, s);
@@ -421,6 +480,7 @@ void MainWindow::headerFooterDialog()
     for (int p = first; p <= last && okAll; ++p) {
         // (what was found on it: taken off - found again on this page, as its text is now)
         std::vector<TextLine> old;
+        std::vector<const Found *> own[2][3];  // (and whose it was)
         if (!found.empty()) {
             for (const TextLine &l : doc->lines(p)) {
                 const QSizeF ps = doc->pageSize(p);
@@ -434,6 +494,9 @@ void MainWindow::headerFooterDialog()
                     if (f.top == top && f.key == key && std::abs(f.y - y) < 6) {
                         if (redo[top ? 0 : 1][f.slot])
                             old.push_back(l);
+                        auto &mine = own[top ? 0 : 1][f.slot];
+                        if (std::find(mine.begin(), mine.end(), &f) == mine.end())
+                            mine.push_back(&f);
                         break;
                     }
             }
@@ -446,6 +509,14 @@ void MainWindow::headerFooterDialog()
         for (int b = 0; b < 2 && okAll; ++b)
             for (int s = 0; s < 3 && okAll; ++s) {
                 QString text = texts[b][s];
+                if (text == was[b][s]) {  // (left as it was: each page its own - on the pages it was on)
+                    auto &mine = own[b][s];
+                    std::sort(mine.begin(), mine.end(), [](const Found *x, const Found *y) { return x->top ? x->y < y->y : x->y > y->y; });
+                    QStringList rows;
+                    for (const Found *f : mine)
+                        rows << f->text;
+                    text = rows.join(QLatin1Char('\n'));
+                }
                 if (text.isEmpty() || !redo[b][s])
                     continue;
                 text.replace(QStringLiteral("{page}"), digitsAs(QString::number(p + startAt->value()), arabicNumbers));

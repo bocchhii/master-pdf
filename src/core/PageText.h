@@ -67,6 +67,8 @@ struct TextLine {
     double angle = 0;
     QPointF pivot;
     std::vector<QPolygonF> quads;
+    // (straight: each letter's pen on the page, and the letter - just its own letters taken out, not others over them)
+    std::vector<std::pair<QPointF, char32_t>> pens;
     QPolygonF shown() const;  // (its box's corners as shown: turned)
     const TextRun &mainRun() const;  // the run with the most letters (its look is the line's)
 };

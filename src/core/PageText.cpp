@@ -897,6 +897,8 @@ std::vector<TextLine> lines(const std::vector<TextChar> &chars)
                     line.rect = line.rect.isNull() ? boxOf(c) : (line.rect | boxOf(c));
                 if (!space && turned)
                     line.quads.push_back(c.quad);
+                if (!space && !turned)
+                    line.pens.emplace_back(c.origin, c.c);
                 arabic += isArabic(ch) ? 1 : 0;
                 latin += (ch < 128 && QChar::isLetter(ch)) ? 1 : 0;
                 // a new run where the look changes (its letter spacing too)
@@ -1051,7 +1053,7 @@ std::vector<TextFrame> frames(const std::vector<TextLine> &lines)
         order[i] = int(i);
     std::sort(order.begin(), order.end(), [&](int a, int b) {
         const QRectF &ra = lines[size_t(a)].rect, &rb = lines[size_t(b)].rect;
-        return ra.top() != rb.top() ? ra.top() < rb.top() : ra.left() < rb.left();
+        return ra.top() != rb.top() ? ra.top() < rb.top() : ra.left() != rb.left() ? ra.left() < rb.left() : a < b;
     });
     struct Building {
         std::vector<int> lines;
@@ -1116,8 +1118,11 @@ std::vector<TextFrame> frames(const std::vector<TextLine> &lines)
                     }
                 }
             }
-            if (-0.3 * h < gap && close && sameSize && over >= 0.4 * std::min(r.width(), fr.rect.width()) && linedUp &&
-                (best < 0 || gap < bestGap)) {
+            // (as near as another: the one it was written with - next to it in the page's order; a block put over
+            // another's lines keeps its own)
+            const bool nearer = best < 0 || gap < bestGap - 0.5 ||
+                                (gap < bestGap + 0.5 && std::abs(fr.lines.back() - i) < std::abs(out[size_t(best)].lines.back() - i));
+            if (-0.3 * h < gap && close && sameSize && over >= 0.4 * std::min(r.width(), fr.rect.width()) && linedUp && nearer) {
                 best = f;
                 bestGap = gap;
             }

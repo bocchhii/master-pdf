@@ -483,6 +483,52 @@ void Document::coverText(pdf_page *pg, int page, const QRectF &rect, unsigned pa
     }
 }
 
+// a straight line's own letters taken out of the page's content - on its runs' baselines, as big, inside their boxes:
+// not the other text lying over it or under it (an area taken out took those too). None found: false
+bool Document::takeOutLetters(pdf_page *pg, int page, const TextLine &line)
+{
+    struct Mine {
+        const TextLine *line;
+        fz_matrix page;  // (PDF space -> MuPDF's page space)
+        QPointF o;
+        int taken = 0;
+    };
+    Mine mine{&line, fz_identity, geometry()->origins.at(size_t(page))};
+    pdf_page_transform(ctx_, pg, nullptr, &mine.page);
+    pdf_sanitize_filter_options sopts = {};
+    sopts.opaque = &mine;
+    sopts.text_filter = [](fz_context *, void *opaque, int *ucs, int ucsLen, fz_matrix trm, fz_matrix ctm, fz_rect) -> int {
+        Mine &w = *static_cast<Mine *>(opaque);
+        const fz_matrix m = fz_concat(fz_concat(trm, ctm), w.page);
+        if (std::abs(m.b) > 0.01 * std::abs(m.a) + 1e-6)
+            return 0;  // (turned: not this line's)
+        const QPointF at = QPointF(m.e, m.f) - w.o;
+        const double size = std::sqrt(std::abs(double(m.a) * m.d - double(m.b) * m.c));
+        if (!w.line->pens.empty()) {  // (its letters' own pens, as read: exactly these)
+            for (const auto &[pen, c] : w.line->pens)
+                if (std::abs(pen.x() - at.x()) < 0.35 && std::abs(pen.y() - at.y()) < 0.35 &&
+                    (ucsLen < 1 || char32_t(ucs[0]) == c || c == 0xFFFD || ucs[0] == 0xFFFD)) {
+                    ++w.taken;
+                    return 1;
+                }
+            return 0;
+        }
+        for (const TextRun &r : w.line->runs)
+            if (std::abs(at.y() - r.origin.y()) <= std::max(0.6, 0.15 * r.size) && std::abs(size - r.size) <= 0.3 * r.size &&
+                at.x() >= r.box.left() - 1 && at.x() <= r.box.right() + 0.5) {
+                ++w.taken;
+                return 1;
+            }
+        return 0;
+    };
+    pdf_filter_factory list[2] = {{pdf_new_sanitize_filter, &sopts}, {nullptr, nullptr}};
+    pdf_filter_options opts = {};
+    opts.recurse = 1;
+    opts.filters = list;
+    pdf_filter_page_contents(ctx_, pdf_, pg, &opts);
+    return mine.taken > 0;
+}
+
 void Document::takeOut(pdf_page *pg, int page, const TextLine &line)
 {
     // a scan's text (not drawn - Scan's): the scan's letters under it covered too, with the paper round them
@@ -491,6 +537,8 @@ void Document::takeOut(pdf_page *pg, int page, const TextLine &line)
             coverText(pg, page, line.rect, r.paper);
             break;
         }
+    if (std::abs(line.angle) < 0.01 && takeOutLetters(pg, page, line))
+        return;
     if (std::abs(line.angle) < 0.01 || line.quads.empty()) {
         removeText(pg, page, line.rect);
         return;
