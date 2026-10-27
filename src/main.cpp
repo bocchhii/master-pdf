@@ -18,6 +18,16 @@
 
 namespace {
 
+// (the self-test: how far it got, written as it goes - a build's check that never ends shows where it stopped)
+void selfTestStep(const char *step)
+{
+    if (!QApplication::arguments().contains(QStringLiteral("--self-test")))
+        return;
+    QFile out(qEnvironmentVariable("MASTERPDF_SELFTEST_OUT"));
+    if (!out.fileName().isEmpty() && out.open(QIODevice::Append))
+        out.write(QByteArray("step: ") + step + '\n');
+}
+
 // the build's check (GitHub's, on each system): MasterPDF --self-test file.pdf [shot.png] - the PDF opened, its first page
 // read by the text reader (OCR), the fonts and the reader's languages found next to the program, a picture of the window
 // saved. Exit 0 if it all went; what was found printed (and in the file MASTERPDF_SELFTEST_OUT names). No questions asked.
@@ -29,14 +39,17 @@ int selfTest(QApplication &app, MainWindow &window, const QStringList &args)
     });
     QStringList found, problems;
     QString error;
+    selfTestStep("opening the PDF");
     auto doc = Document::open(args.value(2), &error);
     if (!doc) {
         problems << QStringLiteral("couldn't open %1: %2").arg(args.value(2), error);
     } else {
         window.showDocument(doc, QFileInfo(args.value(2)).fileName());
         found << QStringLiteral("opened: %1 page(s)").arg(doc->pageCount());
+        selfTestStep("drawing its page");
         const QSizeF size = doc->pageSize(0) * 2.0;
         const QImage page = doc->render(0, 2.0, QRect(0, 0, int(size.width()), int(size.height())));
+        selfTestStep("reading it (OCR)");
         QString text;
         for (const ocr::Line &line : ocr::read(page, &error))
             text += line.text + QLatin1Char(' ');
@@ -55,7 +68,9 @@ int selfTest(QApplication &app, MainWindow &window, const QStringList &args)
     else
         found << QStringLiteral("text reader: %1").arg(ocr::languages().join(QLatin1Char('+')));
     int code = 0;
+    selfTestStep("waiting for the window to be drawn");
     QTimer::singleShot(3000, &window, [&] {  // (its pages drawn meanwhile)
+        selfTestStep("saving the picture of the window");
         if (args.size() > 3)
             window.grab().save(args.at(3));
         const QString report = (problems.isEmpty() ? QStringLiteral("ok\n") : QStringLiteral("FAILED\n")) +
@@ -81,6 +96,7 @@ int main(int argc, char *argv[])
     // app's patterns are tiny, nothing's lost
     qputenv("QT_ENABLE_REGEXP_JIT", "0");
     QApplication app(argc, argv);
+    selfTestStep("started");
     QApplication::setApplicationName(QStringLiteral("Master PDF"));
     QApplication::setOrganizationName(QStringLiteral("Master PDF"));
     // the Python app's look: Windows 98, in the theme chosen last time
@@ -93,13 +109,16 @@ int main(int argc, char *argv[])
     icon.addFile(QStringLiteral(":/icons/app16.png"));  // (where it's small: the picture drawn for 16 pixels)
     QApplication::setWindowIcon(icon);
 
+    selfTestStep("looking up the fonts");
     fonts::startScan();  // (the installed fonts looked up in the background)
     for (const QString &folder : {fonts::bundledFolder(), fonts::myFolder()}) {
         QDirIterator it(folder, {QStringLiteral("*.ttf"), QStringLiteral("*.otf")}, QDir::Files, QDirIterator::Subdirectories);
         while (it.hasNext())
             QFontDatabase::addApplicationFont(it.next());
     }
+    selfTestStep("making the window");
     MainWindow window;
+    selfTestStep("showing the window");
     window.show();
     if (theme::settings().value("start_maximized").toBool())
         window.toggleMaximize();

@@ -42,10 +42,27 @@ jobs:
       - name: Self-test
         timeout-minutes: 5
         shell: pwsh   # (not MSYS2's shell: its libraries mustn't be found - only the ones beside the app)
+        # (a library missing, a crash: the app ends with its code - no box left on the screen waiting for a click; still
+        # going after 2 minutes: the screen's picture kept with the run, the windows open listed, how far it got)
         run: |
+          Add-Type -Namespace Win -Name Errors -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint mode);'
+          [Win.Errors]::SetErrorMode(0x8003) | Out-Null
           $env:MASTERPDF_SELFTEST_OUT = "$PWD\selftest.txt"
-          $p = Start-Process dist\MasterPDF.exe -ArgumentList '--self-test','packaging\selftest.pdf','screenshot-windows.png' -Wait -PassThru
-          Get-Content selftest.txt
+          $p = Start-Process dist\MasterPDF.exe -ArgumentList '--self-test','packaging\selftest.pdf','screenshot-windows.png' -PassThru
+          if (-not $p.WaitForExit(120000)) {
+            Write-Output "Still going after 2 minutes - the windows open:"
+            Get-Process | Where-Object { $_.MainWindowTitle } | Format-Table Id, ProcessName, MainWindowTitle -AutoSize | Out-String | Write-Output
+            Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $shot = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            [System.Drawing.Graphics]::FromImage($shot).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $shot.Save("$PWD\screenshot-windows.png")
+            Stop-Process -Id $p.Id -Force
+            if (Test-Path selftest.txt) { Get-Content selftest.txt }
+            exit 1
+          }
+          if (Test-Path selftest.txt) { Get-Content selftest.txt }
+          Write-Output ("exit code: 0x{0:X8}" -f $p.ExitCode)
           if ($p.ExitCode -ne 0) { exit 1 }
       - name: Install Inno Setup
         shell: pwsh
