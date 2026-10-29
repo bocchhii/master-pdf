@@ -288,6 +288,42 @@ QByteArray clipped(const QByteArray &path, const QByteArray &draw, const fz_matr
     return " q " + matrixOp(fz_invert_matrix(c)) + user + "W n " + matrixOp(c) + "/MPclip MP " + draw + " Q ";
 }
 
+// a see-through picture's unseen pixels given the colour of the nearest seen one (from each seen pixel outwards, a
+// step at a time): its colours and its see-through mask are written apart, and drawn small they're each blended -
+// the unseen pixels' black (as an edited picture leaves them) bled into its edge, a grey line round it
+QImage bled(QImage argb)
+{
+    const int w = argb.width(), h = argb.height();
+    if (w == 0 || h == 0)
+        return argb;
+    std::vector<char> done(size_t(w) * size_t(h), 0);
+    std::vector<int> front;
+    for (int y = 0; y < h; ++y) {
+        const QRgb *row = reinterpret_cast<const QRgb *>(argb.constScanLine(y));
+        for (int x = 0; x < w; ++x)
+            if (qAlpha(row[x]) > 0) {
+                done[size_t(y) * size_t(w) + size_t(x)] = 1;
+                front.push_back(y * w + x);
+            }
+    }
+    if (front.empty() || front.size() == size_t(w) * size_t(h))
+        return argb;
+    for (size_t at = 0; at < front.size(); ++at) {
+        const int x = front[at] % w, y = front[at] / w;
+        const QRgb from = reinterpret_cast<const QRgb *>(argb.constScanLine(y))[x];
+        static const int dx[4] = {1, -1, 0, 0}, dy[4] = {0, 0, 1, -1};
+        for (int k = 0; k < 4; ++k) {
+            const int nx = x + dx[k], ny = y + dy[k];
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h || done[size_t(ny) * size_t(w) + size_t(nx)])
+                continue;
+            done[size_t(ny) * size_t(w) + size_t(nx)] = 1;
+            reinterpret_cast<QRgb *>(argb.scanLine(ny))[nx] = qRgba(qRed(from), qGreen(from), qBlue(from), 0);
+            front.push_back(ny * w + nx);
+        }
+    }
+    return argb;
+}
+
 }  // namespace
 
 // ---- the pictures on a page ----
@@ -1406,7 +1442,7 @@ QByteArray pictureBytes(const QString &path, const QImage &image, QString *error
         QByteArray png;
         QBuffer out(&png);
         out.open(QIODevice::WriteOnly);
-        image.save(&out, "PNG");
+        (image.hasAlphaChannel() ? bled(image.convertToFormat(QImage::Format_ARGB32)) : image).save(&out, "PNG");  // (see-through: no grey edge, bled above)
         return png;
     }
     QFile f(path);
@@ -1461,8 +1497,13 @@ bool Document::placePicture(int page, const QString &path, const QImage &image, 
         if (!readable && !probe.isNull())
             bytes = pictureBytes(QString(), probe, error);
     }
+    // (see-through - an edited cut-out, a PNG with its own see-through parts: its colours and its mask written apart, as
+    // they are - MuPDF reading the PNG would make its unseen pixels black, a grey line round it when drawn small)
+    const bool seeThrough = !probe.isNull() && probe.hasAlphaChannel();
     std::lock_guard guard(docMutex_);
-    return onPage(page, replacing ? "replace picture" : "add picture", [&](pdf_page *pg) { placeIn(pg, page, bytes, r, replacing); }, error);
+    return onPage(page, replacing ? "replace picture" : "add picture", [&](pdf_page *pg) {
+        placeIn(pg, page, bytes, r, replacing, seeThrough ? &probe : nullptr);
+    }, error);
 }
 
 // (docMutex_ held, in a change) the picture's bytes added, drawn at r (page points) - in replacing's
@@ -1485,7 +1526,7 @@ void Document::placeIn(pdf_page *pg, int page, const QByteArray &bytes, const QR
     fz_var(colours);
     fz_var(alpha);
     fz_var(mask);
-    const QImage argb = seeThrough ? seeThrough->convertToFormat(QImage::Format_ARGB32) : QImage();
+    const QImage argb = seeThrough ? bled(seeThrough->convertToFormat(QImage::Format_ARGB32)) : QImage();
     fz_try(ctx_) {
         if (seeThrough) {
             const int w = argb.width(), h = argb.height();

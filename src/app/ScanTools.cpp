@@ -2069,8 +2069,14 @@ std::vector<QRect> pictureRegions(const std::vector<Blob> &blobs, const std::vec
 {
     absorbed->assign(text.size(), 0);
     const int pad = int(0.1 * lineH);
+    // (one "word" twice as tall as the page's lines, not like its font, not a word of letters: a logo's shapes read as
+    // letters - its triangles as "AVA", however sure the reader was - its ink the picture's, not a word's)
+    auto shapes = [&](size_t t) { return counts[t] == 1 && !plain[t] && fits[t] < 0.5 && text[t].height() > 1.8 * lineH; };
     auto inWords = [&](const QRect &b) {
         const QPoint c = b.center();
+        for (size_t t = 0; t < text.size(); ++t)
+            if (shapes(t) && text[t].contains(c))
+                return false;
         for (const QRect &w : words)
             if (w.adjusted(-pad, -pad, pad, pad).contains(c))
                 return true;
@@ -2145,8 +2151,9 @@ std::vector<QRect> pictureRegions(const std::vector<Blob> &blobs, const std::vec
     // ("2030" read "2103100", a signature read "لوست") - a picture; one like no font at all touching a picture
     // ("VISION" over "2030"), or one like no font mostly in one - the picture's (a heading in a font none is
     // like - its words read surely, nothing round it - stays text)
+    // (... or a logo's shapes read as letters, above)
     for (size_t t = 0; t < text.size(); ++t)
-        if (counts[t] <= 3 && sures[t] < 60 && surest[t] < 85 && (fits[t] < 0.2 || (fits[t] < 0.35 && !plain[t]))) {
+        if ((counts[t] <= 3 && sures[t] < 60 && surest[t] < 85 && (fits[t] < 0.2 || (fits[t] < 0.35 && !plain[t]))) || shapes(t)) {
             regions.push_back(text[t]);
             (*absorbed)[t] = 1;
         }
@@ -2850,9 +2857,10 @@ std::vector<Document::OcrLine> readPage(Document *doc, int page, QString &langs,
                 bool any = false;
                 for (const QChar c : word)
                     any = any || c.isLetterOrNumber();
-                if (any)
-                    for (const QChar c : word)
-                        (c.isLetter() ? letters : other) += 1;
+                if (any)  // (a sentence's mark at its end - "الأسنان." - is no less a word)
+                    for (qsizetype i = 0; i < word.size(); ++i)
+                        if (!(i == word.size() - 1 && i > 0 && QStringLiteral(".,:;!?،؛؟").contains(word[i])))
+                            (word[i].isLetter() ? letters : other) += 1;
             }
             outPlain.push_back(char(other == 0 && letters >= 4));
         }

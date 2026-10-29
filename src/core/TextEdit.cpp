@@ -485,15 +485,32 @@ void Document::coverText(pdf_page *pg, int page, const QRectF &rect, unsigned pa
 
 // a straight line's own letters taken out of the page's content - on its runs' baselines, as big, inside their boxes:
 // not the other text lying over it or under it (an area taken out took those too). None found: false
+// (the other lines lying over or under the lines about to be taken out: their letters' pens - kept)
+void Document::keepOthers(int page, const std::vector<TextLine> &taking)
+{
+    keepPens_.clear();
+    for (const TextLine &l : lines(page)) {
+        bool mine = false, over = false;
+        for (const TextLine &t : taking) {
+            mine = mine || (t.rect == l.rect && t.text == l.text);
+            over = over || t.rect.intersects(l.rect);
+        }
+        if (!mine && over)
+            for (const auto &pen : l.pens)
+                keepPens_.push_back(pen.first);
+    }
+}
+
 bool Document::takeOutLetters(pdf_page *pg, int page, const TextLine &line)
 {
     struct Mine {
         const TextLine *line;
         fz_matrix page;  // (PDF space -> MuPDF's page space)
         QPointF o;
+        const std::vector<QPointF> *keep;  // (the letters of the other lines over it: theirs, left)
         int taken = 0;
     };
-    Mine mine{&line, fz_identity, geometry()->origins.at(size_t(page))};
+    Mine mine{&line, fz_identity, geometry()->origins.at(size_t(page)), &keepPens_};
     pdf_page_transform(ctx_, pg, nullptr, &mine.page);
     pdf_sanitize_filter_options sopts = {};
     sopts.opaque = &mine;
@@ -504,15 +521,18 @@ bool Document::takeOutLetters(pdf_page *pg, int page, const TextLine &line)
             return 0;  // (turned: not this line's)
         const QPointF at = QPointF(m.e, m.f) - w.o;
         const double size = std::sqrt(std::abs(double(m.a) * m.d - double(m.b) * m.c));
-        if (!w.line->pens.empty()) {  // (its letters' own pens, as read: exactly these)
-            for (const auto &[pen, c] : w.line->pens)
-                if (std::abs(pen.x() - at.x()) < 0.35 && std::abs(pen.y() - at.y()) < 0.35 &&
-                    (ucsLen < 1 || char32_t(ucs[0]) == c || c == 0xFFFD || ucs[0] == 0xFFFD)) {
-                    ++w.taken;
-                    return 1;
-                }
-            return 0;
-        }
+        // (its letters' own pens, as read: these)
+        for (const auto &[pen, c] : w.line->pens)
+            if (std::abs(pen.x() - at.x()) < 0.35 && std::abs(pen.y() - at.y()) < 0.35 &&
+                (ucsLen < 1 || char32_t(ucs[0]) == c || c == 0xFFFD || ucs[0] == 0xFFFD)) {
+                ++w.taken;
+                return 1;
+            }
+        // (... and whatever else is on its line where it is - a scan's hidden copy of its words, under them - but
+        // another line's letters, one it lies over or under)
+        for (const QPointF &pen : *w.keep)
+            if (std::abs(pen.x() - at.x()) < 0.35 && std::abs(pen.y() - at.y()) < 0.35)
+                return 0;
         for (const TextRun &r : w.line->runs)
             if (std::abs(at.y() - r.origin.y()) <= std::max(0.6, 0.15 * r.size) && std::abs(size - r.size) <= 0.3 * r.size &&
                 at.x() >= r.box.left() - 1 && at.x() <= r.box.right() + 0.5) {
@@ -1049,10 +1069,12 @@ bool Document::moveLines(int page, const std::vector<TextLine> &lines, QPointF b
         }
         all.push_back(pieces);
     }
+    keepOthers(page, lines);
     std::lock_guard guard(docMutex_);
     return onPage(page, "move", [&](pdf_page *pg) {
         for (const TextLine &line : lines)
             takeOut(pg, page, line);
+        keepPens_.clear();
         for (size_t k = 0; k < lines.size(); ++k) {
             setTurn(lines[k].angle, lines[k].pivot + by);
             for (const Piece &p : all[k])
@@ -1064,10 +1086,12 @@ bool Document::moveLines(int page, const std::vector<TextLine> &lines, QPointF b
 
 bool Document::deleteLines(int page, const std::vector<TextLine> &lines, QString *error)
 {
+    keepOthers(page, lines);
     std::lock_guard guard(docMutex_);
     return onPage(page, "delete text", [&](pdf_page *pg) {
         for (const TextLine &line : lines)
             takeOut(pg, page, line);
+        keepPens_.clear();
     }, error);
 }
 
