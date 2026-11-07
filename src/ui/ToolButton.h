@@ -11,6 +11,7 @@ class ToolButton : public QWidget {
     Q_OBJECT
 public:
     static constexpr int W = 23, H = 22, ARROW_W = 11;
+    bool wordsOnly() const { return icon_.isEmpty() && image_.isNull() && !label_.isEmpty(); }  // (no picture: no place kept for one)
 
     ToolButton(const QString &icon, const QString &tip, const QString &note = {},
                bool split = false, const QString &label = {}, QWidget *parent = nullptr);

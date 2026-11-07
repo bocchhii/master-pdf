@@ -111,6 +111,25 @@ constexpr int FX = 212, FY = 7, FW = 175, FH = 187;
 constexpr int BX = 404, BW = 10;
 constexpr int PX = 212, PY = 204, PW = 58, PH = 44;
 
+}  // namespace
+
+void paintColorTag(QPainter &p, QPoint at, const QColor &c)
+{
+    p.save();
+    p.translate(at);
+    p.fillRect(QRect(0, 0, 18, 18), c.isValid() ? c : QColor(Qt::white));
+    p.setPen(Qt::black);
+    p.setBrush(Qt::NoBrush);
+    p.drawRect(QRectF(0.5, 0.5, 17, 17));
+    p.fillRect(QRect(18, 0, 66, 18), QColor("#FFFFE1"));
+    p.drawRect(QRectF(18.5, 0.5, 65, 17));
+    p.setFont(theme::font());
+    p.drawText(QRect(18, 0, 66, 18), Qt::AlignCenter, c.isValid() ? c.name().toUpper() : QString());
+    p.restore();
+}
+
+namespace {
+
 // the eyedropper's layer: over every screen, all but see-through - the screen as it was a moment ago read
 // under the mouse; a click takes the colour, Esc or a right-click puts back the one there was
 class Dropper : public QWidget {
@@ -197,13 +216,7 @@ private:
         pm.setDevicePixelRatio(tag_->devicePixelRatioF());
         pm.fill(Qt::transparent);
         QPainter p(&pm);
-        p.fillRect(QRect(0, 0, 18, 18), tagColor_.isValid() ? tagColor_ : Qt::white);
-        p.setPen(Qt::black);
-        p.drawRect(QRectF(0.5, 0.5, 17, 17));
-        p.fillRect(QRect(18, 0, 66, 18), QColor("#FFFFE1"));
-        p.drawRect(QRectF(18.5, 0.5, 65, 17));
-        p.setFont(theme::font());
-        p.drawText(QRect(18, 0, 66, 18), Qt::AlignCenter, tagColor_.isValid() ? tagColor_.name().toUpper() : QString());
+        paintColorTag(p, QPoint(0, 0), tagColor_);
         p.end();
         QPalette pal = tag_->palette();
         pal.setBrush(QPalette::Window, pm);

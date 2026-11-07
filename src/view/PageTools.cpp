@@ -698,6 +698,15 @@ void drawMoveGuide(QPainter &p, const QPolygonF &ghost, const QRectF &view, cons
     p.restore();
 }
 
+// how a picture is turned on the page, as it shows (degrees clockwise): 0 with its rotate handle straight up
+double shownTurn(const Picture &pic)
+{
+    if (pic.corners.size() != 4)
+        return 0;
+    const QPointF up = (pic.corners[0] + pic.corners[1]) / 2 - (pic.corners[0] + pic.corners[1] + pic.corners[2] + pic.corners[3]) / 4;
+    return std::hypot(up.x(), up.y()) < 1e-9 ? 0 : std::atan2(up.x(), -up.y()) * 180 / M_PI;
+}
+
 void drawPicked(QPainter &p, const QPolygonF &poly, const QPointF &turn, bool handles, const QColor &sel)
 {
     p.save();
@@ -718,11 +727,14 @@ void drawPicked(QPainter &p, const QPolygonF &poly, const QPointF &turn, bool ha
         white.setCapStyle(Qt::RoundCap);
         p.setPen(white);
         p.setBrush(Qt::NoBrush);
-        p.drawArc(QRectF(turn - QPointF(4, 4), QSizeF(8, 8)), 50 * 16, 280 * 16);
-        const QPointF end = turn + QPointF(4 * std::cos(50 * M_PI / 180), -4 * std::sin(50 * M_PI / 180));
+        p.drawArc(QRectF(turn - QPointF(4, 4), QSizeF(8, 8)), 70 * 16, 280 * 16);
+        // (its head where the circle ends near the top, going on round it clockwise)
+        const double at = 70 * M_PI / 180;
+        const QPointF out(std::cos(at), -std::sin(at)), along(std::sin(at), std::cos(at));
+        const QPointF end = turn + out * 4;
         p.setPen(Qt::NoPen);
         p.setBrush(QColor("#FFFFFE"));
-        p.drawPolygon(QPolygonF({end + QPointF(-2.6, -1.2), end + QPointF(1.9, -1.9), end + QPointF(0.9, 2.6)}));
+        p.drawPolygon(QPolygonF({end + out * 2.4, end - out * 2.4, end + along * 3.4}));
     }
     if (handles && poly.size() == 4) {
         p.setPen(QPen(sel, 1.2));
@@ -965,10 +977,11 @@ void PageView::paintTool(QPainter &p)
                 else
                     p.drawPolygon(moved);
                 if (press_ == Press::TurnPic) {
-                    const double a = std::atan2(t.m12(), t.m11()) * 180 / M_PI;
+                    // (its angle on the page, as the text's: 0 upright - not how far this drag has gone)
+                    const double a = shownTurn(pic) + std::atan2(t.m12(), t.m11()) * 180 / M_PI;
                     p.setPen(theme::selection().first);
                     p.setFont(theme::font());
-                    p.drawText(QPointF(moveTo_) + QPointF(14, 14), QStringLiteral("%1°").arg(std::lround(a)));
+                    p.drawText(QPointF(moveTo_) + QPointF(14, 14), QStringLiteral("%1°").arg(std::lround(std::fmod(a + 540, 360) - 180)));
                 }
             }
         }
@@ -3910,14 +3923,17 @@ QTransform PageView::pictureMove() const
         const QPointF cv = (QPointF(toView(picPage_, c)) ) / ppp;
         double angle = (std::atan2(b.y() - cv.y(), b.x() - cv.x()) - std::atan2(a.y() - cv.y(), a.x() - cv.x())) * 180 / M_PI;
         angle = std::fmod(angle + 540, 360) - 180;
+        // (what settles is its angle on the page: upright, 15, 30... wherever the drag began)
+        const double was = shownTurn(pic);
+        double to = was + angle;
         if (QApplication::keyboardModifiers() & Qt::ShiftModifier)
-            angle = std::round(angle / 15) * 15;
+            to = std::round(to / 15) * 15;
         else {
-            const double near15 = std::round(angle / 15) * 15;
-            angle = std::abs(angle - near15) <= 2 ? near15 : std::round(angle);
+            const double near15 = std::round(to / 15) * 15;
+            to = std::abs(to - near15) <= 2 ? near15 : std::round(to);
         }
         QTransform r;
-        r.rotate(angle);
+        r.rotate(to - was);
         return QTransform::fromTranslate(-c.x(), -c.y()) * r * QTransform::fromTranslate(c.x(), c.y());
     }
     // a corner: from the opposite one

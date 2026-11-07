@@ -1,3 +1,5 @@
+#include "app/FileTypes.h"
+#include <cstring>
 #include "app/MainWindow.h"
 #include "core/Document.h"
 #include "core/Fonts.h"
@@ -91,6 +93,13 @@ int selfTest(QApplication &app, MainWindow &window, const QStringList &args)
 
 int main(int argc, char *argv[])
 {
+    // (the installer's: Master PDF offered for PDF files, or no longer - and nothing else, no window)
+    if (argc == 2 && std::strcmp(argv[1], "--register-file-types") == 0)
+        return filetypes::registerApp() ? 0 : 1;
+    if (argc == 2 && std::strcmp(argv[1], "--unregister-file-types") == 0) {
+        filetypes::unregisterApp();
+        return 0;
+    }
     // no JIT for regular expressions: the code it makes faults on purpose (Windows handles it),
     // which stops a debugger (F5) with SIGSEGV in pcre2 when the font index starts - and the
     // app's patterns are tiny, nothing's lost

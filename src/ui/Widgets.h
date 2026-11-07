@@ -126,6 +126,9 @@ void setAutoAnswer(std::function<QString(const QString &message, const QStringLi
 // The colour picker - Windows 98's "Edit Colors" box, as the Python app's (ColorDialog.cpp). Invalid if
 // cancelled. (beside: opened off to the right of its window, not centred over it)
 QColor colorDialog(QWidget *owner, const QString &title, const QColor &initial, bool beside = false);
+// the eyedropper's tag beside the mouse: the colour under it and its number (no colour: an empty one)
+inline constexpr int kColorTagW = 84, kColorTagH = 18;
+void paintColorTag(QPainter &p, QPoint at, const QColor &c);
 // Words typed in a box (a sticky note's); null if cancelled
 QString textDialog(QWidget *owner, const QString &title, const QString &prompt, const QString &text);
 

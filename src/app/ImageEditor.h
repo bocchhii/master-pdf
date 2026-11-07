@@ -2,6 +2,7 @@
 
 #include "ui/ClassicWindow.h"
 
+#include <QElapsedTimer>
 #include <QImage>
 #include <QPainterPath>
 #include <QPolygonF>
@@ -16,6 +17,7 @@ class QComboBox;
 class QEventLoop;
 class QMenu;
 class QMenuBar;
+class QScrollBar;
 class StatusPanel;
 class QLabel;
 class QSpinBox;
@@ -57,6 +59,7 @@ public:
     void canvasRelease(class QMouseEvent *e);
     void canvasDoubleClick(class QMouseEvent *e);
     void canvasWheel(class QWheelEvent *e);
+    void canvasPinch(double k, QPointF at) { zoomBy(k, at); }
     void canvasResized();
     void canvasLeft();
 
@@ -80,6 +83,7 @@ private:
     void setColors(QColor fg, QColor bg);  // (the colour box's: the two colours drawn with)
     void refreshTools();
     Qt::CursorShape toolCursor() const;
+    void setAltDown(bool down);  // (the Alt key: with the brush, the eyedropper)
     void refreshStatus(QPointF imagePoint = QPointF(-1, -1));
     void remember();  // (what it is now: one step for Undo)
     void undo();
@@ -90,6 +94,9 @@ private:
     QPointF toView(QPointF image) const;
     void fit();
     void zoomBy(double k, QPointF at);
+    void scrollBy(QPointF by);
+    void keepInView();  // (the picture no further out than the bars go; all of it in view, in the middle)
+    void syncBars();    // (the bars: where the picture is now)
 
     // the selection: 0..255 a pixel (null: none - everything)
     void select(const QImage &mask, Mode mode);
@@ -108,7 +115,8 @@ private:
     void paintStroke(const QRect &area);
 
     void fill(QPoint at);
-    void pick(QPoint at);
+    QColor colourAt(QPointF at) const;  // (off the picture or see-through: none)
+    void pick(QPointF at);              // (the colour there, for the left button)
     void deleteSelected();
     void cropTo(const QRect &r);
     void cropToSelection();
@@ -159,6 +167,8 @@ private:
     int changes_ = 0;  // (since opened: asked about when closed)
 
     class Canvas *canvas_ = nullptr;
+    QScrollBar *hbar_ = nullptr, *vbar_ = nullptr;
+    bool syncing_ = false;  // (the bars being set from the picture: not the other way round)
     double zoom_ = 1;
     QPointF offset_;  // (the picture's top left in the canvas)
     Tool tool_ = Tool::Brush;
@@ -183,6 +193,13 @@ private:
     std::vector<QPointF> lasso_;
     Mode mode_ = Mode::New;
     QPointF mouse_{-1, -1};  // (the canvas: where the mouse is - the brush's ring)
+    // Alt: with the brush, the colour under the mouse taken instead of drawing; with the right button, the brush's
+    // size and hardness dragged - shown where the button went down, as they were when it did
+    bool altDown_ = false, picking_ = false, sizing_ = false;
+    QPointF sizeAt_;
+    int sizeWas_ = 0, hardWas_ = 0;
+    // (a touchpad's pinch comes as Ctrl + the wheel: when Ctrl went down, when one last came)
+    QElapsedTimer ctrlPressed_, pinched_;
     // a stroke being painted
     QImage base_, cover_;
     QPointF lastDab_;

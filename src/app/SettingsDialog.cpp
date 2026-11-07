@@ -3,6 +3,7 @@
 // the window opens, the ? button, the version.
 
 #include "app/MainWindow.h"
+#include "app/FileTypes.h"
 #include "ui/WhatsThis.h"
 #include "ui/Sounds.h"
 #include <map>
@@ -27,6 +28,7 @@
 #include <QFileInfo>
 #include <QFontDatabase>
 #include <QGroupBox>
+#include <QScreen>
 #include <QHBoxLayout>
 #include <QJsonObject>
 #include <QLabel>
@@ -409,6 +411,49 @@ void MainWindow::openSettings()
         pair->addWidget(h, 1);
         page->addLayout(pair);
     }
+    // what opens PDF files: only the user can choose that - on Windows' own page, which this button opens at Master PDF
+    if (filetypes::supported()) {
+        auto *g = group(tr("PDF files"), body);
+        auto *l = new QVBoxLayout(g);
+        auto *row = new QHBoxLayout;
+        auto *state = new QLabel(g);
+        row->addWidget(state);
+        row->addStretch();
+        auto *make = new ClassicButton(tr("Make default..."), g);
+        make->setToolTip(tr("Opens Windows' default apps at Master PDF: click .pdf there and choose it"));
+        make->setWhatsThis(tr("Master PDF is offered in Open with whatever you choose here. This opens Windows' default apps at Master PDF: click .pdf there and choose Master PDF, and PDF files open in it when you double-click them."));
+        row->addWidget(make);
+        l->addLayout(row);
+        auto *status = new QLabel(g);
+        status->setFont(theme::font());
+        status->setWordWrap(true);
+        status->hide();
+        l->addWidget(status);
+        const auto refresh = [state, make, status] {
+            const bool can = filetypes::available(), is = can && filetypes::isDefault();
+            state->setText(!can ? tr("This copy runs from the source code, so Windows can't open files in it.")
+                           : is ? tr("Master PDF opens your PDF files.")
+                                : tr("Another app opens your PDF files."));
+            make->setEnabled(can && !is);
+            if (is)
+                status->hide();
+        };
+        refresh();
+        // (back from Windows' page: what was chosen there)
+        connect(qApp, &QGuiApplication::applicationStateChanged, g, [refresh](Qt::ApplicationState s) {
+            if (s == Qt::ApplicationActive)
+                refresh();
+        });
+        connect(make, &QPushButton::clicked, g, [status] {
+            filetypes::registerApp();
+            const bool opened = filetypes::openDefaultsPage();
+            status->setStyleSheet(opened ? QStringLiteral("color: #666666") : QStringLiteral("color: #C00000"));
+            status->setText(opened ? tr("Windows has to confirm it: on the page it opened, click .pdf and choose Master PDF.")
+                                   : tr("Windows' default apps couldn't be opened - find them in Windows' Settings, under Apps."));
+            status->show();
+        });
+        page->addWidget(g);
+    }
     // the version, and checking for a newer one (as the Python app's: what was found said under it - a newer one offered
     // straight away)
     {
@@ -424,9 +469,11 @@ void MainWindow::openSettings()
         auto *status = new QLabel(g);
         status->setFont(theme::font());
         status->setWordWrap(true);
+        status->hide();  // (no room taken until there's something to say)
         l->addWidget(status);
         connect(check, &QPushButton::clicked, &dlg, [this, check, status, &dlg] {
             check->setEnabled(false);
+            status->show();
             status->setStyleSheet(QStringLiteral("color: #666666"));
             status->setText(tr("Checking for updates..."));
             QPointer<QLabel> alive(status);
@@ -471,6 +518,11 @@ void MainWindow::openSettings()
     for (QLabel *l : dlg.findChildren<QLabel *>())
         if (!l->text().isEmpty())
             l->setContentsMargins(l->contentsMargins() + QMargins(1, 0, 0, 0));
+    // (a short screen: the notes under the settings give way, for OK to stay on it)
+    if (dlg.sizeHint().height() > screen()->availableGeometry().height())
+        for (QWidget *w : dlg.findChildren<QWidget *>())
+            if (dynamic_cast<EngravedLabel *>(w))
+                w->hide();
     dlg.exec();
 }
 

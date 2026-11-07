@@ -56,9 +56,15 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon
 
 [Run]
+; offered for PDF files - Open with, Windows' default apps, the right-click menu: written by the app itself, for the
+; user installing it (an update too: every version does this)
+Filename: "{app}\{#MyAppExe}"; Parameters: "--register-file-types"; Flags: runhidden waituntilterminated runasoriginaluser
 Filename: "{app}\{#MyAppExe}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 ; after a silent install (the in-app update), start the new version straight away
 Filename: "{app}\{#MyAppExe}"; Flags: nowait; Check: WizardSilent
+
+[UninstallRun]
+Filename: "{app}\{#MyAppExe}"; Parameters: "--unregister-file-types"; Flags: runhidden waituntilterminated; RunOnceId: "UnregisterFileTypes"
 
 [Code]
 { The in-app update runs this installer silently once the app has closed (a small helper waits for it). If the app

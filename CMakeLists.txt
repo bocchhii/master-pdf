@@ -48,6 +48,7 @@ add_executable(MasterPDF WIN32 MACOSX_BUNDLE
     src/main.cpp
     src/app/Updates.h
     src/app/Updates.cpp
+    src/app/FileTypes.cpp
     src/app/UpdateTools.cpp
     src/app/HomePage.cpp
     src/app/OrganizeView.cpp
@@ -135,6 +136,8 @@ add_executable(MasterPDF WIN32 MACOSX_BUNDLE
 )
 if(WIN32)
     target_sources(MasterPDF PRIVATE resources/app.rc)  # (the program's icon)
+    # (made again when the icon changes: the resource compiler doesn't say it reads it)
+    set_source_files_properties(resources/app.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/icons/app.ico;${CMAKE_CURRENT_SOURCE_DIR}/resources/icons/pdf_file.ico")
 endif()
 if(APPLE)
     set_target_properties(MasterPDF PROPERTIES
@@ -168,7 +171,7 @@ if(MUPDF_THIRD_LIB)
 endif()
 target_link_libraries(MasterPDF PRIVATE Qt6::Widgets Qt6::Network ${MUPDF_LIBS} ${MUPDF_DEPS} ${TESSERACT_LIB} ${LEPTONICA_LIB} ${POTRACE_LIB})
 if(WIN32)
-    target_link_libraries(MasterPDF PRIVATE dwmapi winmm)
+    target_link_libraries(MasterPDF PRIVATE dwmapi winmm shlwapi)
 endif()
 if(UNIX)
     find_package(Threads REQUIRED)

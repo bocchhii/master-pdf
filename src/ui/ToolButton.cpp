@@ -21,19 +21,21 @@ ToolButton::ToolButton(const QString &icon, const QString &tip, const QString &n
 QSize ToolButton::sizeHint() const
 {
     const int labelW = label_.isEmpty() ? 0 : QFontMetrics(theme::font()).horizontalAdvance(label_) + 6;
-    return {W + (split_ ? ARROW_W : 0) + labelW, H};
+    return {(wordsOnly() ? 6 : W) + (split_ ? ARROW_W : 0) + labelW, H};
 }
 
 void ToolButton::setIcon(const QString &name)
 {
     icon_ = name;
     image_ = QImage();
+    setFixedSize(sizeHint());
     update();
 }
 
 void ToolButton::setImage(const QImage &image)
 {
     image_ = image;
+    setFixedSize(sizeHint());
     update();
 }
 
@@ -63,7 +65,10 @@ void ToolButton::paintEvent(QPaintEvent *)
     const int split = split_ ? ARROW_W : 0;
     const int cx = label_.isEmpty() ? (w - split) / 2 : W / 2;
     const QRectF pic(cx - 8 + o, h / 2 - 8 + o, 16, 16);
-    if (greyBlues_)  // (its dark blues grey, in every theme)
+    const bool words = wordsOnly();
+    if (words)
+        ;  // (nothing to show but its words)
+    else if (greyBlues_)  // (its dark blues grey, in every theme)
         icons::draw(p, pic, classic::greyBlues(image_.isNull() ? icons::best(icon_) : image_, theme::dark()), enabled, whiten_);
     else if (!image_.isNull())
         icons::draw(p, pic, image_, enabled, whiten_);
@@ -71,12 +76,14 @@ void ToolButton::paintEvent(QPaintEvent *)
         icons::draw(p, pic, icon_, enabled, whiten_);
     if (!label_.isEmpty()) {
         p.setFont(theme::font());
-        const QRectF r(W - 2 + o, o, w - W, h);
+        // (beside its picture - or alone, in the middle)
+        const QRectF r = words ? QRectF(o, o, w - split, h) : QRectF(W - 2 + o, o, w - W, h);
+        const int place = (words ? Qt::AlignHCenter : Qt::AlignLeft) | Qt::AlignVCenter;
         if (enabled) {
             p.setPen(theme::text());
-            classic::crispText(p, r, Qt::AlignLeft | Qt::AlignVCenter, label_);
+            classic::crispText(p, r, place, label_);
         } else {
-            classic::engravedText(p, r, Qt::AlignLeft | Qt::AlignVCenter, label_);
+            classic::engravedText(p, r, place, label_);
         }
     }
     if (split_) {  // the arrow part: a small triangle, a line between when raised

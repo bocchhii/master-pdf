@@ -31,10 +31,12 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QMouseEvent>
+#include <QNativeGestureEvent>
 #include <QPainter>
 #include <QPushButton>
 #include <QRegion>
 #include <QScreen>
+#include <QScrollBar>
 #include <QSpinBox>
 #include <QTimer>
 #include <QWheelEvent>
@@ -90,6 +92,19 @@ double falloff(double t, double hard)
     return 1 - u * u * (3 - 2 * u);
 }
 
+// how far the picture can go along the canvas: its edge a little way in, room for the canvas's handles; if it all fits, in
+// the middle (lo, hi: the picture's offset)
+void panRange(double view, double content, double *lo, double *hi)
+{
+    const double pad = 12;
+    if (content + 2 * pad <= view) {
+        *lo = *hi = (view - content) / 2;
+    } else {
+        *lo = view - content - pad;
+        *hi = pad;
+    }
+}
+
 }  // namespace
 
 // ---- the canvas: the picture over a checkered see-through ground ----
@@ -105,6 +120,22 @@ public:
     }
 
 protected:
+    bool event(QEvent *e) override
+    {
+        // (Alt is the tools' here: let go, the menu bar doesn't take the keys - Alt + a menu's letter still opens it)
+        if (e->type() == QEvent::ShortcutOverride && static_cast<QKeyEvent *>(e)->key() == Qt::Key_Alt) {
+            e->accept();
+            return true;
+        }
+        if (e->type() == QEvent::NativeGesture) {  // (a touchpad's pinch, where the system says it is one)
+            auto *g = static_cast<QNativeGestureEvent *>(e);
+            if (g->gestureType() == Qt::ZoomNativeGesture) {
+                ed_->canvasPinch(1.0 + g->value(), g->position());
+                return true;
+            }
+        }
+        return QWidget::event(e);
+    }
     void paintEvent(QPaintEvent *e) override
     {
         QPainter p(this);
@@ -311,8 +342,8 @@ void ImageEditor::buildUi()
     opts->setContentsMargins(2, 2, 4, 2);
     opts->setSpacing(0);
     opts->addWidget(new ToolGrip(body()));
-    sizeRow_ = labelled(body(), tr("Size:"), &sizeBox_, 1, 1000, 30, tr(" px"), tr("How big the brush is ( [ and ] )"));
-    hardRow_ = labelled(body(), tr("Hardness:"), &hardBox_, 0, 100, 50, tr(" %"), tr("Hard edged (100) or soft (0)"));
+    sizeRow_ = labelled(body(), tr("Size:"), &sizeBox_, 1, 1000, 30, tr(" px"), tr("How big the brush is ( [ and ], or Alt + right button dragged sideways )"));
+    hardRow_ = labelled(body(), tr("Hardness:"), &hardBox_, 0, 100, 50, tr(" %"), tr("Hard edged (100) or soft (0) - Alt + right button dragged down or up"));
     widthRow_ = labelled(body(), tr("Line width:"), &widthBox_, 1, 200, 3, tr(" px"), tr("How thick the line or the outline is"));
     styleRow_ = new QWidget(body());
     {
@@ -384,8 +415,33 @@ void ImageEditor::buildUi()
     mid->addLayout(tools);
     canvas_ = new Canvas(this, body());
     canvas_->setObjectName(QStringLiteral("canvas"));
-    canvas_->setWhatsThis(tr("The picture. The wheel zooms; the middle button (or Space) drags it about."));
-    mid->addWidget(canvas_, 1);
+    canvas_->setWhatsThis(tr("The picture. The wheel moves it up and down - with Ctrl sideways, with Shift further. Alt + the wheel, or a touchpad's pinch, zooms. The middle button (or Space) drags it about."));
+    // ... its bars, right and below
+    vbar_ = new QScrollBar(Qt::Vertical, body());
+    hbar_ = new QScrollBar(Qt::Horizontal, body());
+    for (QScrollBar *b : {hbar_, vbar_})
+        b->setSingleStep(20);
+    connect(hbar_, &QScrollBar::valueChanged, this, [this](int v) {
+        if (!syncing_) {
+            offset_.setX(-v);
+            canvas_->update();
+        }
+    });
+    connect(vbar_, &QScrollBar::valueChanged, this, [this](int v) {
+        if (!syncing_) {
+            offset_.setY(-v);
+            canvas_->update();
+        }
+    });
+    auto *viewBox = new QGridLayout;
+    viewBox->setContentsMargins(0, 0, 0, 0);
+    viewBox->setSpacing(0);
+    viewBox->addWidget(canvas_, 0, 0);
+    viewBox->addWidget(vbar_, 0, 1);
+    viewBox->addWidget(hbar_, 1, 0);
+    viewBox->setRowStretch(0, 1);
+    viewBox->setColumnStretch(0, 1);
+    mid->addLayout(viewBox, 1);
     box->addLayout(mid, 1);
     // the colour box
     colorBox_ = new ColorBox(body());
@@ -562,8 +618,10 @@ void ImageEditor::refreshTools()
         hint = tr("Shift: add to the selection - Alt: take from it - Shift+Alt: just where they meet");
         break;
     case Tool::Brush:
+        hint = tr("Inside the selection only, if there is one. Right button: the right colour. Alt: take a colour. Alt + right drag: size and hardness");
+        break;
     case Tool::Eraser:
-        hint = tr("Inside the selection only, if there is one. Right button: the right colour. [ ]: smaller / bigger");
+        hint = tr("Inside the selection only, if there is one. [ ]: smaller / bigger. Alt + right drag: size and hardness");
         break;
     case Tool::Pencil:
         hint = tr("Draws one pixel wide. Right button: the right colour");
@@ -592,7 +650,7 @@ void ImageEditor::refreshTools()
         hint = tr("Drag its edges or a new frame - Enter or a double click crops, Esc leaves it");
         break;
     case Tool::Hand:
-        hint = tr("Drag the picture about - the wheel zooms");
+        hint = tr("Drag the picture about");
         break;
     default:
         break;
@@ -603,6 +661,8 @@ void ImageEditor::refreshTools()
 
 Qt::CursorShape ImageEditor::toolCursor() const
 {
+    if (altDown_ && tool_ == Tool::Brush)
+        return Qt::CrossCursor;
     return tool_ == Tool::Hand                               ? Qt::OpenHandCursor
            : tool_ == Tool::Brush || tool_ == Tool::Eraser   ? Qt::BlankCursor
            : tool_ == Tool::Text                             ? Qt::IBeamCursor
@@ -628,6 +688,7 @@ void ImageEditor::refreshStatus(QPointF at)
     posPanel_->setText(in ? QStringLiteral("%1, %2").arg(int(at.x())).arg(int(at.y())) : QString());
     sizePanel_->setText(tr("%1 x %2 px").arg(img_.width()).arg(img_.height()));
     zoomPanel_->setText(QStringLiteral("%1%").arg(std::lround(zoom_ * 100)));
+    syncBars();
 }
 
 // ---- Undo ----
@@ -713,14 +774,57 @@ void ImageEditor::zoomBy(double k, QPointF at)
     const QPointF i = toImage(at);
     zoom_ = std::clamp(zoom_ * k, 0.02, 32.0);
     offset_ = at - i * zoom_;
-    refreshStatus(i);
+    keepInView();
+    refreshStatus(toImage(at));
     canvas_->update();
+}
+
+void ImageEditor::scrollBy(QPointF by)
+{
+    // (no further out than it may go - dragged further than that by hand, only back)
+    double lo, hi;
+    panRange(canvas_->width(), img_.width() * zoom_, &lo, &hi);
+    offset_.setX(std::clamp(offset_.x() + by.x(), std::min(lo, offset_.x()), std::max(hi, offset_.x())));
+    panRange(canvas_->height(), img_.height() * zoom_, &lo, &hi);
+    offset_.setY(std::clamp(offset_.y() + by.y(), std::min(lo, offset_.y()), std::max(hi, offset_.y())));
+    refreshStatus(toImage(mouse_));
+    canvas_->update();
+}
+
+void ImageEditor::keepInView()
+{
+    double lo, hi;
+    panRange(canvas_->width(), img_.width() * zoom_, &lo, &hi);
+    offset_.setX(std::clamp(offset_.x(), lo, hi));
+    panRange(canvas_->height(), img_.height() * zoom_, &lo, &hi);
+    offset_.setY(std::clamp(offset_.y(), lo, hi));
+}
+
+void ImageEditor::syncBars()
+{
+    if (!hbar_ || !vbar_ || img_.isNull())
+        return;
+    syncing_ = true;
+    auto set = [](QScrollBar *b, double view, double content, double at) {
+        double lo, hi;
+        panRange(view, content, &lo, &hi);
+        lo = std::min(lo, at);  // (dragged further out by hand: the bar says so, and brings it back)
+        hi = std::max(hi, at);
+        b->setPageStep(int(view));
+        b->setRange(int(std::lround(-hi)), int(std::lround(-lo)));
+        b->setValue(int(std::lround(-at)));
+    };
+    set(hbar_, canvas_->width(), img_.width() * zoom_, offset_.x());
+    set(vbar_, canvas_->height(), img_.height() * zoom_, offset_.y());
+    syncing_ = false;
 }
 
 void ImageEditor::canvasResized()
 {
     if (img_.isNull())
         return;
+    keepInView();
+    syncBars();
     canvas_->update();
 }
 
@@ -737,16 +841,20 @@ void ImageEditor::paintCanvas(QPainter &p, const QRect &area)
     const QRectF shown(offset_, QSizeF(img_.width() * zoom_, img_.height() * zoom_));
     // (the canvas's edge being dragged: where its edges go)
     const QRectF canvasNew = canvasHandle_ >= 0 ? QRectF(toView(QPointF(canvasTo_.topLeft())), QSizeF(canvasTo_.width() * zoom_, canvasTo_.height() * zoom_)) : shown;
-    // the see-through ground: grey and white squares
+    // the see-through ground: grey and white squares - those in view (zoomed in, there are millions that aren't)
     {
         const QRectF ground = shown.united(canvasNew);
-        p.save();
-        p.setClipRect(ground.intersected(QRectF(area)));
-        const int cell = 8;
-        for (int y = int(std::floor(ground.top())); y < ground.bottom(); y += cell)
-            for (int x = int(std::floor(ground.left())); x < ground.right(); x += cell)
-                p.fillRect(QRect(x, y, cell, cell), ((x - int(ground.left())) / cell + (y - int(ground.top())) / cell) % 2 ? QColor(204, 204, 204) : Qt::white);
-        p.restore();
+        const QRectF seen = ground.intersected(QRectF(area));
+        if (!seen.isEmpty()) {
+            p.save();
+            p.setClipRect(seen);
+            const int cell = 8, left = int(std::floor(ground.left())), top = int(std::floor(ground.top()));
+            const int firstX = int((seen.left() - left) / cell), firstY = int((seen.top() - top) / cell);
+            for (int j = firstY; top + j * cell < seen.bottom(); ++j)
+                for (int i = firstX; left + i * cell < seen.right(); ++i)
+                    p.fillRect(QRect(left + i * cell, top + j * cell, cell, cell), (i + j) % 2 ? QColor(204, 204, 204) : Qt::white);
+            p.restore();
+        }
     }
     p.setRenderHint(QPainter::SmoothPixmapTransform, zoom_ < 2);  // (big: its pixels as squares)
     p.drawImage(shown, img_);
@@ -870,7 +978,8 @@ void ImageEditor::paintCanvas(QPainter &p, const QRect &area)
         p.restore();
     }
     // the brush's ring, its size
-    if ((tool_ == Tool::Brush || tool_ == Tool::Eraser) && mouse_.x() >= 0 && canvasHover_ < 0) {
+    if ((tool_ == Tool::Brush || tool_ == Tool::Eraser) && mouse_.x() >= 0 && canvasHover_ < 0 && !sizing_ && !picking_ &&
+        !(altDown_ && tool_ == Tool::Brush)) {
         const double r = std::max(1.0, sizeBox_->value() * zoom_ / 2);
         p.setRenderHint(QPainter::Antialiasing);
         p.setBrush(Qt::NoBrush);
@@ -880,6 +989,67 @@ void ImageEditor::paintCanvas(QPainter &p, const QRect &area)
         p.drawEllipse(mouse_, r, r);
         p.drawLine(mouse_ - QPointF(3, 0), mouse_ + QPointF(3, 0));
         p.drawLine(mouse_ - QPointF(0, 3), mouse_ + QPointF(0, 3));
+    }
+    // the colour being picked: what's under the mouse and its number beside it, as the colour box's eyedropper
+    if ((picking_ || (altDown_ && tool_ == Tool::Brush)) && !sizing_ && mouse_.x() >= 0) {
+        if (const QColor c = colourAt(toImage(mouse_)); c.isValid()) {
+            const QPoint m = mouse_.toPoint();
+            QPoint at = m + QPoint(16, 18);  // (the corner near: the other side of the mouse, to stay in view)
+            if (at.x() + kColorTagW > canvas_->width())
+                at.setX(m.x() - 16 - kColorTagW);
+            if (at.y() + kColorTagH > canvas_->height())
+                at.setY(m.y() - 18 - kColorTagH);
+            p.setRenderHint(QPainter::Antialiasing, false);
+            paintColorTag(p, at, c);
+        }
+    }
+    // the size and hardness being dragged: the brush itself, in red over the picture - as big and as soft as it paints -
+    // and what it's set to in a box beside it
+    if (sizing_) {
+        const double r = std::max(1.0, sizeBox_->value() * zoom_ / 2);
+        const double hard = hardBox_->value() / 100.0;
+        QRadialGradient soft(sizeAt_, r);
+        auto stop = [&](double t) {
+            QColor c(255, 0, 0);
+            c.setAlphaF(0.85 * falloff(t, hard));
+            soft.setColorAt(t, c);
+        };
+        for (int k = 0; k <= 20; ++k)
+            stop(k / 20.0);
+        stop(hard);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setPen(Qt::NoPen);
+        p.setBrush(soft);
+        p.drawEllipse(sizeAt_, r, r);
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(Qt::white, 1));
+        p.drawEllipse(sizeAt_, r + 1, r + 1);
+        p.setPen(QPen(Qt::black, 1));
+        p.drawEllipse(sizeAt_, r, r);
+        p.setRenderHint(QPainter::Antialiasing, false);
+        const QFont f = theme::font();
+        const QFontMetrics fm(f);
+        const QString names[3] = {tr("Diameter :"), tr("Hardness :"), tr("Opacity :")};
+        const QString values[3] = {tr("%1 px").arg(sizeBox_->value()), QStringLiteral("%1%").arg(hardBox_->value()),
+                                   QStringLiteral("%1%").arg(opacityBox_->value())};
+        int nameW = 0;
+        for (const QString &n : names)
+            nameW = std::max(nameW, fm.horizontalAdvance(n));
+        const int valueW = fm.horizontalAdvance(tr("%1 px").arg(1000));  // (its widest: the box doesn't jump as it changes)
+        const int line = fm.height() + 1, w = nameW + valueW + 18, h = 3 * line + 8;
+        QRect box(int(sizeAt_.x()) + 16, int(sizeAt_.y()) - 16 - h, w, h);  // (up to the right of its middle)
+        box.moveLeft(std::clamp(box.left(), 2, std::max(2, canvas_->width() - w - 2)));
+        box.moveTop(std::clamp(box.top(), 2, std::max(2, canvas_->height() - h - 2)));
+        p.fillRect(box, QColor(30, 30, 30, 240));
+        p.setPen(QColor(70, 70, 70));
+        p.drawRect(box.adjusted(0, 0, -1, -1));
+        p.setFont(f);
+        p.setPen(Qt::white);
+        for (int k = 0; k < 3; ++k) {
+            const QRect row(box.left() + 6, box.top() + 4 + k * line, nameW, line);
+            p.drawText(row, Qt::AlignRight | Qt::AlignVCenter, names[k]);
+            p.drawText(row.translated(nameW + 6, 0).adjusted(0, 0, valueW - nameW, 0), Qt::AlignLeft | Qt::AlignVCenter, values[k]);
+        }
     }
 }
 
@@ -896,6 +1066,26 @@ void ImageEditor::canvasPress(QMouseEvent *e)
         offsetFrom_ = offset_;
         canvas_->setCursor(Qt::ClosedHandCursor);
         return;
+    }
+    // (Alt: the brush takes the colour under the mouse, drawing nothing - with the right button, it and the eraser have
+    // their size and hardness dragged)
+    setAltDown(e->modifiers() & Qt::AltModifier);
+    if (altDown_ && !dragging_ && canvasHandle_ < 0) {
+        if (e->button() == Qt::LeftButton && tool_ == Tool::Brush) {
+            picking_ = true;
+            pick(at);
+            canvas_->update();
+            return;
+        }
+        if (e->button() == Qt::RightButton && (tool_ == Tool::Brush || tool_ == Tool::Eraser)) {
+            sizing_ = true;
+            sizeAt_ = v;
+            sizeWas_ = sizeBox_->value();
+            hardWas_ = hardBox_->value();
+            canvas_->setCursor(Qt::ArrowCursor);
+            canvas_->update();
+            return;
+        }
     }
     // (on the canvas's edge: its edge dragged)
     if (e->button() == Qt::LeftButton) {
@@ -1028,9 +1218,29 @@ void ImageEditor::canvasMove(QMouseEvent *e)
     refreshStatus(at);
     if (panning_) {
         offset_ = offsetFrom_ + (v - panFrom_);
+        syncBars();
         canvas_->update();
         return;
     }
+    if (sizing_ && !(e->buttons() & Qt::RightButton)) {  // (let go where it wasn't seen)
+        sizing_ = false;
+        canvas_->setCursor(toolCursor());
+    }
+    if (sizing_) {  // (sideways its size - its edge following the mouse - up and down its hardness)
+        const QPointF d = v - sizeAt_;
+        sizeBox_->setValue(int(std::lround(sizeWas_ + 2 * d.x() / zoom_)));
+        hardBox_->setValue(int(std::lround(hardWas_ + d.y() / 2)));
+        canvas_->update();
+        return;
+    }
+    if (picking_ && !(e->buttons() & Qt::LeftButton))
+        picking_ = false;
+    if (picking_) {
+        pick(at);
+        canvas_->update();
+        return;
+    }
+    setAltDown(e->modifiers() & Qt::AltModifier);
     if (canvasHandle_ >= 0) {  // (the canvas's edge dragged: as far as the mouse, the canvas at least a pixel)
         const int dx = int(std::lround(at.x() - canvasFrom_.x())), dy = int(std::lround(at.y() - canvasFrom_.y()));
         const int h = canvasHandle_;
@@ -1124,6 +1334,24 @@ void ImageEditor::canvasRelease(QMouseEvent *e)
     if (panning_) {
         panning_ = false;
         refreshTools();
+        return;
+    }
+    if (sizing_) {
+        if (e->button() == Qt::RightButton) {
+            sizing_ = false;
+            setAltDown(e->modifiers() & Qt::AltModifier);
+            canvas_->setCursor(toolCursor());
+            canvas_->update();
+        }
+        return;
+    }
+    if (picking_) {
+        if (e->button() == Qt::LeftButton) {
+            picking_ = false;
+            setAltDown(e->modifiers() & Qt::AltModifier);
+            canvas_->setCursor(toolCursor());
+            canvas_->update();
+        }
         return;
     }
     if (canvasHandle_ >= 0) {
@@ -1223,15 +1451,40 @@ void ImageEditor::canvasDoubleClick(QMouseEvent *e)
 
 void ImageEditor::canvasWheel(QWheelEvent *e)
 {
-    const double steps = e->angleDelta().y() / 120.0;
-    if (steps != 0)
-        zoomBy(std::pow(1.2, steps), e->position());
+    const QPoint a = e->angleDelta();
+    const int d = a.y() ? a.y() : a.x();  // (Windows hands Alt + the wheel over as going sideways)
+    const Qt::KeyboardModifiers m = e->modifiers();
+    mouse_ = e->position();
+    if (m & Qt::AltModifier) {  // (Alt: it zooms. On the canvas: let go, the menu bar doesn't take the keys)
+        canvas_->setFocus();
+        if (d)
+            zoomBy(std::pow(1.2, d / 120.0), mouse_);
+        return;
+    }
+    const bool ctrl = m & Qt::ControlModifier;
+    // a touchpad's pinch comes as Ctrl + the wheel too: in finer steps than a wheel's notches, or with its Ctrl pressed
+    // for it just before - which a hand can't do - and more of it right after
+    if (ctrl && (d % 120 != 0 || (ctrlPressed_.isValid() && ctrlPressed_.elapsed() < 40) ||
+                 (pinched_.isValid() && pinched_.elapsed() < 300))) {
+        pinched_.restart();
+        if (d)
+            zoomBy(std::pow(1.2, d / 120.0), mouse_);
+        return;
+    }
+    // up and down (a touchpad's: sideways as well, as far as the fingers went) - Ctrl: sideways; Shift: further
+    QPointF by = !e->pixelDelta().isNull() ? QPointF(e->pixelDelta()) : QPointF(a) / 2.0;
+    const bool shift = m & Qt::ShiftModifier;
+    if (ctrl || shift) {
+        const double along = (by.y() != 0 ? by.y() : by.x()) * (shift ? 5 : 1);
+        by = ctrl ? QPointF(along, 0) : QPointF(0, along);
+    }
+    scrollBy(by);
 }
 
 int ImageEditor::canvasHandleAt(QPointF v) const
 {
     // (just outside the picture - its edges, its corners: inside it, the tools go on working up to its very edge)
-    if (tool_ == Tool::Crop || spaceDown_ || dragging_ || panning_)
+    if (tool_ == Tool::Crop || spaceDown_ || dragging_ || panning_ || sizing_ || picking_ || (altDown_ && tool_ == Tool::Brush))
         return -1;
     const QRectF s(offset_, QSizeF(img_.width() * zoom_, img_.height() * zoom_));
     const double band = 8;
@@ -1488,10 +1741,19 @@ void ImageEditor::fill(QPoint at)
     changed();
 }
 
-void ImageEditor::pick(QPoint at)
+QColor ImageEditor::colourAt(QPointF at) const
 {
-    const QRgb c = img_.pixel(at);
-    setColors(QColor(qRed(c), qGreen(c), qBlue(c)), bg_);
+    const QPoint px(int(std::floor(at.x())), int(std::floor(at.y())));
+    if (!img_.rect().contains(px))
+        return {};
+    const QRgb c = img_.pixel(px);
+    return qAlpha(c) ? QColor(qRed(c), qGreen(c), qBlue(c)) : QColor();
+}
+
+void ImageEditor::pick(QPointF at)
+{
+    if (const QColor c = colourAt(at); c.isValid())
+        setColors(c, bg_);
 }
 
 void ImageEditor::deleteSelected()
@@ -1708,8 +1970,26 @@ void ImageEditor::grayscale()
 
 // ---- keys, closing ----
 
+void ImageEditor::setAltDown(bool down)
+{
+    if (down == altDown_)
+        return;
+    altDown_ = down;
+    if (tool_ != Tool::Brush || dragging_ || sizing_ || picking_ || panning_ || spaceDown_)
+        return;
+    canvasHover_ = -1;
+    canvas_->setCursor(toolCursor());
+    canvas_->update();
+}
+
 void ImageEditor::keyPressEvent(QKeyEvent *e)
 {
+    if (e->key() == Qt::Key_Alt) {
+        setAltDown(true);
+        return;
+    }
+    if (e->key() == Qt::Key_Control && !e->isAutoRepeat())
+        ctrlPressed_.restart();
     // (Ctrl + the key itself - an Arabic keyboard's letters aside - as the main window's)
     const quint32 vk = e->nativeVirtualKey();
     const bool ctrl = e->modifiers() & Qt::ControlModifier, shift = e->modifiers() & Qt::ShiftModifier;
@@ -1798,6 +2078,10 @@ void ImageEditor::keyPressEvent(QKeyEvent *e)
 
 void ImageEditor::keyReleaseEvent(QKeyEvent *e)
 {
+    if (e->key() == Qt::Key_Alt) {
+        setAltDown(false);
+        return;
+    }
     if (e->key() == Qt::Key_Space && !e->isAutoRepeat()) {
         spaceDown_ = false;
         refreshTools();

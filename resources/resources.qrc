@@ -80,7 +80,9 @@
     <file>icons/crop.png</file>
     <file>icons/obj_align.png</file>
     <file>icons/rotate_ccw.png</file>
+    <file>icons/rotate_ccw@4x.png</file>
     <file>icons/rotate_cw.png</file>
+    <file>icons/rotate_cw@4x.png</file>
     <file>icons/arrange.png</file>
     <file>icons/scan.png</file>
     <file>icons/convert.png</file>
