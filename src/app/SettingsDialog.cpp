@@ -412,9 +412,10 @@ void MainWindow::openSettings()
         page->addLayout(pair);
     }
     // what opens PDF files: only the user can choose that - on Windows' own page, which this button opens at Master PDF
-    if (filetypes::supported()) {
+    {
         auto *g = group(tr("PDF files"), body);
         auto *l = new QVBoxLayout(g);
+        if (filetypes::supported()) {
         auto *row = new QHBoxLayout;
         auto *state = new QLabel(g);
         row->addWidget(state);
@@ -452,6 +453,12 @@ void MainWindow::openSettings()
                                    : tr("Windows' default apps couldn't be opened - find them in Windows' Settings, under Apps."));
             status->show();
         });
+        }
+        auto *reading = new QCheckBox(tr("Open PDF files in Read mode"), g);
+        reading->setWhatsThis(tr("A PDF you open shows just its pages, with the tools put away. Esc brings them back."));
+        reading->setChecked(theme::settings().value("open_in_read_mode").toBool(true));
+        connect(reading, &QCheckBox::toggled, &dlg, [](bool on) { theme::saveSetting("open_in_read_mode", on); });
+        l->addWidget(reading);
         page->addWidget(g);
     }
     // the version, and checking for a newer one (as the Python app's: what was found said under it - a newer one offered

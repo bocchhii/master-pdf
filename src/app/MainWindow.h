@@ -49,7 +49,8 @@ class MainWindow : public ClassicWindow {
 public:
     explicit MainWindow(QWidget *parent = nullptr);
 
-    bool openFile(const QString &path);  // (in a tab of its own - or its tab, if it's open already)
+    // (in a tab of its own - or its tab, if it's open already. toRead: opened to be read - in Read mode, if Settings says so)
+    bool openFile(const QString &path, bool toRead = true);
     void showDocument(std::shared_ptr<Document> doc, const QString &name);  // (a PDF opened or made: a new tab)
     // the tabs: Home first, then the PDFs open, one each
     DocTabs *tabs() const { return tabs_; }

@@ -3921,7 +3921,7 @@ void MainWindow::scanFile()
     if (path.isEmpty())
         return;
     if (QFileInfo(path).suffix().compare(QStringLiteral("pdf"), Qt::CaseInsensitive) == 0) {
-        if (!openFile(path))
+        if (!openFile(path, false))  // (opened to be scanned: the tools stay)
             return;
     } else {  // (a picture: a PDF of it, named as it is)
         QString error;

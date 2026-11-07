@@ -873,7 +873,7 @@ void MainWindow::themeChanged()
 
 // ---- opening and closing ----
 
-bool MainWindow::openFile(const QString &path)
+bool MainWindow::openFile(const QString &path, bool toRead)
 {
     for (size_t k = 0; k < docs_.size(); ++k)  // (open already: its tab)
         if (QFileInfo(docs_[k].doc->path()).absoluteFilePath().compare(QFileInfo(path).absoluteFilePath(), Qt::CaseInsensitive) == 0) {
@@ -892,6 +892,8 @@ bool MainWindow::openFile(const QString &path)
     addRecent(QFileInfo(path).absoluteFilePath());
     theme::saveSetting("last_folder", QFileInfo(path).absolutePath());
     say(tr("Opened %1.").arg(name_));
+    if (toRead && theme::settings().value("open_in_read_mode").toBool(true))
+        setReadMode(true);
     return true;
 }
 
