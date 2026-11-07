@@ -93,7 +93,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14          # Apple chips (M1 and newer)
+          - runner: macos-15          # Apple chips (M1 and newer)
             file: MasterPDF-Mac-AppleChip-M1-and-newer
           - runner: macos-15-intel    # Intel Macs
             file: MasterPDF-Mac-Intel-chip
