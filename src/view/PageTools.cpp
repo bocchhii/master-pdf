@@ -908,25 +908,37 @@ void PageView::paintTool(QPainter &p)
             p.drawPolygon(poly);
         }
         if (cropping_ && picPage_ >= 0) {  // Crop: what's cut off dimmed, the box with its handles
-            const QRectF whole = cropBounds(), box = cropRect_;
-            auto onView = [&](const QRectF &r) { return QRectF(origin(picPage_) + r.topLeft() * ppp, r.size() * ppp); };
-            const QColor dim(0, 0, 0, 110);
-            const QRectF w = onView(whole), b = onView(box);
-            p.fillRect(QRectF(w.left(), w.top(), w.width(), b.top() - w.top()), dim);
-            p.fillRect(QRectF(w.left(), b.bottom(), w.width(), w.bottom() - b.bottom()), dim);
-            p.fillRect(QRectF(w.left(), b.top(), b.left() - w.left(), b.height()), dim);
-            p.fillRect(QRectF(b.right(), b.top(), w.right() - b.right(), b.height()), dim);
+            // (turned with the picture's frame: its box its way, on the page)
+            const Picture &cropped = picturesOf(picPage_)[size_t(picIndex_)];
+            const QTransform back = cropTurn_.inverted();
+            auto onView = [&](QPointF q) { return origin(picPage_) + q * ppp; };
+            const QRectF box = cropRect_;
+            QPolygonF w, b;
+            for (const QPointF &c : cropped.whole.size() == 4 ? cropped.whole : cropped.corners)
+                w << onView(c);
+            for (const QPointF &c : {box.topLeft(), box.topRight(), box.bottomRight(), box.bottomLeft()})
+                b << onView(back.map(c));
+            w = w.united(QPolygonF(b));  // (the frame past the picture's own edges: its outside, not its inside)
+            QPainterPath outside, inside;
+            outside.addPolygon(w);
+            inside.addPolygon(b);
+            const bool askew = cropAngle_ != 0;
+            p.setRenderHint(QPainter::Antialiasing, askew);
+            p.fillPath(outside.subtracted(inside), QColor(0, 0, 0, 110));
             p.setPen(QPen(Qt::black, 1));
             p.setBrush(Qt::NoBrush);
-            p.drawRect(b);
+            p.drawPolygon(b);
             p.setPen(QPen(Qt::white, 1, Qt::DashLine));
-            p.drawRect(b);
+            p.drawPolygon(b);
             p.setPen(QPen(Qt::black, 1));
             p.setBrush(QColor("#FFFFFE"));
-            const QPointF spots[8] = {b.topLeft(), {b.center().x(), b.top()}, b.topRight(), {b.right(), b.center().y()},
-                                      b.bottomRight(), {b.center().x(), b.bottom()}, b.bottomLeft(), {b.left(), b.center().y()}};
-            for (const QPointF &c : spots)
-                p.drawRect(QRectF(c.x() - 3, c.y() - 3, 7, 7));
+            const QPointF spots[8] = {box.topLeft(), {box.center().x(), box.top()}, box.topRight(), {box.right(), box.center().y()},
+                                      box.bottomRight(), {box.center().x(), box.bottom()}, box.bottomLeft(), {box.left(), box.center().y()}};
+            p.setRenderHint(QPainter::Antialiasing, false);
+            for (const QPointF &c : spots) {
+                const QPointF on = onView(back.map(c));
+                p.drawRect(QRectF(on.x() - 3, on.y() - 3, 7, 7));
+            }
         } else if (picIndex_ >= 0 && picPage_ >= 0 && picIndex_ < int(picturesOf(picPage_).size())) {
             // the picture picked up: its outline, square handles at its corners, and the
             // rotate handle on a stalk over its top
@@ -3718,23 +3730,42 @@ QRectF PageView::cropBounds()
         return {};
     const Picture &pic = picturesOf(picPage_)[size_t(picIndex_)];
     QRectF r;
-    for (const QPointF &c : pic.whole.empty() ? pic.corners : pic.whole)
-        r = r.isNull() ? QRectF(c, QSizeF(0.001, 0.001)) : r.united(QRectF(c, QSizeF(0.001, 0.001)));
-    return r;
+    for (const QPointF &c : pic.whole.empty() ? pic.corners : pic.whole) {
+        const QPointF q = cropTurn_.map(c);
+        r = r.isNull() ? QRectF(q, QSizeF(0.001, 0.001)) : r.united(QRectF(q, QSizeF(0.001, 0.001)));
+    }
+    return r.united(cropWas_);  // (a tile's frame can reach a little past the picture it's in)
 }
 
 bool PageView::startCrop()
 {
-    // (upright pictures - or turned a quarter: its box is a box on the page)
+    // (its box turned as its frame is - the picture turned, or a tile drawn turned in it; a quarter turn or none: a box
+    // on the page. Slanted - its sides not square to each other: no box fits it)
     if (picPage_ < 0 || picIndex_ < 0 || picIndex_ >= int(picturesOf(picPage_).size()))
         return false;
     const Picture &pic = picturesOf(picPage_)[size_t(picIndex_)];
     const std::vector<QPointF> &w = pic.whole.empty() ? pic.corners : pic.whole;
-    if (w.size() != 4 || (std::abs(w[1].y() - w[0].y()) > 0.5 && std::abs(w[1].x() - w[0].x()) > 0.5))
+    if (w.size() != 4 || pic.corners.size() != 4)
         return false;
+    const QPointF ex = w[1] - w[0], ey = w[3] - w[0];
+    if (std::abs(QPointF::dotProduct(ex, ey)) > 0.02 * std::hypot(ex.x(), ex.y()) * std::hypot(ey.x(), ey.y()))
+        return false;
+    const QPointF side = pic.corners[1] - pic.corners[0];
+    double angle = std::atan2(side.y(), side.x()) * 180 / M_PI;
+    angle = std::fmod(std::fmod(angle + 45, 90) + 90, 90) - 45;
+    cropAngle_ = std::abs(angle) < 0.05 ? 0 : angle;
+    const QPointF pivot = (pic.corners[0] + pic.corners[2]) / 2;
+    cropTurn_ = QTransform();
+    if (cropAngle_ != 0) {
+        cropTurn_.translate(pivot.x(), pivot.y());
+        cropTurn_.rotate(-cropAngle_);
+        cropTurn_.translate(-pivot.x(), -pivot.y());
+    }
     QRectF shown;
-    for (const QPointF &c : pic.corners)
-        shown = shown.isNull() ? QRectF(c, QSizeF(0.001, 0.001)) : shown.united(QRectF(c, QSizeF(0.001, 0.001)));
+    for (const QPointF &c : pic.corners) {
+        const QPointF q = cropTurn_.map(c);
+        shown = shown.isNull() ? QRectF(q, QSizeF(0.001, 0.001)) : shown.united(QRectF(q, QSizeF(0.001, 0.001)));
+    }
     cropping_ = true;
     cropRect_ = cropWas_ = shown;
     cropHandle_ = -1;
@@ -3762,13 +3793,13 @@ void PageView::finishCrop(bool apply)
     const double lx = QPointF::dotProduct(ex, ex), ly = QPointF::dotProduct(ey, ey);
     if (lx < 1e-9 || ly < 1e-9)
         return;
-    double u0 = 1e9, u1 = -1e9, v0 = 1e9, v1 = -1e9;
+    const QTransform back = cropTurn_.inverted();
+    QPolygonF unit;
     for (const QPointF &c : {r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()}) {
-        const double u = QPointF::dotProduct(c - w[0], ex) / lx;
-        const double v = 1 - QPointF::dotProduct(c - w[0], ey) / ly;
-        u0 = std::min(u0, u), u1 = std::max(u1, u), v0 = std::min(v0, v), v1 = std::max(v1, v);
+        const QPointF on = back.map(c);
+        unit << QPointF(QPointF::dotProduct(on - w[0], ex) / lx, 1 - QPointF::dotProduct(on - w[0], ey) / ly);
     }
-    emit pictureCropped(picPage_, picIndex_, QRectF(QPointF(u0, v0), QPointF(u1, v1)));
+    emit pictureCropped(picPage_, picIndex_, unit);
 }
 
 bool PageView::cropMouse(QMouseEvent *e)
@@ -3777,13 +3808,15 @@ bool PageView::cropMouse(QMouseEvent *e)
         return false;
     const QPoint pos = e->position().toPoint();
     const double ppp = pixelsPerPoint();
-    const QPointF at = QPointF(pos + scrollOffset() - pages_[size_t(picPage_)].topLeft()) / ppp;
+    // (where the mouse is as if the frame were straight)
+    const QPointF at = cropTurn_.map(QPointF(pos + scrollOffset() - pages_[size_t(picPage_)].topLeft()) / ppp);
+    const QTransform back = cropTurn_.inverted();
     const QRectF b = cropRect_;
     const QPointF spots[8] = {b.topLeft(), {b.center().x(), b.top()}, b.topRight(), {b.right(), b.center().y()},
                               b.bottomRight(), {b.center().x(), b.bottom()}, b.bottomLeft(), {b.left(), b.center().y()}};
     auto handleAt = [&]() {
         for (int k = 0; k < 8; ++k)
-            if ((QPointF(toView(picPage_, spots[k])) - QPointF(pos)).manhattanLength() <= 7)
+            if ((QPointF(toView(picPage_, back.map(spots[k]))) - QPointF(pos)).manhattanLength() <= 7)
                 return k;
         return b.contains(at) ? 8 : -1;
     };
@@ -3806,7 +3839,9 @@ bool PageView::cropMouse(QMouseEvent *e)
     if (e->type() == QEvent::MouseMove) {
         if (cropHandle_ < 0) {
             const int h = handleAt();
-            viewport()->setCursor(h >= 0 ? shapes[h] : Qt::ArrowCursor);
+            // (the arrows the way that side or corner points now, the frame turned)
+            const int turned = int(std::lround(cropAngle_ / 45));
+            viewport()->setCursor(h < 0 ? Qt::ArrowCursor : h == 8 ? shapes[8] : shapes[(h + turned + 8) % 8]);
             return true;
         }
         const QRectF bounds = cropBounds();

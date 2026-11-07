@@ -177,7 +177,7 @@ void MainWindow::cropPicture()
         return;
     }
     if (!view_->startCrop()) {
-        say(tr("Only a picture that's upright (or turned a quarter) can be cropped."));
+        say(tr("This picture is slanted, so it can't be cropped here - Edit image can."));
         return;
     }
     say(tr("Crop: drag its edges or corners - Enter, a double click or a click outside puts it in; Esc leaves it as it was."));
@@ -763,22 +763,82 @@ void MainWindow::editImage()
         return;
     const Picture pic = *picked;
     const int page = view_->pickedPicturePage();
-    const QImage im = doc->pictureImage(pic);
+    QImage im = doc->pictureImage(pic);
     if (im.isNull()) {
         classicMessage(this, tr("Master PDF"), tr("This picture can't be edited."));
         return;
     }
+    // where its corners are on the page: top left, top right, bottom right, bottom left
+    std::vector<QPointF> on = pic.whole;
+    if (on.size() != 4) {
+        const QRectF r = pic.full.isNull() ? pic.rect : pic.full;
+        on = {r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()};
+    }
+    // what shows is what's edited: only this part of it (in its pixels), the rest see-through
+    auto keepOnly = [&im](const QPolygonF &part) {
+        QImage shown(im.size(), QImage::Format_ARGB32);
+        shown.fill(Qt::transparent);
+        QPainter p(&shown);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setPen(Qt::NoPen);
+        p.setBrush(Qt::black);
+        p.drawPolygon(part);
+        p.setCompositionMode(QPainter::CompositionMode_SourceIn);
+        p.drawImage(0, 0, im);
+        p.end();
+        im = shown;
+    };
+    // (a tile moved, drawn clipped to its shape: the background saved round it stays hidden)
+    if (pic.clipped && pic.shape.size() >= 3) {
+        const QPointF ax = on[1] - on[0], ay = on[3] - on[0];
+        const double xx = QPointF::dotProduct(ax, ax), yy = QPointF::dotProduct(ay, ay);
+        QPolygonF part;
+        for (const QPointF &q : pic.shape)
+            part << QPointF(QPointF::dotProduct(q - on[0], ax) / std::max(xx, 1e-6) * im.width(),
+                            QPointF::dotProduct(q - on[0], ay) / std::max(yy, 1e-6) * im.height());
+        keepOnly(part);
+    }
+    // (cropped: what the crop hides, cut off - or, cropped askew, see-through)
+    if (!pic.cropPoly.empty()) {
+        QPolygonF part;
+        for (const QPointF &q : pic.cropPoly)
+            part << QPointF(q.x() * im.width(), (1 - q.y()) * im.height());
+        keepOnly(part);
+    } else if (!pic.crop.isNull() && pic.corners.size() == 4) {
+        const QRect part(int(std::lround(pic.crop.left() * im.width())), int(std::lround((1 - pic.crop.bottom()) * im.height())),
+                         int(std::lround(pic.crop.width() * im.width())), int(std::lround(pic.crop.height() * im.height())));
+        im = im.copy(part & im.rect());
+        on = pic.corners;
+    }
+    if (im.isNull()) {
+        classicMessage(this, tr("Master PDF"), tr("This picture can't be edited."));
+        return;
+    }
+    const QPointF ex = on[1] - on[0], ey = on[3] - on[0];
+    const double lx = std::hypot(ex.x(), ex.y()), ly = std::hypot(ey.x(), ey.y());
+    // (stretched on the page: opened in the shape it has there - turned by any angle, it stays that shape)
+    {
+        const double kx = lx / std::max(1, im.width()), ky = ly / std::max(1, im.height()), k = std::min(kx, ky);
+        if (k > 0 && std::max(kx, ky) > k * 1.01)
+            im = im.scaled(std::clamp(int(std::lround(lx / k)), 1, 12000), std::clamp(int(std::lround(ly / k)), 1, 12000),
+                           Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    }
+    const QSize opened = im.size();
+    // (how it's turned on the page, degrees clockwise; a mirrored one has no such angle)
+    double turn = ex.x() * ey.y() - ex.y() * ey.x() > 0 ? std::atan2(ex.y(), ex.x()) * 180 / M_PI : 0;
+    if (std::abs(turn) < 0.05)
+        turn = 0;
     ImageEditor editor(this, im);
+    editor.setPageTurn(turn);
     if (!editor.exec())
         return;
     const QImage result = editor.image();
-    const QRectF box0 = pic.full.isNull() ? pic.rect : pic.full;
-    const QRectF part = editor.frame();
-    const double kx = box0.width() / std::max(1, im.width()), ky = box0.height() / std::max(1, im.height());
-    const QRectF box(box0.left() + part.left() * kx, box0.top() + part.top() * ky, part.width() * kx, part.height() * ky);
+    QPolygonF corners;
+    for (const QPointF &q : editor.place())
+        corners << on[0] + ex * (q.x() / std::max(1, opened.width())) + ey * (q.y() / std::max(1, opened.height()));
     QString error;
-    const bool ok = doc->placePicture(page, QString(), result, box, false, &pic, &error);
-    pictureChangedDone(ok, page, box, error);
+    const bool ok = doc->placePicture(page, result, corners, &pic, &error);
+    pictureChangedDone(ok, page, corners.boundingRect(), error);
     if (ok)
         say(tr("The picture's changes put in."));
 }
@@ -929,7 +989,7 @@ void MainWindow::connectPictureTools()
         pictureChangedDone(ok, page, move.mapRect(pics[size_t(index)].rect), error);
     });
     connect(view_, &PageView::pictureDelete, this, [this] { deletePicture(); });
-    connect(view_, &PageView::pictureCropped, this, [this](int page, int index, const QRectF &unit) {
+    connect(view_, &PageView::pictureCropped, this, [this](int page, int index, const QPolygonF &unit) {
         auto doc = view_->document();
         const std::vector<Picture> pics = view_->picturesOf(page);
         if (!doc || index < 0 || index >= int(pics.size()))

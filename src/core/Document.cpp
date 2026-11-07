@@ -8,6 +8,7 @@
 #include <QFile>
 #include <QHash>
 #include <QImage>
+#include <QImageReader>
 
 #include <mupdf/fitz.h>
 #include <mupdf/pdf.h>
@@ -1063,7 +1064,7 @@ bool Document::insertBlank(int at, QSizeF size, QString *error)
     return ok;
 }
 
-int Document::insertFiles(const QStringList &paths, int at, QStringList *problems)
+int Document::insertFiles(const QStringList &paths, int at, QStringList *problems, const PicturePages *pages)
 {
     // each file read first (pictures MuPDF can't read: through Qt, as PNG)
     struct Source {
@@ -1138,6 +1139,26 @@ int Document::insertFiles(const QStringList &paths, int at, QStringList *problem
                 }
             }
         }
+        // (a picture with see-through parts - a GIF's, a BMP's, a PNG's: its colours and its see-through parts written apart.
+        // MuPDF left to it, the parts of a GIF or a BMP that aren't seen were written as they are stored: black)
+        QImage seeThrough;
+        if (!s.pdf && !s.data.startsWith("\xFF\xD8")) {
+            QBuffer in(&s.data);
+            QImageReader reader(&in);
+            reader.setAutoTransform(true);
+            const QImage read = reader.read();
+            bool any = false;
+            if (read.hasAlphaChannel()) {
+                const QImage argb = read.convertToFormat(QImage::Format_ARGB32);
+                for (int y = 0; y < argb.height() && !any; ++y) {
+                    const QRgb *row = reinterpret_cast<const QRgb *>(argb.constScanLine(y));
+                    for (int x = 0; x < argb.width() && !any; ++x)
+                        any = qAlpha(row[x]) < 255;
+                }
+            }
+            if (any)
+                seeThrough = seeThroughPixels(read);
+        }
         fz_buffer *buf = nullptr;
         fz_document *src = nullptr;
         pdf_graft_map *map = nullptr;
@@ -1154,7 +1175,7 @@ int Document::insertFiles(const QStringList &paths, int at, QStringList *problem
         fz_var(contents);
         fz_var(n);
         fz_try(ctx) {
-            buf = fz_new_buffer_from_shared_data(ctx, reinterpret_cast<const unsigned char *>(s.data.constData()),
+            buf = fz_new_buffer_from_copied_data(ctx, reinterpret_cast<const unsigned char *>(s.data.constData()),
                                                  size_t(s.data.size()));
             if (s.pdf) {
                 src = fz_open_document_with_buffer(ctx, "application/pdf", buf);
@@ -1169,8 +1190,8 @@ int Document::insertFiles(const QStringList &paths, int at, QStringList *problem
                     pdf_graft_mapped_page(ctx, map, at + added + i, sp, i);
                     ++n;
                 }
-            } else {  // a picture: a page its own size (at its resolution; 96 dpi if it says 72 or less)
-                img = fz_new_image_from_buffer(ctx, buf);
+            } else {  // a picture: a page its own size (at its resolution; 96 dpi if it says 72 or less) - or the size asked for
+                img = seeThrough.isNull() ? fz_new_image_from_buffer(ctx, buf) : seeThroughImage(seeThrough);
                 int xres = 96, yres = 96;
                 fz_image_resolution(img, &xres, &yres);
                 const float dx = xres > 72 ? float(xres) : 96.f, dy = yres > 72 ? float(yres) : 96.f;
@@ -1183,14 +1204,24 @@ int Document::insertFiles(const QStringList &paths, int at, QStringList *problem
                 xobj = pdf_dict_put_dict(ctx, res, PDF_NAME(XObject), 1);
                 pdf_dict_puts(ctx, xobj, "Img", ref);
                 // the picture the right way up, filling the page (the PDF's y goes up)
+                float pageW = w, pageH = h, left = 0, top = 0;
+                if (pages && pages->fixed) {  // (every page this size: the picture as big as fits inside its margin, in the middle)
+                    pageW = float(pages->size.width()), pageH = float(pages->size.height());
+                    if (pages->followShape && (w > h) != (pageW > pageH))
+                        std::swap(pageW, pageH);
+                    const float roomW = std::max(1.f, pageW - 2 * float(pages->margin)), roomH = std::max(1.f, pageH - 2 * float(pages->margin));
+                    const float k = std::min(roomW / w, roomH / h);
+                    w *= k, h *= k;
+                    left = (pageW - w) / 2, top = (pageH - h) / 2;
+                }
                 const fz_matrix flipImage = {1, 0, 0, -1, 0, 1};
-                const fz_matrix flipPage = {1, 0, 0, -1, 0, h};
+                const fz_matrix flipPage = {1, 0, 0, -1, left, pageH - top};
                 const fz_matrix m = fz_concat(fz_concat(flipImage, fz_concat(fz_image_orientation_matrix(ctx, img),
                                                                              fz_scale(w, h))),
                                               flipPage);
                 contents = fz_new_buffer(ctx, 64);
                 fz_append_printf(ctx, contents, "q %g %g %g %g %g %g cm /Img Do Q", m.a, m.b, m.c, m.d, m.e, m.f);
-                page = pdf_add_page(ctx, pdf_, fz_make_rect(0, 0, w, h), 0, res, contents);
+                page = pdf_add_page(ctx, pdf_, fz_make_rect(0, 0, pageW, pageH), 0, res, contents);
                 pdf_insert_page(ctx, pdf_, at + added, page);
                 n = 1;
             }

@@ -164,7 +164,7 @@ public:
     QPoint toView(int page, QPointF at) const;
 
 signals:
-    void pictureCropped(int page, int index, const QRectF &unit);  // (its own square's part, PDF's way up)
+    void pictureCropped(int page, int index, const QPolygonF &unit);  // (its own square's part: its corners, PDF's way up, top left first as shown)
     void zoomChanged(double zoom);
     void currentPageChanged(int page);
     void selectionChanged(bool any);
@@ -382,7 +382,9 @@ private:
     bool rubKept_ = false;
     void paintRubbed(QPainter &p, const std::vector<QPointF> &path);
     bool cropping_ = false;
-    QRectF cropRect_;      // (page points)
+    QRectF cropRect_;      // (page points, as if the frame were straight: cropTurn_ takes the page's to these)
+    QTransform cropTurn_;  // (the picture's frame turned: its crop box turned with it)
+    double cropAngle_ = 0;
     int cropHandle_ = -1;  // 0..7: tl, t, tr, r, br, b, bl, l; 8: the box moved
     QPointF cropFrom_;
     QRectF cropWas_;

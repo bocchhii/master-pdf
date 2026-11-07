@@ -17,8 +17,11 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QButtonGroup>
 #include <QComboBox>
 #include <QDir>
+#include <QDoubleSpinBox>
+#include <QJsonObject>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGridLayout>
@@ -468,6 +471,133 @@ QStringList MainWindow::fromWord(const QStringList &paths, QStringList *problems
     return out;
 }
 
+namespace {
+
+// the new PDF's pictures: each page its picture's size, or one size for them all with the pictures inside it.
+// (Asked each time, the last choices kept.) False: cancelled
+bool askPicturePages(QWidget *owner, PicturePages *out)
+{
+    struct Paper {
+        const char *name;
+        double w, h;  // (mm, upright)
+    };
+    static const Paper papers[] = {{"A3", 297, 420}, {"A4", 210, 297}, {"A5", 148, 210}, {"B5", 176, 250}, {"Letter", 215.9, 279.4}, {"Legal", 215.9, 355.6}};
+    const int custom = int(std::size(papers));
+    const QJsonObject saved = theme::settings();
+    ClassicDialog d(owner, QObject::tr("Create PDF: page size"));
+    QWidget *body = d.body();
+    body->setFont(theme::font());
+    auto *box = new QVBoxLayout(body);
+    box->setContentsMargins(12, 10, 12, 10);
+    box->setSpacing(6);
+    auto *adaptive = new QRadioButton(QObject::tr("Adaptive: each page takes its picture's size"), body);
+    auto *fixed = new QRadioButton(QObject::tr("Fixed: every page the same size, each picture fits inside it, in the middle"), body);
+    adaptive->setFont(theme::font());
+    fixed->setFont(theme::font());
+    box->addWidget(adaptive);
+    box->addWidget(fixed);
+    auto *options = new QWidget(body);
+    auto *grid = new QGridLayout(options);
+    grid->setContentsMargins(20, 2, 0, 2);
+    grid->setHorizontalSpacing(6);
+    grid->setVerticalSpacing(6);
+    auto label = [&](const QString &text, int row) {
+        auto *l = new QLabel(text, options);
+        l->setFont(theme::font());
+        grid->addWidget(l, row, 0);
+    };
+    auto number = [&](double value, double most) {
+        auto *n = new QDoubleSpinBox(options);
+        n->setFont(theme::font());
+        n->setFixedHeight(20);
+        n->setDecimals(1);
+        n->setRange(0, most);
+        n->setSuffix(QObject::tr(" mm"));
+        n->setValue(value);
+        return n;
+    };
+    label(QObject::tr("Size:"), 0);
+    auto *paper = new QComboBox(options);
+    paper->setFont(theme::font());
+    for (const Paper &p : papers)
+        paper->addItem(QString::fromLatin1(p.name));
+    paper->addItem(QObject::tr("Custom"));
+    grid->addWidget(paper, 0, 1, 1, 2);
+    label(QObject::tr("Width:"), 1);
+    auto *width = number(saved.value("create_w").toDouble(210), 5000);
+    width->setMinimum(10);
+    grid->addWidget(width, 1, 1);
+    label(QObject::tr("Height:"), 2);
+    auto *height = number(saved.value("create_h").toDouble(297), 5000);
+    height->setMinimum(10);
+    grid->addWidget(height, 2, 1);
+    label(QObject::tr("Direction:"), 3);
+    auto *way = new QComboBox(options);
+    way->setFont(theme::font());
+    way->addItems({QObject::tr("Portrait"), QObject::tr("Landscape"), QObject::tr("As each picture")});
+    way->setCurrentIndex(std::clamp(saved.value("create_turn").toInt(0), 0, 2));
+    grid->addWidget(way, 3, 1, 1, 2);
+    label(QObject::tr("Margin:"), 4);
+    auto *margin = number(saved.value("create_margin").toDouble(0), 100);
+    grid->addWidget(margin, 4, 1);
+    grid->setColumnStretch(2, 1);
+    box->addWidget(options);
+    auto *note = new QLabel(QObject::tr("PDFs and Word documents keep their own pages."), body);
+    note->setFont(theme::font());
+    box->addWidget(note);
+    // (a paper chosen: its size shown, and turned the way chosen; only Custom's typed)
+    auto papersChosen = [=] {
+        const int i = paper->currentIndex();
+        width->setEnabled(i == custom);
+        height->setEnabled(i == custom);
+        way->setEnabled(i != custom);
+        if (i == custom)
+            return;
+        const bool wide = way->currentIndex() == 1;
+        width->setValue(wide ? papers[i].h : papers[i].w);
+        height->setValue(wide ? papers[i].w : papers[i].h);
+    };
+    QObject::connect(paper, &QComboBox::currentIndexChanged, &d, papersChosen);
+    QObject::connect(way, &QComboBox::currentIndexChanged, &d, papersChosen);
+    paper->setCurrentIndex(std::clamp(saved.value("create_paper").toInt(1), 0, custom));
+    papersChosen();
+    auto modeChosen = [=] { options->setEnabled(fixed->isChecked()); };
+    QObject::connect(fixed, &QRadioButton::toggled, &d, modeChosen);
+    (saved.value("create_fixed").toBool(false) ? fixed : adaptive)->setChecked(true);
+    modeChosen();
+    auto *buttons = new QHBoxLayout;
+    buttons->addStretch(1);
+    auto *okB = new ClassicButton(QObject::tr("OK"), body);
+    auto *noB = new ClassicButton(QObject::tr("Cancel"), body);
+    okB->setDefault(true);
+    bool ok = false;
+    QObject::connect(okB, &QPushButton::clicked, &d, [&] {
+        ok = true;
+        d.close();
+    });
+    QObject::connect(noB, &QPushButton::clicked, &d, [&] { d.close(); });
+    buttons->addWidget(okB);
+    buttons->addWidget(noB);
+    box->addLayout(buttons);
+    d.exec();
+    if (!ok)
+        return false;
+    theme::saveSetting("create_fixed", fixed->isChecked());
+    theme::saveSetting("create_paper", paper->currentIndex());
+    theme::saveSetting("create_w", width->value());
+    theme::saveSetting("create_h", height->value());
+    theme::saveSetting("create_turn", way->currentIndex());
+    theme::saveSetting("create_margin", margin->value());
+    const double point = 72 / 25.4;
+    out->fixed = fixed->isChecked();
+    out->size = QSizeF(width->value() * point, height->value() * point);
+    out->margin = margin->value() * point;
+    out->followShape = paper->currentIndex() != custom && way->currentIndex() == 2;
+    return true;
+}
+
+}  // namespace
+
 // Create PDF from files (Home's Create, the File menu's, files dropped): PDFs, pictures and Word documents put
 // together into a new PDF - shown first in Organize Pages to be put in order, named and created there (not saved
 // until Save)
@@ -479,6 +609,11 @@ void MainWindow::createFromFiles(QStringList paths)
             tr("PDFs, Word documents and pictures (*.pdf *.docx *.doc *.docm *.rtf *.odt *.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp);;All files (*)"));
     if (paths.isEmpty())
         return;
+    // (pictures among them: what size their pages are)
+    PicturePages pages;
+    if (std::any_of(paths.cbegin(), paths.cend(), [](const QString &p) { return !p.endsWith(QStringLiteral(".pdf"), Qt::CaseInsensitive) && !isWord(p); })
+        && !askPicturePages(this, &pages))
+        return;
     QStringList problems;
     const QStringList files = fromWord(paths, &problems);
     QString error;
@@ -486,7 +621,7 @@ void MainWindow::createFromFiles(QStringList paths)
     int added = 0;
     if (doc && !files.isEmpty()) {
         QApplication::setOverrideCursor(classic::waitCursor());
-        added = doc->insertFiles(files, 0, &problems);
+        added = doc->insertFiles(files, 0, &problems, &pages);
         QApplication::restoreOverrideCursor();
     }
     if (!problems.isEmpty()) {

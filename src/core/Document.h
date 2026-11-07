@@ -19,6 +19,8 @@
 #include "core/Fonts.h"
 #include "core/PageText.h"
 
+#include <QPolygonF>
+
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -29,6 +31,7 @@
 struct fz_context;
 struct fz_document;
 struct fz_display_list;
+struct fz_image;
 struct pdf_document;
 
 // An open PDF. Safe to render from several threads at once: each page is turned into a
@@ -73,6 +76,7 @@ struct Picture {
     // cropped (the Crop tool): the part of its own square shown - (x, y, w, h), PDF's way up - and
     // its corners uncropped; null: all of it. The "/Name Do" itself, and the crop's q ... Q round it
     QRectF crop;
+    std::vector<QPointF> cropPoly;  // (cropped askew - a part turned in its square: that part's corners in it, top left first; empty: crop itself)
     std::vector<QPointF> whole;
     qint64 doStart = 0, doEnd = 0, cropStart = -1, cropEnd = -1;
     QByteArray cropMoves;  // (moves put inside the crop's q since: kept when it's cropped again)
@@ -102,6 +106,16 @@ struct PdfLink {
     QRectF rect;    // (points from the page's top left)
     QString uri;    // a web page (or mail...): empty for a page of this PDF
     int page = -1;  // the page it goes to (from 0)
+};
+
+// How pictures made pages (Create PDF) are laid out: each page as big as its picture (adaptive) - or every page this
+// size, each picture as big as fits inside its margin, its shape kept, in the middle (fixed). followShape: a wide
+// picture's page turned wide too. (Points.)
+struct PicturePages {
+    bool fixed = false;
+    QSizeF size;
+    double margin = 0;
+    bool followShape = false;
 };
 
 // A bookmark (the PDF's table of contents): how deep, its title, where it goes (page from 0,
@@ -185,7 +199,7 @@ public:
     bool movePages(const std::vector<int> &pages, int to, QString *error);  // before page `to`
     bool insertBlank(int at, QSizeF size, QString *error);
     // PDFs and pictures (a page each) put in from page `at` on: how many pages went in
-    int insertFiles(const QStringList &paths, int at, QStringList *problems);
+    int insertFiles(const QStringList &paths, int at, QStringList *problems, const PicturePages *pages = nullptr);
     bool extractPages(const std::vector<int> &pages, const QString &path, QString *error) const;
 
     // ---- annotations (each change one step for Undo) ----
@@ -301,12 +315,16 @@ public:
     int changesOpen_ = 0;  // (inside beginChanges ... endChanges: the journal can't be asked where it is)
     // one step: drawn after the next picture over it (forward) / before the one before it
     bool stepPicture(int page, const Picture &pic, bool forward, QString *error);
-    // cropped to a part of its own square (x, y, w, h - PDF's way up; all of it: uncropped)
-    bool cropPicture(int page, const Picture &pic, const QRectF &unit, QString *error);
+    // cropped to a part of its own square - that part's four corners, PDF's way up, top left first as shown; straight
+    // in its square: a box, all of it: uncropped; askew (a tile drawn turned inside an upright picture): just as it is
+    bool cropPicture(int page, const Picture &pic, const QPolygonF &unit, QString *error);
     // a picture (a file, or image if it's not null) put in box - fit: its shape kept, as big
     // as fits; replacing: in that picture's place, instead of it
     bool placePicture(int page, const QString &path, const QImage &image, const QRectF &box, bool fit,
                       const Picture *replacing, QString *error);
+    // ... or image put on these four corners of the page, turned as they are: its top left, top right, bottom right,
+    // bottom left (points)
+    bool placePicture(int page, const QImage &image, const QPolygonF &corners, const Picture *replacing, QString *error);
     QImage pictureImage(const Picture &pic);  // (its own pixels)
     // a picture's text read (OCR): the picture put back without its letters (cleaned), and each line
     // written as real text where it was - its baseline's start, size, colour, as wide as it was
@@ -408,8 +426,13 @@ private:
     void takeOut(struct pdf_page *pg, int page, const TextLine &line);
     // (seeThrough, if given: the picture from its pixels - its colours, and its see-through parts as a mask of their own,
     // their colours kept: no dark fringe where it's drawn smooth - not from bytes)
+    // (corners, if given: shown on them, turned as they are - not r)
     void placeIn(struct pdf_page *pg, int page, const QByteArray &bytes, const QRectF &r, const Picture *replacing,
-                 const QImage *seeThrough = nullptr);
+                 const QImage *seeThrough = nullptr, const QPolygonF *corners = nullptr);
+    // (a see-through picture, ready to be made a MuPDF image: as ARGB32, its unseen pixels coloured - outside a fz_try,
+    // that; then, inside one, the image of it - its colours, its see-through parts a mask of their own)
+    static QImage seeThroughPixels(const QImage &image);
+    struct fz_image *seeThroughImage(const QImage &argb);
     void editPieces(struct pdf_page *pg, const Picture &pic,
                     const std::function<QByteArray(const Picture::Piece &, const QByteArray &)> &change);
     // what writeText writes next: turned (degrees clockwise as shown, round pivot) - 0: straight

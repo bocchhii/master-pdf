@@ -15,6 +15,7 @@
 #include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QFontComboBox>
 #include <QMenu>
 #include <QMenuBar>
@@ -66,6 +67,16 @@ QWidget *labelled(QWidget *parent, const QString &label, QSpinBox **box, int lo,
     (*box)->setFixedHeight(20);
     l->addWidget(*box);
     return w;
+}
+
+// a picture turned by any angle (clockwise): as big as it now needs, what's added see-through
+QImage turnedBy(const QImage &im, double degrees, Qt::TransformationMode mode)
+{
+    if (std::abs(std::remainder(degrees, 360.0)) < 0.001)
+        return im;
+    QTransform t;
+    t.rotate(degrees);
+    return im.transformed(t, mode).convertToFormat(QImage::Format_ARGB32);
 }
 
 // a smooth step down: 1 inside the hard part, to 0 at the edge
@@ -270,6 +281,7 @@ void ImageEditor::buildUi()
     top->addWidget(new ToolSeparator(body()));
     button(top, QStringLiteral("rotate_ccw"), tr("Rotate left"), {}, [this] { turn(false); });
     button(top, QStringLiteral("rotate_cw"), tr("Rotate right"), {}, [this] { turn(true); });
+    button(top, {}, tr("Rotate by any angle"), tr("Rotate..."), [this] { rotateDialog(); });
     button(top, QStringLiteral("flip_h"), tr("Flip horizontal"), {}, [this] { flip(true); });
     button(top, QStringLiteral("flip_v"), tr("Flip vertical"), {}, [this] { flip(false); });
     top->addWidget(new ToolSeparator(body()));
@@ -473,6 +485,7 @@ void ImageEditor::fillMenu(QMenu *m, int which)
         m->addAction(tr("Rotate &left"), this, [this] { turn(false); });
         m->addAction(tr("Rotate &right"), this, [this] { turn(true); });
         m->addAction(tr("Rotate 1&80 degrees"), this, [this] { rotate180(); });
+        m->addAction(tr("Rotate by an &angle..."), this, [this] { rotateDialog(); });
         m->addSeparator();
         m->addAction(tr("Flip &horizontal"), this, [this] { flip(true); });
         m->addAction(tr("Flip &vertical"), this, [this] { flip(false); });
@@ -585,11 +598,28 @@ void ImageEditor::refreshTools()
         break;
     }
     hintPanel_->setText(hint);
-    canvas_->setCursor(tool_ == Tool::Hand   ? Qt::OpenHandCursor
-                       : paints              ? Qt::BlankCursor
-                       : tool_ == Tool::Text ? Qt::IBeamCursor
-                       : tool_ == Tool::Move ? Qt::SizeAllCursor
-                                             : Qt::CrossCursor);
+    canvas_->setCursor(toolCursor());
+}
+
+Qt::CursorShape ImageEditor::toolCursor() const
+{
+    return tool_ == Tool::Hand                               ? Qt::OpenHandCursor
+           : tool_ == Tool::Brush || tool_ == Tool::Eraser   ? Qt::BlankCursor
+           : tool_ == Tool::Text                             ? Qt::IBeamCursor
+           : tool_ == Tool::Move                             ? Qt::SizeAllCursor
+                                                             : Qt::CrossCursor;
+}
+
+QPolygonF ImageEditor::place() const
+{
+    return axes_.map(QPolygonF({frame_.topLeft(), frame_.topRight(), frame_.bottomRight(), frame_.bottomLeft()}));
+}
+
+void ImageEditor::setPageTurn(double degrees)
+{
+    pageTurn_ = degrees;
+    if (degrees != 0)
+        hintPanel_->setText(tr("On the page it's turned %1 degrees - Rotate... shows it as it is there, to crop it straight").arg(degrees, 0, 'f', 0));
 }
 
 void ImageEditor::refreshStatus(QPointF at)
@@ -605,7 +635,7 @@ void ImageEditor::refreshStatus(QPointF at)
 void ImageEditor::remember()
 {
     floating_ = false;  // (something else done: what was moved stays where it is)
-    undo_.push_back({img_, sel_, frame_});
+    undo_.push_back({img_, sel_, frame_, pageTurn_, axes_});
     if (int(undo_.size()) > kMaxUndo)
         undo_.erase(undo_.begin());
     redo_.clear();
@@ -616,11 +646,13 @@ void ImageEditor::undo()
     if (undo_.empty())
         return;
     floating_ = false;
-    redo_.push_back({img_, sel_, frame_});
+    redo_.push_back({img_, sel_, frame_, pageTurn_, axes_});
     const QSize was = img_.size();
     img_ = undo_.back().img;
     sel_ = undo_.back().sel;
     frame_ = undo_.back().frame;
+    pageTurn_ = undo_.back().pageTurn;
+    axes_ = undo_.back().axes;
     undo_.pop_back();
     --changes_;
     changed(img_.size() != was);
@@ -631,11 +663,13 @@ void ImageEditor::redo()
     if (redo_.empty())
         return;
     floating_ = false;
-    undo_.push_back({img_, sel_, frame_});
+    undo_.push_back({img_, sel_, frame_, pageTurn_, axes_});
     const QSize was = img_.size();
     img_ = redo_.back().img;
     sel_ = redo_.back().sel;
     frame_ = redo_.back().frame;
+    pageTurn_ = redo_.back().pageTurn;
+    axes_ = redo_.back().axes;
     redo_.pop_back();
     ++changes_;
     changed(img_.size() != was);
@@ -693,6 +727,7 @@ void ImageEditor::canvasResized()
 void ImageEditor::canvasLeft()
 {
     mouse_ = QPointF(-1, -1);
+    canvasHover_ = -1;
     canvas_->update();
 }
 
@@ -700,14 +735,17 @@ void ImageEditor::paintCanvas(QPainter &p, const QRect &area)
 {
     p.fillRect(area, theme::workspace());
     const QRectF shown(offset_, QSizeF(img_.width() * zoom_, img_.height() * zoom_));
+    // (the canvas's edge being dragged: where its edges go)
+    const QRectF canvasNew = canvasHandle_ >= 0 ? QRectF(toView(QPointF(canvasTo_.topLeft())), QSizeF(canvasTo_.width() * zoom_, canvasTo_.height() * zoom_)) : shown;
     // the see-through ground: grey and white squares
     {
+        const QRectF ground = shown.united(canvasNew);
         p.save();
-        p.setClipRect(shown.intersected(QRectF(area)));
+        p.setClipRect(ground.intersected(QRectF(area)));
         const int cell = 8;
-        for (int y = int(std::floor(shown.top())); y < shown.bottom(); y += cell)
-            for (int x = int(std::floor(shown.left())); x < shown.right(); x += cell)
-                p.fillRect(QRect(x, y, cell, cell), ((x - int(shown.left())) / cell + (y - int(shown.top())) / cell) % 2 ? QColor(204, 204, 204) : Qt::white);
+        for (int y = int(std::floor(ground.top())); y < ground.bottom(); y += cell)
+            for (int x = int(std::floor(ground.left())); x < ground.right(); x += cell)
+                p.fillRect(QRect(x, y, cell, cell), ((x - int(ground.left())) / cell + (y - int(ground.top())) / cell) % 2 ? QColor(204, 204, 204) : Qt::white);
         p.restore();
     }
     p.setRenderHint(QPainter::SmoothPixmapTransform, zoom_ < 2);  // (big: its pixels as squares)
@@ -803,8 +841,36 @@ void ImageEditor::paintCanvas(QPainter &p, const QRect &area)
         for (const QPointF &q : h)
             p.drawRect(QRectF(q - QPointF(3, 3), QSizeF(6, 6)));
     }
+    // the canvas's edges: dragged to make it bigger or smaller. (What would be cut off darkened, its new edges dotted)
+    if (tool_ != Tool::Crop) {
+        p.save();
+        p.setRenderHint(QPainter::Antialiasing, false);
+        if (canvasHandle_ >= 0) {
+            QPainterPath cut;
+            cut.addRect(shown);
+            QPainterPath kept;
+            kept.addRect(canvasNew);
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(0, 0, 0, 120));
+            p.drawPath(cut.subtracted(kept));
+            p.setBrush(Qt::NoBrush);
+            p.setPen(QPen(Qt::white, 1));
+            p.drawRect(canvasNew);
+            p.setPen(QPen(Qt::black, 1, Qt::DashLine));
+            p.drawRect(canvasNew);
+        }
+        const QRectF &c = canvasNew;
+        const double out = 4;
+        const QPointF h[8] = {{c.left() - out, c.top() - out}, {c.center().x(), c.top() - out}, {c.right() + out, c.top() - out}, {c.right() + out, c.center().y()},
+                              {c.right() + out, c.bottom() + out}, {c.center().x(), c.bottom() + out}, {c.left() - out, c.bottom() + out}, {c.left() - out, c.center().y()}};
+        p.setPen(Qt::black);
+        p.setBrush(Qt::white);
+        for (const QPointF &q : h)
+            p.drawRect(QRectF(q - QPointF(3, 3), QSizeF(6, 6)));
+        p.restore();
+    }
     // the brush's ring, its size
-    if ((tool_ == Tool::Brush || tool_ == Tool::Eraser) && mouse_.x() >= 0) {
+    if ((tool_ == Tool::Brush || tool_ == Tool::Eraser) && mouse_.x() >= 0 && canvasHover_ < 0) {
         const double r = std::max(1.0, sizeBox_->value() * zoom_ / 2);
         p.setRenderHint(QPainter::Antialiasing);
         p.setBrush(Qt::NoBrush);
@@ -830,6 +896,16 @@ void ImageEditor::canvasPress(QMouseEvent *e)
         offsetFrom_ = offset_;
         canvas_->setCursor(Qt::ClosedHandCursor);
         return;
+    }
+    // (on the canvas's edge: its edge dragged)
+    if (e->button() == Qt::LeftButton) {
+        if (const int h = canvasHandleAt(v); h >= 0) {
+            canvasHandle_ = h;
+            canvasFrom_ = at;
+            canvasTo_ = img_.rect();
+            pressed_ = Qt::LeftButton;
+            return;
+        }
     }
     // (the right button: Paint's - drawn with the right colour; the zoom out, the right colour taken)
     const bool right = e->button() == Qt::RightButton;
@@ -902,7 +978,7 @@ void ImageEditor::canvasPress(QMouseEvent *e)
             break;
         }
         if (floating_) {  // (moved before: moved on - nothing lifted again, nothing left behind)
-            undo_.push_back({img_, sel_, frame_});
+            undo_.push_back({img_, sel_, frame_, pageTurn_, axes_});
             redo_.clear();
         } else {  // (what's selected lifted off the picture: where it was, see-through)
             remember();
@@ -954,6 +1030,30 @@ void ImageEditor::canvasMove(QMouseEvent *e)
         offset_ = offsetFrom_ + (v - panFrom_);
         canvas_->update();
         return;
+    }
+    if (canvasHandle_ >= 0) {  // (the canvas's edge dragged: as far as the mouse, the canvas at least a pixel)
+        const int dx = int(std::lround(at.x() - canvasFrom_.x())), dy = int(std::lround(at.y() - canvasFrom_.y()));
+        const int h = canvasHandle_;
+        QRect r = img_.rect();
+        if (h == 0 || h == 6 || h == 7)
+            r.setLeft(std::clamp(dx, r.right() - 19999, r.right()));
+        if (h == 2 || h == 3 || h == 4)
+            r.setRight(std::clamp(r.right() + dx, r.left(), r.left() + 19999));
+        if (h == 0 || h == 1 || h == 2)
+            r.setTop(std::clamp(dy, r.bottom() - 19999, r.bottom()));
+        if (h == 4 || h == 5 || h == 6)
+            r.setBottom(std::clamp(r.bottom() + dy, r.top(), r.top() + 19999));
+        canvasTo_ = r;
+        sizePanel_->setText(tr("%1 x %2 px").arg(r.width()).arg(r.height()));
+        canvas_->update();
+        return;
+    }
+    if (const int h = canvasHandleAt(v); h != canvasHover_) {  // (over the canvas's edge: its arrows)
+        static const Qt::CursorShape arrows[8] = {Qt::SizeFDiagCursor, Qt::SizeVerCursor, Qt::SizeBDiagCursor, Qt::SizeHorCursor,
+                                                  Qt::SizeFDiagCursor, Qt::SizeVerCursor, Qt::SizeBDiagCursor, Qt::SizeHorCursor};
+        canvasHover_ = h;
+        canvas_->setCursor(h >= 0 ? arrows[h] : toolCursor());
+        canvas_->update();
     }
     if (tool_ == Tool::Crop && !dragging_) {
         static const Qt::CursorShape shapes[9] = {Qt::SizeFDiagCursor, Qt::SizeVerCursor, Qt::SizeBDiagCursor, Qt::SizeHorCursor,
@@ -1024,6 +1124,18 @@ void ImageEditor::canvasRelease(QMouseEvent *e)
     if (panning_) {
         panning_ = false;
         refreshTools();
+        return;
+    }
+    if (canvasHandle_ >= 0) {
+        if (e->button() != Qt::LeftButton)
+            return;
+        canvasMove(e);  // (as far as where it's let go)
+        const QRect r = canvasTo_;
+        canvasHandle_ = -1;
+        if (r != img_.rect())
+            setCanvas(r, false);
+        refreshStatus();
+        canvas_->update();
         return;
     }
     if (!dragging_ || e->button() != pressed_)
@@ -1114,6 +1226,21 @@ void ImageEditor::canvasWheel(QWheelEvent *e)
     const double steps = e->angleDelta().y() / 120.0;
     if (steps != 0)
         zoomBy(std::pow(1.2, steps), e->position());
+}
+
+int ImageEditor::canvasHandleAt(QPointF v) const
+{
+    // (just outside the picture - its edges, its corners: inside it, the tools go on working up to its very edge)
+    if (tool_ == Tool::Crop || spaceDown_ || dragging_ || panning_)
+        return -1;
+    const QRectF s(offset_, QSizeF(img_.width() * zoom_, img_.height() * zoom_));
+    const double band = 8;
+    const bool left = v.x() >= s.left() - band && v.x() < s.left(), right = v.x() > s.right() && v.x() <= s.right() + band;
+    const bool top = v.y() >= s.top() - band && v.y() < s.top(), bottom = v.y() > s.bottom() && v.y() <= s.bottom() + band;
+    const bool acrossIt = v.x() >= s.left() - band && v.x() <= s.right() + band, downIt = v.y() >= s.top() - band && v.y() <= s.bottom() + band;
+    if (!acrossIt || !downIt)
+        return -1;
+    return top && left ? 0 : top && right ? 2 : bottom && right ? 4 : bottom && left ? 6 : top ? 1 : right ? 3 : bottom ? 5 : left ? 7 : -1;
 }
 
 int ImageEditor::cropHandleAt(QPointF v) const
@@ -1919,8 +2046,15 @@ void ImageEditor::canvasSizeDialog()
     const int nw = wBox->value(), nh = hBox->value();
     if (!ok || (nw == img_.width() && nh == img_.height()))
         return;
+    setCanvas(QRect(QPoint(-(nw - img_.width()) / 2, -(nh - img_.height()) / 2), QSize(nw, nh)), true);
+}
+
+void ImageEditor::setCanvas(const QRect &r, bool refit)
+{
     remember();
-    const QPoint at((nw - img_.width()) / 2, (nh - img_.height()) / 2);
+    const int nw = r.width(), nh = r.height();
+    const QPoint at = -r.topLeft();
+    const QRectF wasShown(offset_, QSizeF(img_.width() * zoom_, img_.height() * zoom_));
     QImage out(nw, nh, QImage::Format_ARGB32);
     out.fill(Qt::transparent);
     {
@@ -1941,6 +2075,132 @@ void ImageEditor::canvasSizeDialog()
     const double sx = frame_.width() / img_.width(), sy = frame_.height() / img_.height();
     frame_ = QRectF(frame_.left() - at.x() * sx, frame_.top() - at.y() * sy, nw * sx, nh * sy);
     img_ = out;
+    ++changes_;
+    // (the picture stays where it is on the screen - unless the canvas no longer fits there)
+    offset_ -= QPointF(at) * zoom_;
+    const QRectF shownNow(offset_, QSizeF(nw * zoom_, nh * zoom_));
+    const QRectF view(canvas_->rect());
+    changed(refit || (view.contains(wasShown) && !view.contains(shownNow)));
+}
+
+void ImageEditor::rotateDialog()
+{
+    // by any angle, shown as it goes: the canvas as big as it needs, what's added see-through. A picture turned on the page
+    // starts as it is there; OK puts that turn in its pixels - straight on the page now, it looks just the same - so it can
+    // be cropped as it's seen
+    const QImage before = img_;
+    const QImage selBefore = sel_;
+    const double start = pageTurn_;
+    // (room for it at any angle; in the middle, staying there)
+    const double across = std::hypot(double(img_.width()), double(img_.height()));
+    zoom_ = std::min(zoom_, (std::min(canvas_->width(), canvas_->height()) - 24) / std::max(1.0, across));
+    const QPointF middle = QPointF(canvas_->rect().center());
+    auto preview = [&](double degrees, Qt::TransformationMode mode) {
+        img_ = turnedBy(before, degrees, mode);
+        offset_ = middle - QPointF(img_.width(), img_.height()) * zoom_ / 2;
+        refreshStatus();
+        canvas_->update();
+    };
+    sel_ = QImage();  // (what's selected: not turned with it, let go)
+    outlineSelection();
+    preview(start, Qt::FastTransformation);
+    ClassicDialog d(this, tr("Rotate"));
+    auto *l = new QVBoxLayout(d.body());
+    l->setContentsMargins(12, 10, 12, 10);
+    l->setSpacing(6);
+    auto *row = new QHBoxLayout;
+    auto *name = new QLabel(tr("Angle:"), d.body());
+    name->setFont(theme::font());
+    row->addWidget(name);
+    auto *bar = new QSlider(Qt::Horizontal, d.body());
+    bar->setRange(-180, 180);
+    bar->setMinimumWidth(260);
+    row->addWidget(bar, 1);
+    auto *box = new QDoubleSpinBox(d.body());
+    box->setFont(theme::font());
+    box->setRange(-180, 180);
+    box->setDecimals(1);
+    box->setSuffix(tr(" deg"));
+    box->setWrapping(true);
+    box->setFixedHeight(20);
+    row->addWidget(box);
+    l->addLayout(row);
+    bool busy = false;
+    QObject::connect(bar, &QSlider::valueChanged, &d, [&](int v) {
+        if (busy)
+            return;
+        busy = true;
+        box->setValue(v);
+        busy = false;
+        preview(v, Qt::FastTransformation);
+    });
+    QObject::connect(box, qOverload<double>(&QDoubleSpinBox::valueChanged), &d, [&](double v) {
+        if (busy)
+            return;
+        busy = true;
+        bar->setValue(int(std::lround(v)));
+        busy = false;
+        preview(v, Qt::FastTransformation);
+    });
+    busy = true;
+    box->setValue(std::remainder(start, 360.0));
+    bar->setValue(int(std::lround(std::remainder(start, 360.0))));
+    busy = false;
+    if (start != 0) {
+        auto *note = new QLabel(tr("It starts as it's turned on the page: OK keeps it looking the same there, and lets you crop it as you see it."), d.body());
+        note->setFont(theme::font());
+        note->setWordWrap(true);
+        l->addWidget(note);
+    }
+    auto *buttons = new QHBoxLayout;
+    auto *straight = new QPushButton(tr("Straight"), d.body());
+    straight->setToolTip(tr("Back to 0 degrees"));
+    QObject::connect(straight, &QPushButton::clicked, &d, [&] { box->setValue(0); });
+    buttons->addWidget(straight);
+    if (start != 0) {
+        auto *asPage = new QPushButton(tr("As on the page"), d.body());
+        QObject::connect(asPage, &QPushButton::clicked, &d, [&] { box->setValue(std::remainder(start, 360.0)); });
+        buttons->addWidget(asPage);
+    }
+    buttons->addStretch(1);
+    bool ok = false;
+    auto *okB = new QPushButton(tr("OK"), d.body());
+    auto *noB = new QPushButton(tr("Cancel"), d.body());
+    QObject::connect(okB, &QPushButton::clicked, &d, [&] {
+        ok = true;
+        d.close();
+    });
+    QObject::connect(noB, &QPushButton::clicked, &d, [&] { d.close(); });
+    buttons->addWidget(okB);
+    buttons->addWidget(noB);
+    l->addLayout(buttons);
+    // (in a corner of the canvas: the picture stays in sight)
+    d.adjustSize();
+    d.move(canvas_->mapToGlobal(QPoint(canvas_->width() - d.width() - 8, canvas_->height() - d.height() - 8)));
+    d.exec(true);
+    const double degrees = box->value();
+    img_ = before;
+    sel_ = selBefore;
+    if (!ok || (std::abs(degrees) < 0.001 && pageTurn_ == 0)) {
+        changed(true);
+        return;
+    }
+    remember();
+    // (where it shows: round the same middle; the turn it had on the page now in its pixels, its corners straight there)
+    const QPointF c = frame_.center();
+    const double sx = frame_.width() / img_.width(), sy = frame_.height() / img_.height();
+    if (pageTurn_ != 0) {
+        QTransform t;
+        t.translate(c.x(), c.y());
+        t.rotate(-pageTurn_);
+        t.translate(-c.x(), -c.y());
+        axes_ = t * axes_;
+        pageTurn_ = 0;
+    }
+    img_ = turnedBy(before, degrees, Qt::SmoothTransformation);
+    sel_ = QImage();
+    const QSizeF size(img_.width() * sx, img_.height() * sy);
+    frame_ = QRectF(c - QPointF(size.width(), size.height()) / 2, size);
     ++changes_;
     changed(true);
 }

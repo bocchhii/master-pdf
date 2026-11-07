@@ -4,6 +4,7 @@
 
 #include <QImage>
 #include <QPainterPath>
+#include <QPolygonF>
 #include <QTransform>
 
 #include <functional>
@@ -39,6 +40,11 @@ public:
     // where it shows, in the picture's own pixels as it was opened (as shown on the page): cropped - the
     // part kept; turned - turned round its middle; resized - as it was
     QRectF frame() const { return frame_; }
+    // ... the corners where it shows now - its top left, top right, bottom right, bottom left - in those same pixels
+    // (not a box, if the turn it has on the page has been put into its pixels: the Rotate box's "as on the page")
+    QPolygonF place() const;
+    // how it's turned on the page (degrees clockwise): the Rotate box starts there
+    void setPageTurn(double degrees);
 
     enum class Tool { Hand, RectSelect, EllipseSelect, Lasso, Wand, Brush, Eraser, Fill, Picker, Crop,
                       Pencil, Line, Rectangle, Ellipse, Text, Zoom, Move };
@@ -63,6 +69,8 @@ private:
     struct State {
         QImage img, sel;
         QRectF frame;
+        double pageTurn;
+        QTransform axes;
     };
     enum class Mode { New, Add, Subtract, Intersect };
 
@@ -71,6 +79,7 @@ private:
     void fillMenu(QMenu *m, int which);
     void setColors(QColor fg, QColor bg);  // (the colour box's: the two colours drawn with)
     void refreshTools();
+    Qt::CursorShape toolCursor() const;
     void refreshStatus(QPointF imagePoint = QPointF(-1, -1));
     void remember();  // (what it is now: one step for Undo)
     void undo();
@@ -121,7 +130,10 @@ private:
     void sepia();
     void blackAndWhite();
     void rotate180();
+    void rotateDialog();  // (by any angle)
     void canvasSizeDialog();
+    void setCanvas(const QRect &r, bool refit);  // (the canvas's new edges, in the picture's pixels: what's added see-through)
+    int canvasHandleAt(QPointF view) const;      // (0..7: tl, t, tr, r, br, b, bl, l; -1 none)
     void trimEdges();
     void exportImage();
     // (the clipboard)
@@ -141,6 +153,8 @@ private:
     bool accepted_ = false;
     QImage img_, sel_;
     QRectF frame_;
+    double pageTurn_ = 0;  // (how it's still turned on the page, degrees clockwise)
+    QTransform axes_;      // (frame_'s coordinates to the pixels as it was opened: turned when the page's turn is put in its pixels)
     std::vector<State> undo_, redo_;
     int changes_ = 0;  // (since opened: asked about when closed)
 
@@ -176,6 +190,10 @@ private:
     QRectF crop_;
     int cropHandle_ = -1;
     QRectF cropWas_;
+    // the canvas's edge being dragged (-1: none), where the mouse went down, the edges it makes; the one the mouse is over
+    int canvasHandle_ = -1, canvasHover_ = -1;
+    QPointF canvasFrom_;
+    QRect canvasTo_;
     // a selection being moved: what's lifted from it, the picture under it, how far it's gone
     QImage lifted_, under_, selWas_;
     QPoint moved_;

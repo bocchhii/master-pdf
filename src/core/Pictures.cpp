@@ -215,9 +215,11 @@ void widenToCrop(const QByteArray &data, Picture &p)
     const qint64 q = data.lastIndexOf('q', k);
     if (q < 0)
         return;
-    // (a move puts its matrix just inside the q: "q a b c d e f cm x y w h re W n")
+    // (a move puts its matrix just inside the q: "q a b c d e f cm x y w h re W n"; cropped askew: its corners, not a box)
     static const QRegularExpression form(QStringLiteral(
-        "^q\\s*((?:(?:[-0-9.eE]+\\s+){6}cm\\s*)*)([-0-9.]+)\\s+([-0-9.]+)\\s+([-0-9.]+)\\s+([-0-9.]+)\\s+re\\s*W\\s*n\\s*$"));
+        "^q\\s*((?:(?:[-0-9.eE]+\\s+){6}cm\\s*)*)(?:([-0-9.]+)\\s+([-0-9.]+)\\s+([-0-9.]+)\\s+([-0-9.]+)\\s+re"
+        "|([-0-9.]+)\\s+([-0-9.]+)\\s+m\\s+([-0-9.]+)\\s+([-0-9.]+)\\s+l\\s+([-0-9.]+)\\s+([-0-9.]+)\\s+l\\s+([-0-9.]+)\\s+([-0-9.]+)\\s+l\\s+h)"
+        "\\s*W\\s*n\\s*$"));
     const QRegularExpressionMatch m = form.match(QString::fromLatin1(data.mid(q, k - q)));
     if (!m.hasMatch())
         return;
@@ -225,7 +227,16 @@ void widenToCrop(const QByteArray &data, Picture &p)
     const qint64 e = data.indexOf('Q', p.end);
     if (e < 0 || !squeezed(data.mid(p.end, e - p.end)).isEmpty())
         return;
-    p.crop = QRectF(m.captured(2).toDouble(), m.captured(3).toDouble(), m.captured(4).toDouble(), m.captured(5).toDouble());
+    if (m.capturedLength(6) > 0) {
+        QRectF round;
+        for (int c = 6; c < 14; c += 2) {
+            p.cropPoly.push_back(QPointF(m.captured(c).toDouble(), m.captured(c + 1).toDouble()));
+            round = c == 6 ? QRectF(p.cropPoly.back(), QSizeF(0, 0)) : round.united(QRectF(p.cropPoly.back(), QSizeF(0.00001, 0.00001)));
+        }
+        p.crop = round;
+    } else {
+        p.crop = QRectF(m.captured(2).toDouble(), m.captured(3).toDouble(), m.captured(4).toDouble(), m.captured(5).toDouble());
+    }
     p.cropStart = q;
     p.cropEnd = e + 1;
     p.start = q;
@@ -602,8 +613,11 @@ std::vector<Picture> Document::picturesLocked(int page)
                     // (cropped: the part shown)
                     const QRectF u = p.crop.isNull() ? QRectF(0, 0, 1, 1) : p.crop;
                     const float ux0 = float(u.left()), uy0 = float(u.top()), ux1 = float(u.right()), uy1 = float(u.bottom());
-                    const fz_point corners[4] = {fz_transform_point_xy(ux0, uy1, shown), fz_transform_point_xy(ux1, uy1, shown),
-                                                 fz_transform_point_xy(ux1, uy0, shown), fz_transform_point_xy(ux0, uy0, shown)};
+                    fz_point corners[4] = {fz_transform_point_xy(ux0, uy1, shown), fz_transform_point_xy(ux1, uy1, shown),
+                                           fz_transform_point_xy(ux1, uy0, shown), fz_transform_point_xy(ux0, uy0, shown)};
+                    if (p.cropPoly.size() == 4)
+                        for (int c = 0; c < 4; ++c)
+                            corners[c] = fz_transform_point_xy(float(p.cropPoly[size_t(c)].x()), float(p.cropPoly[size_t(c)].y()), shown);
                     double x0 = 1e18, y0 = 1e18, x1 = -1e18, y1 = -1e18;
                     for (const fz_point &c : corners) {
                         const QPointF q(c.x - o.x(), c.y - o.y());
@@ -1307,18 +1321,31 @@ bool Document::stepPicture(int page, const Picture &pic, bool forward, QString *
                   error);
 }
 
-bool Document::cropPicture(int page, const Picture &pic, const QRectF &unitIn, QString *error)
+bool Document::cropPicture(int page, const Picture &pic, const QPolygonF &part, QString *error)
 {
     if (pic.vector) {
         if (error)
             *error = QStringLiteral("only pictures can be cropped");
         return false;
     }
-    // its "Do" in a q ... Q of its own with the box (replacing a crop it had); all of it: none
-    const QRectF unit = unitIn.normalized() & QRectF(0, 0, 1, 1);
+    // its "Do" in a q ... Q of its own with the box (replacing a crop it had); all of it: none. Askew in its square: its
+    // corners, not a box
+    bool askew = false;
+    for (int k = 0; k < part.size(); ++k) {
+        const QPointF d = part[(k + 1) % part.size()] - part[k];
+        askew = askew || (std::abs(d.x()) > 0.001 && std::abs(d.y()) > 0.001);
+    }
+    const QRectF unit = askew ? part.boundingRect() : part.boundingRect() & QRectF(0, 0, 1, 1);
     if (unit.width() < 0.005 || unit.height() < 0.005)
         return false;
-    const bool all = unit.left() < 0.001 && unit.top() < 0.001 && unit.right() > 0.999 && unit.bottom() > 0.999;
+    const bool all = !askew && unit.left() < 0.001 && unit.top() < 0.001 && unit.right() > 0.999 && unit.bottom() > 0.999;
+    auto number = [](double v) { return QByteArray::number(v, 'f', 5); };
+    QByteArray shape;
+    if (askew && part.size() == 4)
+        shape = number(part[0].x()) + " " + number(part[0].y()) + " m " + number(part[1].x()) + " " + number(part[1].y()) + " l " + number(part[2].x()) + " " +
+                number(part[2].y()) + " l " + number(part[3].x()) + " " + number(part[3].y()) + " l h";
+    else
+        shape = number(unit.left()) + " " + number(unit.top()) + " " + number(unit.width()) + " " + number(unit.height()) + " re";
     std::lock_guard guard(docMutex_);
     return onPage(page, all ? "uncrop picture" : "crop picture", [&](pdf_page *pg) {
         pdf_obj *stm = contentStreams(ctx_, pg->obj).at(size_t(pic.stream));
@@ -1328,9 +1355,7 @@ bool Document::cropPicture(int page, const Picture &pic, const QRectF &unitIn, Q
         const QByteArray doOp = data.mid(pic.doStart, pic.doEnd - pic.doStart);
         const QByteArray moves = pic.cropStart >= 0 ? pic.cropMoves : QByteArray();
         const QByteArray now = all ? (moves.isEmpty() ? " " + doOp + " " : " q " + moves + " " + doOp + " Q ")
-                                   : " q " + moves + " " + QByteArray::number(unit.left(), 'f', 5) + " " + QByteArray::number(unit.top(), 'f', 5) + " " +
-                                         QByteArray::number(unit.width(), 'f', 5) + " " + QByteArray::number(unit.height(), 'f', 5) +
-                                         " re W n /MPcrop MP " + doOp + " Q ";
+                                   : " q " + moves + " " + shape + " W n /MPcrop MP " + doOp + " Q ";
         const qint64 a = pic.cropStart >= 0 ? pic.cropStart : pic.doStart, b = pic.cropStart >= 0 ? pic.cropEnd : pic.doEnd;
         setStreamData(ctx_, pdf_, stm, data.left(a) + now + data.mid(b));
     }, error);
@@ -1506,9 +1531,83 @@ bool Document::placePicture(int page, const QString &path, const QImage &image, 
     }, error);
 }
 
+bool Document::placePicture(int page, const QImage &image, const QPolygonF &corners, const Picture *replacing, QString *error)
+{
+    if (image.isNull() || corners.size() != 4)
+        return false;
+    const QByteArray bytes = pictureBytes(QString(), image, error);
+    if (bytes.isEmpty())
+        return false;
+    const bool seeThrough = image.hasAlphaChannel();
+    std::lock_guard guard(docMutex_);
+    return onPage(page, replacing ? "replace picture" : "add picture", [&](pdf_page *pg) {
+        placeIn(pg, page, bytes, corners.boundingRect(), replacing, seeThrough ? &image : nullptr, &corners);
+    }, error);
+}
+
+QImage Document::seeThroughPixels(const QImage &image)
+{
+    return bled(image.convertToFormat(QImage::Format_ARGB32));
+}
+
+// (in a fz_try - no C++ objects here: an error jumps out past them)
+fz_image *Document::seeThroughImage(const QImage &argb)
+{
+    const int w = argb.width(), h = argb.height();
+    bool any = false;  // (none of it see-through after all: no mask)
+    for (int y = 0; y < h && !any; ++y) {
+        const QRgb *row = reinterpret_cast<const QRgb *>(argb.constScanLine(y));
+        for (int x = 0; x < w && !any; ++x)
+            any = qAlpha(row[x]) < 255;
+    }
+    fz_pixmap *colours = nullptr, *alpha = nullptr;
+    fz_image *mask = nullptr, *img = nullptr;
+    fz_var(colours);
+    fz_var(alpha);
+    fz_var(mask);
+    fz_var(img);
+    fz_try(ctx_) {
+        colours = fz_new_pixmap(ctx_, fz_device_rgb(ctx_), w, h, nullptr, 0);
+        const int dx = int(std::lround(argb.dotsPerMeterX() * 0.0254)), dy = int(std::lround(argb.dotsPerMeterY() * 0.0254));
+        fz_set_pixmap_resolution(ctx_, colours, dx, dy);
+        unsigned char *c = fz_pixmap_samples(ctx_, colours);
+        const ptrdiff_t cs = fz_pixmap_stride(ctx_, colours);
+        for (int y = 0; y < h; ++y) {
+            const QRgb *row = reinterpret_cast<const QRgb *>(argb.constScanLine(y));
+            for (int x = 0; x < w; ++x) {
+                c[y * cs + 3 * x] = uchar(qRed(row[x]));
+                c[y * cs + 3 * x + 1] = uchar(qGreen(row[x]));
+                c[y * cs + 3 * x + 2] = uchar(qBlue(row[x]));
+            }
+        }
+        if (any) {
+            alpha = fz_new_pixmap(ctx_, fz_device_gray(ctx_), w, h, nullptr, 0);
+            unsigned char *a = fz_pixmap_samples(ctx_, alpha);
+            const ptrdiff_t as = fz_pixmap_stride(ctx_, alpha);
+            for (int y = 0; y < h; ++y) {
+                const QRgb *row = reinterpret_cast<const QRgb *>(argb.constScanLine(y));
+                for (int x = 0; x < w; ++x)
+                    a[y * as + x] = uchar(qAlpha(row[x]));
+            }
+            mask = fz_new_image_from_pixmap(ctx_, alpha, nullptr);
+        }
+        img = fz_new_image_from_pixmap(ctx_, colours, mask);
+    }
+    fz_always(ctx_) {
+        fz_drop_image(ctx_, mask);
+        fz_drop_pixmap(ctx_, colours);
+        fz_drop_pixmap(ctx_, alpha);
+    }
+    fz_catch(ctx_) {
+        fz_rethrow(ctx_);
+    }
+    return img;
+}
+
 // (docMutex_ held, in a change) the picture's bytes added, drawn at r (page points) - in replacing's
 // place in the page's drawing, or over the page
-void Document::placeIn(pdf_page *pg, int page, const QByteArray &bytes, const QRectF &r, const Picture *replacing, const QImage *seeThrough)
+void Document::placeIn(pdf_page *pg, int page, const QByteArray &bytes, const QRectF &r, const Picture *replacing, const QImage *seeThrough,
+                       const QPolygonF *corners)
 {
     const QPointF o = geometry()->origins.at(size_t(page));
     const Picture old = replacing ? *replacing : Picture();
@@ -1519,35 +1618,11 @@ void Document::placeIn(pdf_page *pg, int page, const QByteArray &bytes, const QR
                                                     size_t(bytes.size()));
     fz_image *img = nullptr;
     pdf_obj *ref = nullptr;
-    fz_pixmap *colours = nullptr, *alpha = nullptr;
-    fz_image *mask = nullptr;
     fz_var(img);
     fz_var(ref);
-    fz_var(colours);
-    fz_var(alpha);
-    fz_var(mask);
-    const QImage argb = seeThrough ? bled(seeThrough->convertToFormat(QImage::Format_ARGB32)) : QImage();
+    const QImage argb = seeThrough ? seeThroughPixels(*seeThrough) : QImage();
     fz_try(ctx_) {
-        if (seeThrough) {
-            const int w = argb.width(), h = argb.height();
-            colours = fz_new_pixmap(ctx_, fz_device_rgb(ctx_), w, h, nullptr, 0);
-            alpha = fz_new_pixmap(ctx_, fz_device_gray(ctx_), w, h, nullptr, 0);
-            unsigned char *c = fz_pixmap_samples(ctx_, colours), *a = fz_pixmap_samples(ctx_, alpha);
-            const ptrdiff_t cs = fz_pixmap_stride(ctx_, colours), as = fz_pixmap_stride(ctx_, alpha);
-            for (int y = 0; y < h; ++y) {
-                const QRgb *row = reinterpret_cast<const QRgb *>(argb.constScanLine(y));
-                for (int x = 0; x < w; ++x) {
-                    c[y * cs + 3 * x] = uchar(qRed(row[x]));
-                    c[y * cs + 3 * x + 1] = uchar(qGreen(row[x]));
-                    c[y * cs + 3 * x + 2] = uchar(qBlue(row[x]));
-                    a[y * as + x] = uchar(qAlpha(row[x]));
-                }
-            }
-            mask = fz_new_image_from_pixmap(ctx_, alpha, nullptr);
-            img = fz_new_image_from_pixmap(ctx_, colours, mask);
-        } else {
-            img = fz_new_image_from_buffer(ctx_, buf);
-        }
+        img = seeThrough ? seeThroughImage(argb) : fz_new_image_from_buffer(ctx_, buf);
         ref = pdf_add_image(ctx_, pdf_, img);
         // its name in the page's resources
         pdf_obj *res = pdf_dict_get(ctx_, pg->obj, PDF_NAME(Resources));
@@ -1567,7 +1642,11 @@ void Document::placeIn(pdf_page *pg, int page, const QByteArray &bytes, const QR
         while (pdf_dict_gets(ctx_, xobjs, name));
         pdf_dict_puts(ctx_, xobjs, name, ref);
         // its square to the box, as shown (the picture's top row at the box's top)
-        const fz_matrix shown = {float(r.width()), 0, 0, -float(r.height()), float(r.left() + o.x()), float(r.bottom() + o.y())};
+        fz_matrix shown = {float(r.width()), 0, 0, -float(r.height()), float(r.left() + o.x()), float(r.bottom() + o.y())};
+        if (corners) {  // (on these corners, turned as they are)
+            const QPointF &tl = (*corners)[0], &tr = (*corners)[1], &bl = (*corners)[3];
+            shown = {float(tr.x() - tl.x()), float(tr.y() - tl.y()), float(tl.x() - bl.x()), float(tl.y() - bl.y()), float(bl.x() + o.x()), float(bl.y() + o.y())};
+        }
         const fz_matrix inPdf = concat(shown, fz_invert_matrix(pagectm));
         if (replacing) {  // drawn in the old one's place in the page's drawing
             pdf_obj *stm = contentStreams(ctx_, pg->obj).at(size_t(old.stream));
@@ -1605,9 +1684,6 @@ void Document::placeIn(pdf_page *pg, int page, const QByteArray &bytes, const QR
     fz_always(ctx_) {
         pdf_drop_obj(ctx_, ref);
         fz_drop_image(ctx_, img);
-        fz_drop_image(ctx_, mask);
-        fz_drop_pixmap(ctx_, colours);
-        fz_drop_pixmap(ctx_, alpha);
         fz_drop_buffer(ctx_, buf);
     }
     fz_catch(ctx_) {
